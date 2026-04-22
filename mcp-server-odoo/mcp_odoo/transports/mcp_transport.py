@@ -46,6 +46,17 @@ def _postgrest_headers(supabase_key: str, *, schema: str = "public",
 
 
 # ---------------------------------------------------------------------------
+# Price display formatter
+# ---------------------------------------------------------------------------
+#
+# Tokenizer-safe "USD 1,383.00" renderer lives in mcp_odoo.tools.formatters
+# so both this transport and the sales tools share one implementation. See
+# that module for the background on why the comma separator matters.
+
+from mcp_odoo.tools.formatters import format_price_display as _format_price_display
+
+
+# ---------------------------------------------------------------------------
 # Ecuador cedula / RUC validation
 # ---------------------------------------------------------------------------
 
@@ -1066,12 +1077,19 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
                 f"{base_url}/web/image/product.template/{p['id']}/image_256"
                 if has_image else None
             )
+            raw_price = p.get("list_price", 0) or 0
+            raw_cost = p.get("standard_price", 0) or 0
             results.append({
                 "id": p["id"],
                 "code": p.get("default_code", ""),
                 "name": p.get("name", ""),
-                "price": p.get("list_price", 0),
-                "cost": p.get("standard_price", 0),
+                # Keep the numeric fields so any existing caller keeps
+                # working; ALSO emit display strings that the LLM should
+                # copy verbatim (tokenizer-safe comma-separated format).
+                "price": raw_price,
+                "price_display": _format_price_display(raw_price) if raw_price else "consultar",
+                "cost": raw_cost,
+                "cost_display": _format_price_display(raw_cost) if raw_cost else "consultar",
                 "stock": p.get("qty_available", 0),
                 "available": p.get("virtual_available", 0),
                 "description": p.get("description_sale") or "",
@@ -2409,18 +2427,26 @@ def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
         code_inline = f"  ·  {code}" if code else ""
         title = f"{badge}  {name}{code_inline}"
 
+        # Use tokenizer-safe formatter ("USD 1,383.00" — comma thousands
+        # separator prevents the BPE merge that drops the first digit of
+        # 4+ digit prices on Qwen2.5/Qwen3 AWQ models. See
+        # _format_price_display() docstring for details.
+        price_display = _format_price_display(price) if price else "consultar"
         if price:
-            price_part = f"💰 USD {price:.2f}"
+            price_part = f"💰 {price_display}"
         else:
             price_part = "💰 consultar"
 
         if qty is None:
             stock_part = ""  # tenant without Odoo wired
+            stock_display = ""
         elif qty > 0:
             qty_str = str(int(qty)) if qty == int(qty) else f"{qty:.2f}"
             stock_part = f"   📦 {qty_str} disponibles"
+            stock_display = f"{qty_str} disponibles"
         else:
             stock_part = "   📦 agotado"
+            stock_display = "agotado"
 
         line_text = f"{title}\n      {price_part}{stock_part}"
 
@@ -2428,6 +2454,13 @@ def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
             "template_id": tmpl_id,
             "code": code or "",
             "line_text": line_text,
+            # Structured fields (safe for LLM arithmetic) alongside the
+            # already-rendered line_text. The LLM should PREFER line_text
+            # for display and only touch price_raw for calculations.
+            "price_raw": float(price) if price else 0.0,
+            "price_display": price_display,
+            "stock_raw": (float(qty) if qty is not None else None),
+            "stock_display": stock_display,
         })
 
     # Header
@@ -2471,7 +2504,12 @@ def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
             "linea en blanco, luego footer. NUNCA muestres template_id al usuario. "
             "Memoriza la posicion (1,2,3...) -> template_id para usar despues en "
             "create_quotation. NUNCA inventes template_id; usa exactamente el numero "
-            "que aparece en este JSON."
+            "que aparece en este JSON. "
+            "REGLA DE PRECIOS: el campo line_text ya contiene el precio formateado "
+            "correctamente (ej: 'USD 1,383.00'). Coopialo VERBATIM — nunca reformatees "
+            "el precio ni lo conviertas a '$NNNN' porque eso puede corromper los "
+            "digitos. Si necesitas hacer aritmetica, usa price_raw (float) en vez "
+            "de parsear line_text."
         ),
     }
     return _json.dumps(payload, ensure_ascii=False)

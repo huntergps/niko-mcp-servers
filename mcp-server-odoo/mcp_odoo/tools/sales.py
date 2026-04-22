@@ -4,6 +4,7 @@ import logging
 import time
 import traceback
 
+from mcp_odoo.tools.formatters import format_price_display
 from mcp_odoo.tools.generic import odoo_search, odoo_read, odoo_create, odoo_call_method
 
 logger = logging.getLogger("mcp_odoo.sales")
@@ -233,18 +234,29 @@ def odoo_create_quotation(
         )
         for ln in (raw_lines or []):
             product_name = ln["product_id"][1] if isinstance(ln.get("product_id"), list) else ln.get("name", "")
+            price_unit = ln.get("price_unit", 0) or 0
+            subtotal = ln.get("price_subtotal", 0) or 0
+            tax = ln.get("price_tax", 0) or 0
+            total = ln.get("price_total", 0) or 0
             order_lines_detail.append({
                 "product": product_name,
                 "quantity": ln.get("product_uom_qty", 1),
-                "price_unit": ln.get("price_unit", 0),
+                "price_unit": price_unit,
+                "price_unit_display": format_price_display(price_unit),
                 "discount": ln.get("discount", 0),
-                "subtotal": ln.get("price_subtotal", 0),
-                "tax": ln.get("price_tax", 0),
-                "total": ln.get("price_total", 0),
+                "subtotal": subtotal,
+                "subtotal_display": format_price_display(subtotal),
+                "tax": tax,
+                "tax_display": format_price_display(tax),
+                "total": total,
+                "total_display": format_price_display(total),
             })
 
     partner_name = order["partner_id"][1] if isinstance(order.get("partner_id"), list) else str(order.get("partner_id", ""))
 
+    subtotal_amt = order["amount_untaxed"]
+    tax_amt = order["amount_tax"]
+    total_amt = order["amount_total"]
     result = {
         "success": True,
         "order_id": order_id,
@@ -252,9 +264,12 @@ def odoo_create_quotation(
         "state": order["state"],
         "partner": partner_name,
         "lines": order_lines_detail,
-        "subtotal": order["amount_untaxed"],
-        "tax": order["amount_tax"],
-        "total": order["amount_total"],
+        "subtotal": subtotal_amt,
+        "subtotal_display": format_price_display(subtotal_amt),
+        "tax": tax_amt,
+        "tax_display": format_price_display(tax_amt),
+        "total": total_amt,
+        "total_display": format_price_display(total_amt),
         "share_link": order.get("share_link_so") or "",
     }
     _log_call("create_quotation", tenant_id, log_args, result, None, int((time.time() - started) * 1000))
@@ -402,12 +417,18 @@ def odoo_add_to_quotation(
         order_lines_detail = []
         for ln in raw_lines:
             product_name = ln["product_id"][1] if isinstance(ln.get("product_id"), list) else ""
+            price_unit = ln.get("price_unit", 0) or 0
+            subtotal = ln.get("price_subtotal", 0) or 0
+            total = ln.get("price_total", 0) or 0
             order_lines_detail.append({
                 "product": product_name,
                 "quantity": ln.get("product_uom_qty", 1),
-                "price_unit": ln.get("price_unit", 0),
-                "subtotal": ln.get("price_subtotal", 0),
-                "total": ln.get("price_total", 0),
+                "price_unit": price_unit,
+                "price_unit_display": format_price_display(price_unit),
+                "subtotal": subtotal,
+                "subtotal_display": format_price_display(subtotal),
+                "total": total,
+                "total_display": format_price_display(total),
             })
     except Exception as e:
         err = f"Lines created but read-after-write failed: {e}"
@@ -415,6 +436,9 @@ def odoo_add_to_quotation(
         return {"success": False, "error_code": "read_after_write_failed", "error_detail": err, "order_id": order_id}
 
     partner_name = order["partner_id"][1] if isinstance(order.get("partner_id"), list) else ""
+    subtotal_amt = order["amount_untaxed"]
+    tax_amt = order["amount_tax"]
+    total_amt = order["amount_total"]
     result = {
         "success": True,
         "order_id": order_id,
@@ -423,9 +447,12 @@ def odoo_add_to_quotation(
         "partner": partner_name,
         "lines": order_lines_detail,
         "lines_added": len(new_line_cmds),
-        "subtotal": order["amount_untaxed"],
-        "tax": order["amount_tax"],
-        "total": order["amount_total"],
+        "subtotal": subtotal_amt,
+        "subtotal_display": format_price_display(subtotal_amt),
+        "tax": tax_amt,
+        "tax_display": format_price_display(tax_amt),
+        "total": total_amt,
+        "total_display": format_price_display(total_amt),
         "share_link": order.get("share_link_so") or "",
     }
     _log_call("add_to_quotation", tenant_id, log_args, result, None, int((time.time() - started) * 1000))
@@ -483,25 +510,28 @@ def odoo_get_active_quotation(
             ["product_id", "product_uom_qty", "price_total"],
         ) if line_ids else []
 
-        lines_detail = [
-            {
+        lines_detail = []
+        for ln in raw_lines:
+            total = ln.get("price_total", 0) or 0
+            lines_detail.append({
                 "product": ln["product_id"][1] if isinstance(ln.get("product_id"), list) else "",
                 "quantity": ln.get("product_uom_qty", 1),
-                "total": ln.get("price_total", 0),
-            }
-            for ln in raw_lines
-        ]
+                "total": total,
+                "total_display": format_price_display(total),
+            })
     except Exception as e:
         err = f"Error leyendo cotizacion: {e}"
         _log_call("get_active_quotation", tenant_id, log_args, None, err, int((time.time() - started) * 1000))
         return {"success": False, "error_code": "read_failed", "error_detail": err}
 
+    total_amt = order["amount_total"]
     result = {
         "success": True,
         "order_id": order_id,
         "name": order["name"],
         "state": order["state"],
-        "total": order["amount_total"],
+        "total": total_amt,
+        "total_display": format_price_display(total_amt),
         "lines": lines_detail,
     }
     _log_call("get_active_quotation", tenant_id, log_args, result, None, int((time.time() - started) * 1000))
@@ -576,13 +606,17 @@ def odoo_list_quotations(
     orders_summary = []
     for r in rows:
         line_ids = r.get("order_line", []) or []
+        total_amt = r["amount_total"]
+        subtotal_amt = r["amount_untaxed"]
         orders_summary.append({
             "order_id": r["id"],
             "name": r["name"],
             "state": r["state"],
             "state_label": _STATE_LABEL.get(r["state"], r["state"]),
-            "total": r["amount_total"],
-            "subtotal": r["amount_untaxed"],
+            "total": total_amt,
+            "total_display": format_price_display(total_amt),
+            "subtotal": subtotal_amt,
+            "subtotal_display": format_price_display(subtotal_amt),
             "date_order": r.get("date_order") or r.get("create_date"),
             "lines_count": len(line_ids),
             "share_link": r.get("share_link_so") or "",
@@ -648,14 +682,22 @@ def odoo_get_quotation(
             )
             for ln in (raw_lines or []):
                 pname = ln["product_id"][1] if isinstance(ln.get("product_id"), list) else ln.get("name", "")
+                price_unit = ln.get("price_unit", 0) or 0
+                subtotal = ln.get("price_subtotal", 0) or 0
+                tax = ln.get("price_tax", 0) or 0
+                total = ln.get("price_total", 0) or 0
                 lines_detail.append({
                     "product": pname,
                     "quantity": ln.get("product_uom_qty", 1),
-                    "price_unit": ln.get("price_unit", 0),
+                    "price_unit": price_unit,
+                    "price_unit_display": format_price_display(price_unit),
                     "discount": ln.get("discount", 0),
-                    "subtotal": ln.get("price_subtotal", 0),
-                    "tax": ln.get("price_tax", 0),
-                    "total": ln.get("price_total", 0),
+                    "subtotal": subtotal,
+                    "subtotal_display": format_price_display(subtotal),
+                    "tax": tax,
+                    "tax_display": format_price_display(tax),
+                    "total": total,
+                    "total_display": format_price_display(total),
                 })
         except Exception as e:
             err = f"Order {order['name']} read OK but lines failed: {e}"
@@ -664,6 +706,9 @@ def odoo_get_quotation(
 
     partner_name = order["partner_id"][1] if isinstance(order.get("partner_id"), list) else ""
 
+    subtotal_amt = order["amount_untaxed"]
+    tax_amt = order["amount_tax"]
+    total_amt = order["amount_total"]
     result = {
         "success": True,
         "order_id": order["id"],
@@ -671,9 +716,12 @@ def odoo_get_quotation(
         "state": order["state"],
         "state_label": _STATE_LABEL.get(order["state"], order["state"]),
         "partner": partner_name,
-        "subtotal": order["amount_untaxed"],
-        "tax": order["amount_tax"],
-        "total": order["amount_total"],
+        "subtotal": subtotal_amt,
+        "subtotal_display": format_price_display(subtotal_amt),
+        "tax": tax_amt,
+        "tax_display": format_price_display(tax_amt),
+        "total": total_amt,
+        "total_display": format_price_display(total_amt),
         "date_order": order.get("date_order") or order.get("create_date"),
         "lines_count": len(lines_detail),
         "lines": lines_detail,

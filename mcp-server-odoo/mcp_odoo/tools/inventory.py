@@ -1,5 +1,6 @@
 """Inventory tools — uses computed fields, NOT stock.quant directly."""
 
+from mcp_odoo.tools.formatters import format_price_display
 from mcp_odoo.transports.xmlrpc import odoo_pool
 
 MAX_PRODUCTS_PER_QUERY = 50
@@ -55,4 +56,11 @@ def odoo_check_stock(
             [[["id", "in", product_ids]]],
             kwargs,
         )
+    # Add tokenizer-safe price_display alongside the raw list_price so the
+    # LLM can copy the formatted string verbatim instead of re-rendering
+    # the float (which Qwen2.5/Qwen3 BPE can corrupt — see
+    # niko/docs/LLM_MODEL_TESTS.md Test 3).
+    for row in results or []:
+        raw_price = row.get("list_price", 0) or 0
+        row["list_price_display"] = format_price_display(raw_price) if raw_price else "consultar"
     return results
