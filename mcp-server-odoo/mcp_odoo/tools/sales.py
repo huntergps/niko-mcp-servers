@@ -3,6 +3,7 @@
 import logging
 import time
 import traceback
+from datetime import datetime
 
 from mcp_odoo.tools.formatters import format_price_display
 from mcp_odoo.tools.generic import odoo_search, odoo_read, odoo_create, odoo_call_method
@@ -159,6 +160,7 @@ def odoo_create_quotation(
     end_customer_name: str | None = None,
     end_customer_phone: str | None = None,
     end_customer_email: str | None = None,
+    salesperson_user_id: int | None = None,
 ) -> dict:
     """Create a sale order (quotation/proforma) in draft state.
 
@@ -176,6 +178,9 @@ def odoo_create_quotation(
         end_customer_name: Name of the end customer (consumidor final)
         end_customer_phone: Phone of the end customer
         end_customer_email: Email of the end customer
+        salesperson_user_id: res.users id of the salesperson that owns the
+            quotation. Sets sale.order.user_id. When None, Odoo defaults to
+            the connection user.
 
     Returns the created order details (read-after-write).
     On failure returns {success: False, error_code, error_detail, ...}.
@@ -185,6 +190,7 @@ def odoo_create_quotation(
         "partner_id": partner_id,
         "lines_count": len(lines),
         "first_line": lines[0] if lines else None,
+        "salesperson_user_id": salesperson_user_id,
     }
 
     # ── Pre-flight validation ────────────────────────────────────────────
@@ -322,6 +328,11 @@ def odoo_create_quotation(
     if end_customer_email:
         values["end_customer_email"] = end_customer_email
 
+    # Salesperson assignment (Sprint 2 B2B). When None, Odoo defaults to
+    # the connection user — same behavior as before.
+    if salesperson_user_id is not None and isinstance(salesperson_user_id, int) and salesperson_user_id > 0:
+        values["user_id"] = salesperson_user_id
+
     # ── Create the sale.order ────────────────────────────────────────────
     try:
         order_id = odoo_create(
@@ -423,6 +434,7 @@ def odoo_add_to_quotation(
     tenant_id: str, url: str, db: str, user: str, password: str,
     order_id: int,
     lines: list[dict],
+    salesperson_user_id: int | None = None,
 ) -> dict:
     """Append product lines to an existing sale.order in draft state.
 
@@ -437,11 +449,25 @@ def odoo_add_to_quotation(
                  (PREFERRED).
                - product_id (int): legacy template_id (deprecated).
                Optional per line: quantity (default 1), price_unit, discount.
+        salesperson_user_id: Forwarded for API symmetry with
+            create_quotation. Since this tool ONLY merges into an existing
+            order, the salesperson on that order is NEVER overwritten —
+            we log a no-op when this argument is supplied.
 
     Returns the updated order summary (same shape as create_quotation).
     """
     started = time.time()
-    log_args = {"order_id": order_id, "lines_count": len(lines)}
+    log_args = {
+        "order_id": order_id,
+        "lines_count": len(lines),
+        "salesperson_user_id": salesperson_user_id,
+    }
+    if salesperson_user_id is not None:
+        logger.info(
+            "ODOO_CALL add_to_quotation tenant=%s order=%s salesperson_user_id=%s ignored "
+            "(merge path never overwrites sale.order.user_id)",
+            tenant_id, order_id, salesperson_user_id,
+        )
 
     if not isinstance(order_id, int) or order_id <= 0:
         err = "order_id requerido y debe ser entero positivo"
@@ -1156,3 +1182,722 @@ def odoo_check_balance(
             for line in lines
         ],
     }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Sprint 2 — B2B Sales Assistant
+# ─────────────────────────────────────────────────────────────────────
+
+
+def odoo_lookup_user_by_email(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    email: str,
+) -> dict:
+    """Locate a res.users record by email (login OR partner.email).
+
+    Used by seller_otp.py to validate that a Telegram user requesting
+    /login corresponds to an actual Odoo salesperson before sending an
+    OTP.
+
+    Returns
+    -------
+    {success: True, user: {user_id, name, login, email, partner_id, partner_name}}
+    {success: False, error_code, error_detail}
+    """
+    started = time.time()
+    log_args = {"email": email}
+
+    if not email or not isinstance(email, str) or not email.strip():
+        err = "email requerido y debe ser un texto no vacio"
+        _log_call("lookup_user_by_email", tenant_id, log_args, None, err, 0)
+        return {
+            "success": False,
+            "error_code": "invalid_email",
+            "error_detail": err,
+        }
+
+    needle = email.strip()
+    fields = ["id", "name", "login", "partner_id", "active"]
+
+    try:
+        rows = odoo_search(
+            tenant_id, url, db, user, password,
+            "res.users",
+            [["login", "=ilike", needle]],
+            fields,
+            limit=10,
+        )
+    except Exception as e:
+        err = f"Error consultando res.users por login={needle!r}: {e}"
+        _log_call("lookup_user_by_email", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "lookup_failed",
+            "error_detail": err,
+        }
+
+    if not rows:
+        # Fallback: search by partner.email (the user's partner record).
+        try:
+            rows = odoo_search(
+                tenant_id, url, db, user, password,
+                "res.users",
+                [["partner_id.email", "=ilike", needle]],
+                fields,
+                limit=10,
+            )
+        except Exception as e:
+            err = f"Error consultando res.users por partner.email={needle!r}: {e}"
+            _log_call("lookup_user_by_email", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {
+                "success": False,
+                "error_code": "lookup_failed",
+                "error_detail": err,
+            }
+
+    # Filter inactive accounts — they cannot log in.
+    active_rows = [r for r in (rows or []) if r.get("active")]
+    if not active_rows:
+        err = "No hay un vendedor con ese email en Odoo"
+        _log_call("lookup_user_by_email", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "user_not_found",
+            "error_detail": err,
+        }
+
+    if len(active_rows) > 1:
+        logger.warning(
+            "ODOO_CALL lookup_user_by_email tenant=%s email=%r returned %d active users; "
+            "picking lowest id",
+            tenant_id, needle, len(active_rows),
+        )
+
+    chosen = min(active_rows, key=lambda r: r["id"])
+    partner_field = chosen.get("partner_id")
+    partner_id: int | None = None
+    partner_name: str | None = None
+    if isinstance(partner_field, list) and len(partner_field) >= 2:
+        partner_id = partner_field[0]
+        partner_name = partner_field[1]
+    elif isinstance(partner_field, int):
+        partner_id = partner_field
+
+    # Pull partner.email if available so the caller has the canonical email
+    # back (login is sometimes a username in older Odoo installs).
+    partner_email: str | None = None
+    if partner_id:
+        try:
+            partner_rows = odoo_read(
+                tenant_id, url, db, user, password,
+                "res.partner", [partner_id], ["email", "name"],
+            )
+            if partner_rows:
+                partner_email = partner_rows[0].get("email") or None
+                # Refresh partner_name from canonical record (more reliable
+                # than the Many2one display string).
+                partner_name = partner_rows[0].get("name") or partner_name
+        except Exception as e:
+            logger.warning(
+                "ODOO_CALL lookup_user_by_email tenant=%s could not read partner_id=%s: %s",
+                tenant_id, partner_id, e,
+            )
+
+    final_email = partner_email or chosen.get("login") or None
+
+    result = {
+        "success": True,
+        "user": {
+            "user_id": chosen["id"],
+            "name": chosen.get("name") or "",
+            "login": chosen.get("login") or "",
+            "email": final_email,
+            "partner_id": partner_id,
+            "partner_name": partner_name,
+        },
+    }
+    _log_call("lookup_user_by_email", tenant_id, log_args,
+              {"user_id": chosen["id"]}, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
+def odoo_apply_discount(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int,
+    discount_pct: float,
+    line_id: int | None = None,
+    reason: str | None = None,
+) -> dict:
+    """Apply a percentage discount to a quotation.
+
+    If `line_id` is given, only that line is updated. Otherwise every line
+    on the order is updated. The orchestrator validates the discount
+    against approval thresholds — this tool just applies what is asked.
+
+    Returns
+    -------
+    {success: True, order_id, lines_updated, discount_pct,
+     new_amount_total, new_amount_untaxed}
+    {success: False, error_code, error_detail, ...}
+    """
+    started = time.time()
+    log_args = {
+        "order_id": order_id,
+        "discount_pct": discount_pct,
+        "line_id": line_id,
+        "reason": reason,
+    }
+
+    # Validation -----------------------------------------------------------
+    if not isinstance(order_id, int) or order_id <= 0:
+        err = "order_id requerido y debe ser entero positivo"
+        _log_call("apply_discount", tenant_id, log_args, None, err, 0)
+        return {"success": False, "error_code": "invalid_order_id", "error_detail": err}
+
+    if not isinstance(discount_pct, (int, float)) or isinstance(discount_pct, bool):
+        err = "discount_pct debe ser numerico"
+        _log_call("apply_discount", tenant_id, log_args, None, err, 0)
+        return {"success": False, "error_code": "invalid_discount", "error_detail": err}
+
+    if discount_pct < 0 or discount_pct > 100:
+        err = f"discount_pct fuera de rango (0-100): {discount_pct}"
+        _log_call("apply_discount", tenant_id, log_args, None, err, 0)
+        return {"success": False, "error_code": "invalid_discount", "error_detail": err}
+
+    if line_id is not None and (not isinstance(line_id, int) or line_id <= 0):
+        err = "line_id debe ser entero positivo o None"
+        _log_call("apply_discount", tenant_id, log_args, None, err, 0)
+        return {"success": False, "error_code": "invalid_line_id", "error_detail": err}
+
+    # Read order and check editable state ---------------------------------
+    try:
+        orders = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id],
+            ["id", "name", "state", "order_line", "user_id"],
+        )
+    except Exception as e:
+        err = f"Error leyendo sale.order {order_id}: {e}"
+        _log_call("apply_discount", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "order_read_failed", "error_detail": err}
+
+    if not orders:
+        err = f"sale.order {order_id} no existe"
+        _log_call("apply_discount", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "order_not_found", "error_detail": err}
+
+    order = orders[0]
+    if order["state"] not in ("draft", "sent"):
+        err = (
+            f"sale.order {order['name']} esta en estado '{order['state']}', "
+            f"no se puede modificar el descuento"
+        )
+        _log_call("apply_discount", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "order_not_editable",
+            "error_detail": err,
+            "order_id": order_id,
+            "state": order["state"],
+        }
+
+    all_line_ids: list[int] = list(order.get("order_line") or [])
+    if not all_line_ids:
+        err = f"sale.order {order['name']} no tiene lineas"
+        _log_call("apply_discount", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "no_lines", "error_detail": err}
+
+    # Resolve target line ids ---------------------------------------------
+    if line_id is not None:
+        # Confirm the line belongs to this order.
+        try:
+            line_rows = odoo_read(
+                tenant_id, url, db, user, password,
+                "sale.order.line", [line_id], ["id", "order_id"],
+            )
+        except Exception as e:
+            err = f"Error leyendo sale.order.line {line_id}: {e}"
+            _log_call("apply_discount", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "line_read_failed", "error_detail": err}
+
+        if not line_rows:
+            err = f"sale.order.line {line_id} no existe"
+            _log_call("apply_discount", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "line_not_found", "error_detail": err}
+
+        line_row = line_rows[0]
+        line_order = line_row.get("order_id")
+        line_order_id = (
+            line_order[0] if isinstance(line_order, list) and line_order
+            else line_order
+        )
+        if line_order_id != order_id:
+            err = (
+                f"La linea {line_id} pertenece a la orden {line_order_id}, "
+                f"no a {order_id}"
+            )
+            _log_call("apply_discount", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {
+                "success": False,
+                "error_code": "line_mismatch",
+                "error_detail": err,
+                "order_id": order_id,
+                "line_id": line_id,
+            }
+        target_ids = [line_id]
+    else:
+        target_ids = all_line_ids
+
+    # Apply the discount ---------------------------------------------------
+    try:
+        odoo_call_method(
+            tenant_id, url, db, user, password,
+            "sale.order.line", "write", target_ids,
+            args=[{"discount": discount_pct}],
+        )
+    except Exception as e:
+        elapsed = int((time.time() - started) * 1000)
+        tb = traceback.format_exc()
+        logger.error(
+            "ODOO_CALL apply_discount FAILED tenant=%s order=%s lines=%s err=%s\n%s",
+            tenant_id, order_id, target_ids, e, tb,
+        )
+        _log_call("apply_discount", tenant_id, log_args, None, str(e), elapsed)
+        return {
+            "success": False,
+            "error_code": "discount_write_failed",
+            "error_detail": str(e),
+            "order_id": order_id,
+        }
+
+    # Optionally log a chatter note (best-effort — never block the result).
+    if reason:
+        try:
+            note_body = (
+                f"Descuento {discount_pct}% aplicado. Motivo: {reason}"
+            )
+            odoo_call_method(
+                tenant_id, url, db, user, password,
+                "sale.order", "message_post", [order_id],
+                kwargs={"body": note_body, "subtype_xmlid": "mail.mt_note"},
+            )
+        except Exception as e:
+            logger.warning(
+                "ODOO_CALL apply_discount tenant=%s order=%s message_post failed: %s",
+                tenant_id, order_id, e,
+            )
+
+    # Re-read totals -------------------------------------------------------
+    try:
+        refreshed = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id],
+            ["amount_total", "amount_untaxed", "amount_tax"],
+        )
+        head = refreshed[0] if refreshed else {}
+        new_total = head.get("amount_total", 0) or 0
+        new_untaxed = head.get("amount_untaxed", 0) or 0
+    except Exception as e:
+        err = f"Descuento aplicado pero no pudimos releer totales: {e}"
+        _log_call("apply_discount", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "read_after_write_failed",
+            "error_detail": err,
+            "order_id": order_id,
+        }
+
+    result = {
+        "success": True,
+        "order_id": order_id,
+        "lines_updated": len(target_ids),
+        "discount_pct": discount_pct,
+        "new_amount_total": new_total,
+        "new_amount_total_display": format_price_display(new_total),
+        "new_amount_untaxed": new_untaxed,
+        "new_amount_untaxed_display": format_price_display(new_untaxed),
+    }
+    _log_call("apply_discount", tenant_id, log_args, result, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
+_ALLOWED_QUOTATION_STATES = {"draft", "sent", "sale", "done", "cancel"}
+
+
+def odoo_list_my_quotations(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    salesperson_user_id: int,
+    state: list[str] | None = None,
+    limit: int = 20,
+) -> dict:
+    """List quotations owned by a specific salesperson.
+
+    Default state filter is ['draft', 'sent'] (active quotations the seller
+    might still close). Use the `state` arg to widen the filter.
+    """
+    started = time.time()
+    log_args = {
+        "salesperson_user_id": salesperson_user_id,
+        "state": state,
+        "limit": limit,
+    }
+
+    if not isinstance(salesperson_user_id, int) or salesperson_user_id <= 0:
+        err = "salesperson_user_id requerido y debe ser entero positivo"
+        _log_call("list_my_quotations", tenant_id, log_args, None, err, 0)
+        return {
+            "success": False,
+            "error_code": "invalid_salesperson_user_id",
+            "error_detail": err,
+        }
+
+    states = state or ["draft", "sent"]
+    if not isinstance(states, list) or not states:
+        err = "state debe ser una lista no vacia"
+        _log_call("list_my_quotations", tenant_id, log_args, None, err, 0)
+        return {
+            "success": False,
+            "error_code": "invalid_state",
+            "error_detail": err,
+        }
+
+    bad = [s for s in states if s not in _ALLOWED_QUOTATION_STATES]
+    if bad:
+        err = (
+            f"Estados invalidos: {bad}. "
+            f"Usa cualquiera de {sorted(_ALLOWED_QUOTATION_STATES)}"
+        )
+        _log_call("list_my_quotations", tenant_id, log_args, None, err, 0)
+        return {
+            "success": False,
+            "error_code": "invalid_state",
+            "error_detail": err,
+        }
+
+    if not isinstance(limit, int) or limit <= 0:
+        limit = 20
+    limit = min(limit, 200)
+
+    domain = [
+        ["user_id", "=", salesperson_user_id],
+        ["state", "in", states],
+    ]
+
+    try:
+        orders = odoo_search(
+            tenant_id, url, db, user, password,
+            "sale.order",
+            domain,
+            ["id", "name", "partner_id", "amount_total", "state",
+             "date_order", "order_line"],
+            limit=limit,
+            order="date_order DESC",
+        )
+    except Exception as e:
+        err = f"Error consultando cotizaciones del vendedor {salesperson_user_id}: {e}"
+        _log_call("list_my_quotations", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "search_failed",
+            "error_detail": err,
+        }
+
+    # Batch-load the partners (best effort; missing data simply omitted).
+    partner_ids: list[int] = []
+    for o in orders or []:
+        pf = o.get("partner_id")
+        if isinstance(pf, list) and pf:
+            partner_ids.append(pf[0])
+        elif isinstance(pf, int):
+            partner_ids.append(pf)
+    partner_ids = sorted(set(partner_ids))
+
+    partner_index: dict[int, dict] = {}
+    if partner_ids:
+        try:
+            partner_rows = odoo_read(
+                tenant_id, url, db, user, password,
+                "res.partner", partner_ids, ["id", "name", "vat"],
+            )
+            for pr in partner_rows or []:
+                partner_index[pr["id"]] = pr
+        except Exception as e:
+            logger.warning(
+                "ODOO_CALL list_my_quotations tenant=%s could not read partners %s: %s",
+                tenant_id, partner_ids, e,
+            )
+
+    quotations = []
+    for o in orders or []:
+        pf = o.get("partner_id")
+        if isinstance(pf, list) and pf:
+            partner_id_val = pf[0]
+            partner_display = pf[1] if len(pf) > 1 else ""
+        elif isinstance(pf, int):
+            partner_id_val = pf
+            partner_display = ""
+        else:
+            partner_id_val = None
+            partner_display = ""
+
+        partner_record = partner_index.get(partner_id_val) if partner_id_val else None
+        partner_name = (partner_record or {}).get("name") or partner_display or ""
+        partner_vat = (partner_record or {}).get("vat") or None
+
+        amount_total = o.get("amount_total", 0) or 0
+        line_ids = o.get("order_line") or []
+
+        quotations.append({
+            "order_id": o["id"],
+            "name": o.get("name") or "",
+            "partner_id": partner_id_val,
+            "partner_name": partner_name,
+            "partner_vat": partner_vat,
+            "amount_total": amount_total,
+            "amount_total_display": format_price_display(amount_total),
+            "state": o.get("state") or "",
+            "state_label": _STATE_LABEL.get(o.get("state") or "", o.get("state") or ""),
+            "date_order": str(o.get("date_order") or ""),
+            "line_count": len(line_ids),
+        })
+
+    result = {
+        "success": True,
+        "count": len(quotations),
+        "quotations": quotations,
+    }
+    _log_call("list_my_quotations", tenant_id, log_args,
+              {"count": len(quotations)}, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
+def odoo_schedule_visit(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    partner_id: int,
+    summary: str,
+    date_deadline: str,
+    salesperson_user_id: int,
+    note: str | None = None,
+) -> dict:
+    """Create a mail.activity (Meeting type) on the partner.
+
+    The activity shows up in the salesperson's calendar/CRM as a pending
+    visit. `date_deadline` must be a YYYY-MM-DD string.
+    """
+    started = time.time()
+    log_args = {
+        "partner_id": partner_id,
+        "summary": summary,
+        "date_deadline": date_deadline,
+        "salesperson_user_id": salesperson_user_id,
+        "has_note": bool(note),
+    }
+
+    # Argument validation -------------------------------------------------
+    if not isinstance(partner_id, int) or partner_id <= 0:
+        err = "partner_id requerido y debe ser entero positivo"
+        _log_call("schedule_visit", tenant_id, log_args, None, err, 0)
+        return {"success": False, "error_code": "invalid_partner_id", "error_detail": err}
+
+    if not isinstance(salesperson_user_id, int) or salesperson_user_id <= 0:
+        err = "salesperson_user_id requerido y debe ser entero positivo"
+        _log_call("schedule_visit", tenant_id, log_args, None, err, 0)
+        return {
+            "success": False,
+            "error_code": "invalid_salesperson_user_id",
+            "error_detail": err,
+        }
+
+    if not summary or not isinstance(summary, str) or not summary.strip():
+        err = "summary requerido y debe ser texto no vacio"
+        _log_call("schedule_visit", tenant_id, log_args, None, err, 0)
+        return {"success": False, "error_code": "invalid_summary", "error_detail": err}
+
+    if not date_deadline or not isinstance(date_deadline, str):
+        err = "date_deadline requerido en formato YYYY-MM-DD"
+        _log_call("schedule_visit", tenant_id, log_args, None, err, 0)
+        return {"success": False, "error_code": "invalid_date", "error_detail": err}
+
+    try:
+        datetime.strptime(date_deadline, "%Y-%m-%d")
+    except ValueError:
+        err = f"date_deadline debe estar en formato YYYY-MM-DD, recibi {date_deadline!r}"
+        _log_call("schedule_visit", tenant_id, log_args, None, err, 0)
+        return {"success": False, "error_code": "invalid_date", "error_detail": err}
+
+    # Resolve the Meeting activity type id --------------------------------
+    try:
+        meeting_rows = odoo_search(
+            tenant_id, url, db, user, password,
+            "mail.activity.type",
+            [["name", "=", "Meeting"]],
+            ["id", "name"],
+            limit=1,
+        )
+    except Exception as e:
+        err = f"Error consultando mail.activity.type: {e}"
+        _log_call("schedule_visit", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "activity_type_lookup_failed",
+            "error_detail": err,
+        }
+
+    if not meeting_rows:
+        # Fallback for non-English Odoo installs.
+        try:
+            meeting_rows = odoo_search(
+                tenant_id, url, db, user, password,
+                "mail.activity.type",
+                [["name", "ilike", "meeting"]],
+                ["id", "name"],
+                limit=1,
+            )
+        except Exception as e:
+            err = f"Error consultando mail.activity.type (fallback): {e}"
+            _log_call("schedule_visit", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {
+                "success": False,
+                "error_code": "activity_type_lookup_failed",
+                "error_detail": err,
+            }
+
+    if not meeting_rows:
+        err = (
+            "No encontre el tipo de actividad 'Meeting' en Odoo. "
+            "Pide al admin que active mail.mail_activity_data_meeting."
+        )
+        _log_call("schedule_visit", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "meeting_activity_type_missing",
+            "error_detail": err,
+        }
+    meeting_type_id = meeting_rows[0]["id"]
+
+    # Resolve ir.model id for res.partner ---------------------------------
+    try:
+        model_rows = odoo_search(
+            tenant_id, url, db, user, password,
+            "ir.model",
+            [["model", "=", "res.partner"]],
+            ["id", "model"],
+            limit=1,
+        )
+    except Exception as e:
+        err = f"Error consultando ir.model res.partner: {e}"
+        _log_call("schedule_visit", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "model_lookup_failed",
+            "error_detail": err,
+        }
+
+    if not model_rows:
+        err = "No encontre ir.model para res.partner; no puedo crear la actividad"
+        _log_call("schedule_visit", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "partner_model_missing",
+            "error_detail": err,
+        }
+    partner_model_id = model_rows[0]["id"]
+
+    # Validate partner exists ---------------------------------------------
+    try:
+        partner_rows = odoo_read(
+            tenant_id, url, db, user, password,
+            "res.partner", [partner_id], ["id", "name"],
+        )
+    except Exception as e:
+        err = f"Error leyendo partner {partner_id}: {e}"
+        _log_call("schedule_visit", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "partner_read_failed",
+            "error_detail": err,
+        }
+
+    if not partner_rows:
+        err = f"Partner id={partner_id} no existe en Odoo"
+        _log_call("schedule_visit", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "partner_not_found",
+            "error_detail": err,
+            "partner_id": partner_id,
+        }
+
+    partner_name = partner_rows[0].get("name") or ""
+
+    # Build vals + create -------------------------------------------------
+    vals: dict = {
+        "activity_type_id": meeting_type_id,
+        "res_model_id": partner_model_id,
+        "res_model": "res.partner",
+        "res_id": partner_id,
+        "user_id": salesperson_user_id,
+        "summary": summary.strip(),
+        "date_deadline": date_deadline,
+    }
+    if note:
+        if note.lstrip().startswith("<"):
+            vals["note"] = note
+        else:
+            vals["note"] = f"<p>{note}</p>"
+
+    try:
+        activity_id = odoo_create(
+            tenant_id, url, db, user, password,
+            "mail.activity", vals,
+        )
+    except Exception as e:
+        elapsed = int((time.time() - started) * 1000)
+        tb = traceback.format_exc()
+        logger.error(
+            "ODOO_CALL schedule_visit FAILED tenant=%s partner=%s err=%s\n%s",
+            tenant_id, partner_id, e, tb,
+        )
+        _log_call("schedule_visit", tenant_id, log_args, None, str(e), elapsed)
+        return {
+            "success": False,
+            "error_code": "activity_create_failed",
+            "error_detail": str(e),
+            "partner_id": partner_id,
+        }
+
+    result = {
+        "success": True,
+        "activity_id": activity_id,
+        "partner_id": partner_id,
+        "partner_name": partner_name,
+        "summary": summary.strip(),
+        "date_deadline": date_deadline,
+        "salesperson_user_id": salesperson_user_id,
+    }
+    _log_call("schedule_visit", tenant_id, log_args,
+              {"activity_id": activity_id}, None,
+              int((time.time() - started) * 1000))
+    return result

@@ -187,6 +187,10 @@ class QuotationRequest(BaseModel):
     partner_id: int
     lines: list[dict]
     notes: str = ""
+    end_customer_name: str | None = None
+    end_customer_phone: str | None = None
+    end_customer_email: str | None = None
+    salesperson_user_id: int | None = None
 
 
 @app.post("/tools/odoo_create_quotation")
@@ -194,6 +198,10 @@ async def tool_create_quotation(req: QuotationRequest, config: dict = Depends(ge
     result = sales.odoo_create_quotation(
         config["tenant_id"], config["url"], config["db"], config["user"], config["password"],
         req.partner_id, req.lines, req.notes,
+        end_customer_name=req.end_customer_name,
+        end_customer_phone=req.end_customer_phone,
+        end_customer_email=req.end_customer_email,
+        salesperson_user_id=req.salesperson_user_id,
     )
     return {"result": result}
 
@@ -235,6 +243,85 @@ async def tool_check_balance(req: BalanceCheckRequest, config: dict = Depends(ge
     result = sales.odoo_check_balance(
         config["tenant_id"], config["url"], config["db"], config["user"], config["password"],
         req.partner_id,
+    )
+    return {"result": result}
+
+
+# --- B2B Sales Assistant (Sprint 2) ---
+
+
+class LookupUserByEmailRequest(BaseModel):
+    email: str
+
+
+@app.post("/tools/odoo_lookup_user_by_email")
+async def tool_lookup_user_by_email(
+    req: LookupUserByEmailRequest,
+    config: dict = Depends(get_tenant_odoo_config),
+):
+    result = sales.odoo_lookup_user_by_email(
+        config["tenant_id"], config["url"], config["db"], config["user"], config["password"],
+        req.email,
+    )
+    return {"result": result}
+
+
+class ApplyDiscountRequest(BaseModel):
+    order_id: int
+    discount_pct: float
+    line_id: int | None = None
+    reason: str | None = None
+
+
+@app.post("/tools/odoo_apply_discount")
+async def tool_apply_discount(
+    req: ApplyDiscountRequest,
+    config: dict = Depends(get_tenant_odoo_config),
+):
+    result = sales.odoo_apply_discount(
+        config["tenant_id"], config["url"], config["db"], config["user"], config["password"],
+        req.order_id, req.discount_pct,
+        line_id=req.line_id, reason=req.reason,
+    )
+    return {"result": result}
+
+
+class ListMyQuotationsRequest(BaseModel):
+    salesperson_user_id: int
+    state: list[str] | None = None
+    limit: int = 20
+
+
+@app.post("/tools/odoo_list_my_quotations")
+async def tool_list_my_quotations(
+    req: ListMyQuotationsRequest,
+    config: dict = Depends(get_tenant_odoo_config),
+):
+    result = sales.odoo_list_my_quotations(
+        config["tenant_id"], config["url"], config["db"], config["user"], config["password"],
+        req.salesperson_user_id,
+        state=req.state, limit=req.limit,
+    )
+    return {"result": result}
+
+
+class ScheduleVisitRequest(BaseModel):
+    partner_id: int
+    summary: str
+    date_deadline: str
+    salesperson_user_id: int
+    note: str | None = None
+
+
+@app.post("/tools/odoo_schedule_visit")
+async def tool_schedule_visit(
+    req: ScheduleVisitRequest,
+    config: dict = Depends(get_tenant_odoo_config),
+):
+    result = sales.odoo_schedule_visit(
+        config["tenant_id"], config["url"], config["db"], config["user"], config["password"],
+        req.partner_id, req.summary, req.date_deadline, req.salesperson_user_id,
+        note=req.note,
     )
     return {"result": result}
 
