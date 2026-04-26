@@ -579,6 +579,11 @@ MCP_TOOLS = [
         "name": "create_quotation",
         "description": (
             "Crear una cotizacion/proforma en Odoo para un cliente con lineas de productos. "
+            "Cada linea DEBE traer **product_code** (SKU del catalogo, ej. 'VID0581') — los "
+            "SKUs vienen del campo `code` de cada resultado de `search_products`. "
+            "Si NO tienes el SKU exacto, llama `search_products` primero. NUNCA inventes "
+            "codigos. El campo `product_id` (template_id numerico) sigue aceptado solo por "
+            "compatibilidad legacy y se va a remover. "
             "IMPORTANTE: Antes de llamar esta herramienta, confirma con el cliente el resumen "
             "de productos, cantidades y precios. "
             "Para ventas a CONSUMIDOR FINAL (RUC 9999999999999): si la empresa requiere datos "
@@ -593,10 +598,23 @@ MCP_TOOLS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "product_id": {"type": "integer"},
+                            "product_code": {
+                                "type": "string",
+                                "description": (
+                                    "Codigo SKU del catalogo (ej. 'VID0581'). PREFERIDO. "
+                                    "Tomalo del campo `code` del resultado de search_products."
+                                ),
+                            },
+                            "product_id": {
+                                "type": "integer",
+                                "description": (
+                                    "DEPRECATED — usa product_code. Aceptado por compat. "
+                                    "Es el template_id numerico de Odoo."
+                                ),
+                            },
                             "quantity": {"type": "number", "default": 1},
                         },
-                        "required": ["product_id"],
+                        # Cada linea debe traer product_code O product_id; el handler valida.
                     },
                 },
                 "notes": {"type": "string", "description": "Notas adicionales", "default": ""},
@@ -612,7 +630,9 @@ MCP_TOOLS = [
         "description": (
             "Agregar uno o mas productos a una cotizacion EXISTENTE en estado borrador. "
             "USA ESTA en lugar de create_quotation cuando ya creaste una cotizacion para el "
-            "cliente y quiere agregar mas productos. NO crea una orden nueva — modifica la existente."
+            "cliente y quiere agregar mas productos. NO crea una orden nueva — modifica la existente. "
+            "Cada linea DEBE traer **product_code** (SKU del catalogo). El campo `product_id` "
+            "(template_id) se acepta solo por compat legacy."
         ),
         "inputSchema": {
             "type": "object",
@@ -623,10 +643,23 @@ MCP_TOOLS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "product_id": {"type": "integer", "description": "template_id del producto"},
+                            "product_code": {
+                                "type": "string",
+                                "description": (
+                                    "Codigo SKU del catalogo (ej. 'VID0581'). PREFERIDO. "
+                                    "Tomalo del campo `code` del resultado de search_products."
+                                ),
+                            },
+                            "product_id": {
+                                "type": "integer",
+                                "description": (
+                                    "DEPRECATED — usa product_code. Aceptado por compat. "
+                                    "Es el template_id numerico de Odoo."
+                                ),
+                            },
                             "quantity": {"type": "number", "default": 1},
                         },
-                        "required": ["product_id"],
+                        # Cada linea debe traer product_code O product_id; el handler valida.
                     },
                 },
             },
@@ -2502,9 +2535,14 @@ def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
             "Para responder al usuario: escribe header, luego una linea en blanco, "
             "luego cada line_text en orden separados por linea en blanco, luego "
             "linea en blanco, luego footer. NUNCA muestres template_id al usuario. "
-            "Memoriza la posicion (1,2,3...) -> template_id para usar despues en "
-            "create_quotation. NUNCA inventes template_id; usa exactamente el numero "
-            "que aparece en este JSON. "
+            "Memoriza la posicion (1,2,3...) -> code (SKU) para usar despues en "
+            "create_quotation/add_to_quotation. "
+            "REGLA DE COTIZACION: al llamar create_quotation o add_to_quotation, "
+            "en cada linea pasa **product_code** con el valor exacto del campo `code` "
+            "que aparece en este JSON (ej. 'VID0581'). NUNCA inventes SKUs. NUNCA "
+            "uses product_id (template_id numerico) — es legacy. Si no tienes el "
+            "SKU exacto del producto que el cliente pidio, llama search_products "
+            "otra vez. "
             "REGLA DE PRECIOS: el campo line_text ya contiene el precio formateado "
             "correctamente (ej: 'USD 1,383.00'). Coopialo VERBATIM — nunca reformatees "
             "el precio ni lo conviertas a '$NNNN' porque eso puede corromper los "

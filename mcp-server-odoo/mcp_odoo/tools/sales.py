@@ -30,6 +30,127 @@ def _log_call(tool: str, tenant_id: str, args: dict, result: dict | None, error:
         logger.info("ODOO_CALL %s", payload)
 
 
+def _resolve_lines_to_template_ids(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    lines: list[dict],
+) -> tuple[list[dict] | None, dict | None]:
+    """Resolve each line's product_code (preferred) / product_id (legacy) into
+    a canonical template_id, in batch.
+
+    The LLM speaks SKUs (e.g. "VID0581") because they appear literally in
+    every search_products result. Numeric template_ids, on the other hand,
+    are easy to fabricate when the model loses context. So this function
+    accepts whichever the caller sent, but PREFERS product_code when both
+    are present, and resolves all SKUs in ONE Odoo query (batch search on
+    default_code IN [...]).
+
+    Returns:
+        (resolved_lines, error_dict)
+        - resolved_lines: same list as input, with each item now carrying a
+          definite "_template_id" int field (consumed by the variant
+          resolver downstream). Original keys are preserved.
+        - error_dict: a {success: False, ...} payload if any SKU could not
+          be resolved (or any line was missing both fields). When non-None,
+          resolved_lines is None.
+    """
+    if not lines:
+        return None, {
+            "success": False,
+            "error_code": "no_lines",
+            "error_detail": "lines vacio: se requiere al menos un producto",
+        }
+
+    # Validate per-line shape and split by which identifier was provided.
+    codes_to_resolve: set[str] = set()
+    for idx, line in enumerate(lines):
+        code = line.get("product_code")
+        pid = line.get("product_id")
+        if code and isinstance(code, str) and code.strip():
+            codes_to_resolve.add(code.strip())
+            if pid:
+                logger.info(
+                    "ODOO_CALL resolve_lines tenant=%s line=%d both product_code=%r and product_id=%r passed; preferring product_code",
+                    tenant_id, idx, code, pid,
+                )
+        elif isinstance(pid, int) and pid > 0:
+            logger.warning(
+                "ODOO_CALL resolve_lines tenant=%s line=%d using legacy product_id=%d (deprecated; prefer product_code/SKU)",
+                tenant_id, idx, pid,
+            )
+        else:
+            return None, {
+                "success": False,
+                "error_code": "missing_product_identifier",
+                "error_detail": (
+                    f"Linea {idx}: cada linea debe traer 'product_code' "
+                    f"(SKU del catalogo, preferido) o 'product_id' (template_id, legacy). "
+                    f"Recibi: {line!r}"
+                ),
+                "line_index": idx,
+            }
+
+    # Batch resolve every SKU in one Odoo query.
+    code_to_template_id: dict[str, int] = {}
+    if codes_to_resolve:
+        try:
+            rows = odoo_search(
+                tenant_id, url, db, user, password,
+                "product.template",
+                [["default_code", "in", list(codes_to_resolve)], ["active", "=", True]],
+                ["id", "default_code"],
+                limit=len(codes_to_resolve) * 2,  # account for multiple variants per code (rare)
+            )
+        except Exception as e:
+            return None, {
+                "success": False,
+                "error_code": "sku_lookup_failed",
+                "error_detail": (
+                    f"Error consultando Odoo para resolver SKUs {sorted(codes_to_resolve)}: {e}"
+                ),
+                "missing_skus": sorted(codes_to_resolve),
+            }
+
+        # default_code SHOULD be unique on product.template, but if a tenant
+        # has duplicates we keep the first and warn.
+        for row in rows or []:
+            code = row.get("default_code")
+            if not code:
+                continue
+            if code in code_to_template_id:
+                logger.warning(
+                    "ODOO_CALL resolve_lines tenant=%s duplicate default_code=%r; keeping first match id=%d",
+                    tenant_id, code, code_to_template_id[code],
+                )
+                continue
+            code_to_template_id[code] = row["id"]
+
+        missing = sorted(c for c in codes_to_resolve if c not in code_to_template_id)
+        if missing:
+            return None, {
+                "success": False,
+                "error_code": "sku_not_found",
+                "error_detail": (
+                    f"SKUs no encontrados en el catalogo (o inactivos): {missing}. "
+                    f"Llama search_products primero para obtener el codigo exacto."
+                ),
+                "missing_skus": missing,
+            }
+
+    # Walk lines again, attach the canonical template_id.
+    resolved: list[dict] = []
+    for line in lines:
+        code = (line.get("product_code") or "").strip() or None
+        pid = line.get("product_id")
+        if code:
+            tmpl_id = code_to_template_id[code]
+        else:
+            tmpl_id = pid  # legacy path
+        new_line = dict(line)
+        new_line["_template_id"] = tmpl_id
+        resolved.append(new_line)
+    return resolved, None
+
+
 def odoo_create_quotation(
     tenant_id: str, url: str, db: str, user: str, password: str,
     partner_id: int,
@@ -43,14 +164,21 @@ def odoo_create_quotation(
 
     Args:
         partner_id: res.partner ID
-        lines: List of dicts with {product_id, quantity, price_unit (optional)}
+        lines: List of dicts. Each line MUST carry one of:
+               - product_code (str): SKU as it appears in search_products
+                 (PREFERRED — the LLM cannot fabricate a SKU because they
+                 follow a strict format and are echoed verbatim in every
+                 search result).
+               - product_id (int): legacy product.template id (deprecated;
+                 prone to LLM hallucination across turns).
+               Optional per line: quantity (default 1), price_unit, discount.
         notes: Optional notes for the order
         end_customer_name: Name of the end customer (consumidor final)
         end_customer_phone: Phone of the end customer
         end_customer_email: Email of the end customer
 
     Returns the created order details (read-after-write).
-    On failure returns {success: False, error_code, error_detail, partner_id, lines}.
+    On failure returns {success: False, error_code, error_detail, ...}.
     """
     started = time.time()
     log_args = {
@@ -102,6 +230,21 @@ def odoo_create_quotation(
             "partner_id": partner_id,
         }
 
+    # ── Resolve product_code (SKU) → template_id in batch ──────────────
+    # The LLM passes SKUs ("VID0581") because they appear literally in every
+    # search_products result and their format is hard to fabricate. Legacy
+    # product_id (numeric template_id) is still accepted for backwards
+    # compatibility, but flagged in logs.
+    resolved_lines, resolve_err = _resolve_lines_to_template_ids(
+        tenant_id, url, db, user, password, lines,
+    )
+    if resolve_err is not None:
+        resolve_err.setdefault("partner_id", partner_id)
+        _log_call("create_quotation", tenant_id, log_args, None,
+                  resolve_err.get("error_detail"),
+                  int((time.time() - started) * 1000))
+        return resolve_err
+
     # The entire RAG/search/details pipeline canonicalizes on `product.template`
     # IDs (that's what _fetch_products_live, get_product_details and the
     # embedding store all use, matching what the Odoo UI shows). But
@@ -109,7 +252,7 @@ def odoo_create_quotation(
     # this at the ORM level. So at THIS boundary (and only here) we resolve
     # template_id → first active variant. We also capture uom_id because
     # TecnoSmart's flex_erp override KeyError's on missing 'product_uom'.
-    template_ids = list({line["product_id"] for line in lines})
+    template_ids = list({line["_template_id"] for line in resolved_lines})
     try:
         variants = odoo_search(
             tenant_id, url, db, user, password,
@@ -150,8 +293,8 @@ def odoo_create_quotation(
         }
 
     order_lines = []
-    for line in lines:
-        tmpl_id = line["product_id"]  # treated as template_id throughout
+    for line in resolved_lines:
+        tmpl_id = line["_template_id"]
         variant_pid = variant_by_template[tmpl_id]
         line_vals = {
             "product_id": variant_pid,
@@ -289,7 +432,11 @@ def odoo_add_to_quotation(
 
     Args:
         order_id: existing sale.order ID
-        lines: [{product_id (template_id), quantity}, ...]
+        lines: List of dicts. Each line MUST carry one of:
+               - product_code (str): SKU as it appears in search_products
+                 (PREFERRED).
+               - product_id (int): legacy template_id (deprecated).
+               Optional per line: quantity (default 1), price_unit, discount.
 
     Returns the updated order summary (same shape as create_quotation).
     """
@@ -333,8 +480,19 @@ def odoo_add_to_quotation(
             "state": order["state"],
         }
 
+    # ── Resolve product_code (SKU) → template_id in batch ──────────────
+    resolved_lines, resolve_err = _resolve_lines_to_template_ids(
+        tenant_id, url, db, user, password, lines,
+    )
+    if resolve_err is not None:
+        resolve_err.setdefault("order_id", order_id)
+        _log_call("add_to_quotation", tenant_id, log_args, None,
+                  resolve_err.get("error_detail"),
+                  int((time.time() - started) * 1000))
+        return resolve_err
+
     # Resolve template_ids → variant + uom (same logic as create_quotation)
-    template_ids = list({line["product_id"] for line in lines})
+    template_ids = list({line["_template_id"] for line in resolved_lines})
     try:
         variants = odoo_search(
             tenant_id, url, db, user, password,
@@ -364,8 +522,8 @@ def odoo_add_to_quotation(
 
     # Build new sale.order.line records and write to existing order via (0,0,vals) commands
     new_line_cmds = []
-    for line in lines:
-        tmpl_id = line["product_id"]
+    for line in resolved_lines:
+        tmpl_id = line["_template_id"]
         variant_pid = variant_by_template[tmpl_id]
         line_vals = {
             "order_id": order_id,
