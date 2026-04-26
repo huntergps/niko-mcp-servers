@@ -770,6 +770,69 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "apply_discount",
+        "description": (
+            "Aplicar un porcentaje de descuento a una cotizacion en estado 'draft' o 'sent'. "
+            "Si pasas line_id, el descuento se aplica solo a esa linea. "
+            "Si no pasas line_id, se aplica a TODAS las lineas del pedido. "
+            "Recuerda: este tool NO valida si el descuento esta dentro del umbral del agente — "
+            "esa validacion ocurre antes (vias guardrails / approval flow). "
+            "Tras aplicar, los totales (amount_total, amount_untaxed) se recalculan automaticamente "
+            "y se devuelven en el resultado."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "integer", "description": "ID interno de Odoo de la cotizacion"},
+                "discount_pct": {"type": "number", "description": "Porcentaje de descuento (0-100). Ej: 5 = 5%"},
+                "line_id": {"type": "integer", "description": "Opcional: ID de la linea especifica. Sin esto, aplica a todas las lineas."},
+                "reason": {"type": "string", "description": "Opcional: motivo del descuento. Se guarda como nota interna en la cotizacion."},
+            },
+            "required": ["order_id", "discount_pct"],
+        },
+    },
+    {
+        "name": "list_my_quotations",
+        "description": (
+            "Listar las cotizaciones de un vendedor especifico (sale.order.user_id). "
+            "Por defecto trae las cotizaciones activas (state in ['draft','sent']). "
+            "Util para que un vendedor B2B revise sus pendientes o para retomar cotizaciones "
+            "abiertas con un cliente. Ordenado por fecha descendente, limite default 20."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "salesperson_user_id": {"type": "integer", "description": "ID del usuario Odoo (res.users.id) del vendedor"},
+                "state": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["draft", "sent", "sale", "done", "cancel"]},
+                    "description": "Filtro de estados. Default: ['draft','sent']",
+                },
+                "limit": {"type": "integer", "description": "Maximo de resultados", "default": 20},
+            },
+            "required": ["salesperson_user_id"],
+        },
+    },
+    {
+        "name": "schedule_visit",
+        "description": (
+            "Agendar una visita a un cliente creando un mail.activity tipo 'Meeting' en su ficha. "
+            "El vendedor responsable (salesperson_user_id) la vera en su CRM/calendario. "
+            "Usar cuando el vendedor B2B pida 'agendar visita a Juan Perez el viernes'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {"type": "integer", "description": "ID del partner (res.partner.id) — el cliente a visitar"},
+                "summary": {"type": "string", "description": "Titulo corto de la visita (ej: 'Demo producto X')"},
+                "date_deadline": {"type": "string", "description": "Fecha de la visita en formato YYYY-MM-DD"},
+                "salesperson_user_id": {"type": "integer", "description": "ID del vendedor responsable (res.users.id)"},
+                "note": {"type": "string", "description": "Opcional: nota detallada (puede contener HTML)"},
+            },
+            "required": ["partner_id", "summary", "date_deadline", "salesperson_user_id"],
+        },
+    },
+    {
         "name": "sri_import",
         "description": "Importar factura de compra del SRI usando la clave de acceso de 49 digitos. Usa esto cuando alguien envie un numero de 49 digitos.",
         "inputSchema": {
@@ -1261,6 +1324,39 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
     if tool_name == "confirm_quotation":
         from mcp_odoo.tools.sales import odoo_confirm_sale_order
         result = odoo_confirm_sale_order(*creds, args["order_id"])
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "apply_discount":
+        from mcp_odoo.tools import sales as _sales
+        result = _sales.odoo_apply_discount(
+            *creds,
+            order_id=int(args["order_id"]),
+            discount_pct=float(args["discount_pct"]),
+            line_id=int(args["line_id"]) if args.get("line_id") is not None else None,
+            reason=args.get("reason"),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "list_my_quotations":
+        from mcp_odoo.tools import sales as _sales
+        result = _sales.odoo_list_my_quotations(
+            *creds,
+            salesperson_user_id=int(args["salesperson_user_id"]),
+            state=args.get("state"),
+            limit=int(args.get("limit", 20)),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "schedule_visit":
+        from mcp_odoo.tools import sales as _sales
+        result = _sales.odoo_schedule_visit(
+            *creds,
+            partner_id=int(args["partner_id"]),
+            summary=args["summary"],
+            date_deadline=args["date_deadline"],
+            salesperson_user_id=int(args["salesperson_user_id"]),
+            note=args.get("note"),
+        )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "sri_import":
