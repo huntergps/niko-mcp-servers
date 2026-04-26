@@ -107,13 +107,22 @@ class TestToolsListRegistration:
                 f"odoo_{expected} would shadow the registration — drop the prefix"
             )
 
-    def test_lookup_user_by_email_NOT_in_protocol(self, client):
-        """Sprint 2D explicitly excludes lookup_user_by_email from MCP — it
-        is invoked over plain HTTP from niko.auth.seller_otp instead."""
+    def test_lookup_user_by_email_backend_only(self, client):
+        """Sprint 2E registers ``odoo_lookup_user_by_email`` (with prefix)
+        because niko/auth/seller_otp.py invokes it over MCP JSON-RPC, not
+        REST. The bare-name ``lookup_user_by_email`` stays out — only the
+        prefixed backend variant exists, signalling 'not for LLMs'.
+
+        Defense-in-depth: even though it appears in tools/list when no
+        allowed-tools header is sent, the allowed_tools filter on
+        tools/call (mcp_transport.py L1018-1031) blocks any agent whose
+        tools_enabled does not include this name — which is every agent,
+        because migration 350 only enables ``apply_discount`` /
+        ``list_my_quotations`` / ``schedule_visit``."""
         body = _rpc(client, "tools/list")
         names = {t["name"] for t in body["result"]["tools"]}
         assert "lookup_user_by_email" not in names
-        assert "odoo_lookup_user_by_email" not in names
+        assert "odoo_lookup_user_by_email" in names
 
     def test_input_schema_present_and_valid(self, client):
         """Each new tool needs a JSONSchema-shaped inputSchema or langchain

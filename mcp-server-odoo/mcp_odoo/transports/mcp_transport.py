@@ -832,6 +832,26 @@ MCP_TOOLS = [
             "required": ["partner_id", "summary", "date_deadline", "salesperson_user_id"],
         },
     },
+    # Backend-only tool — invocada por niko/auth/seller_otp.py durante el flujo
+    # /login del bot B2B. NO incluida en tools_enabled de ningun agente (no
+    # es LLM-facing); el filtro allowed_tools en tools/call la deja invisible
+    # al LLM aunque aparezca en este registro. Mantiene el prefijo odoo_
+    # porque la convencion sin-prefijo es solo para tools que el LLM ve.
+    {
+        "name": "odoo_lookup_user_by_email",
+        "description": (
+            "Backend RPC: localiza un res.users de Odoo por email "
+            "(login OR partner_id.email). Usado por el flujo /login del bot "
+            "B2B para validar que el vendedor existe antes de enviar OTP."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "email": {"type": "string", "description": "Email del vendedor a validar"},
+            },
+            "required": ["email"],
+        },
+    },
     {
         "name": "sri_import",
         "description": "Importar factura de compra del SRI usando la clave de acceso de 49 digitos. Usa esto cuando alguien envie un numero de 49 digitos.",
@@ -1357,6 +1377,12 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             salesperson_user_id=int(args["salesperson_user_id"]),
             note=args.get("note"),
         )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    # Backend-only — niko/auth/seller_otp.py via lookup_odoo_user_by_email wrapper.
+    if tool_name == "odoo_lookup_user_by_email":
+        from mcp_odoo.tools import sales as _sales
+        result = _sales.odoo_lookup_user_by_email(*creds, email=args["email"])
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "sri_import":
