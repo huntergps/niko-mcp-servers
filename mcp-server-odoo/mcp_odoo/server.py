@@ -266,6 +266,35 @@ async def tool_lookup_user_by_email(
     return {"result": result}
 
 
+# Sprint 2F — Generic ERP-agnostic policy & authorization (backend-only)
+
+
+@app.post("/tools/odoo_get_discount_policy")
+async def tool_get_discount_policy(
+    config: dict = Depends(get_tenant_odoo_config),
+):
+    result = sales.odoo_get_discount_policy(
+        config["tenant_id"], config["url"], config["db"], config["user"], config["password"],
+    )
+    return {"result": result}
+
+
+class VerifySellerAuthorizationRequest(BaseModel):
+    email: str
+
+
+@app.post("/tools/odoo_verify_seller_authorization")
+async def tool_verify_seller_authorization(
+    req: VerifySellerAuthorizationRequest,
+    config: dict = Depends(get_tenant_odoo_config),
+):
+    result = sales.odoo_verify_seller_authorization(
+        config["tenant_id"], config["url"], config["db"], config["user"], config["password"],
+        req.email,
+    )
+    return {"result": result}
+
+
 class ApplyDiscountRequest(BaseModel):
     order_id: int
     discount_pct: float

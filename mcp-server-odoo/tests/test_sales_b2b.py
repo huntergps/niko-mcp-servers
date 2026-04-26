@@ -803,3 +803,252 @@ class TestScheduleVisit:
         assert result["success"] is False
         assert result["error_code"] == "invalid_summary"
         mock_pool.execute.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Sprint 2F — odoo_get_discount_policy
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestGetDiscountPolicy:
+    """Generic ERP-agnostic 'get discount policy' contract.
+
+    Reads ``ir.config_parameter`` + the supervisor group, then returns a
+    plugin-agnostic shape. Niko core never sees the Odoo specifics.
+    """
+
+    def test_happy_path_with_two_supervisors(self, client):
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = [
+            # 1) ir.config_parameter.get_param
+            "15",
+            # 2) ir.model.data search for account.group_account_manager
+            [{"id": 100, "res_id": 77}],
+            # 3) res.users search for supervisors in group 77
+            [
+                {"id": 1, "name": "Sup A", "login": "supa@x.ec",
+                 "partner_id": [10, "Sup A"]},
+                {"id": 2, "name": "Sup B", "login": "supb",
+                 "partner_id": [11, "Sup B"]},
+            ],
+            # 4) res.partner read for canonical emails
+            [
+                {"id": 10, "email": "supa.canonical@x.ec"},
+                {"id": 11, "email": "supb.canonical@x.ec"},
+            ],
+        ]
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            response = client.post("/tools/odoo_get_discount_policy", json={})
+        assert response.status_code == 200
+        result = response.json()["result"]
+        assert result["success"] is True
+        policy = result["policy"]
+        assert policy["max_pct"] == 15.0
+        assert len(policy["supervisors"]) == 2
+        emails = {s["email"] for s in policy["supervisors"]}
+        assert emails == {"supa.canonical@x.ec", "supb.canonical@x.ec"}
+        # Source metadata is the dashboard's "from Odoo" badge
+        assert policy["source"]["max_pct_key"] == \
+            "ir.config_parameter:sale.partner_max_sale_discount"
+        assert policy["source"]["supervisors_group_xmlid"] == \
+            "account.group_account_manager"
+
+    def test_max_pct_missing_returns_zero(self, client):
+        """ir.config_parameter.get_param returns the default '0' when the
+        key has never been set; we coerce to 0.0 (== 'no control')."""
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = [
+            # 1) get_param → '0' default
+            "0",
+            # 2) supervisor group resolves
+            [{"id": 100, "res_id": 77}],
+            # 3) one active supervisor
+            [{"id": 1, "name": "Sup", "login": "sup@x.ec",
+              "partner_id": [10, "Sup"]}],
+            # 4) partner email
+            [{"id": 10, "email": "sup@x.ec"}],
+        ]
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            response = client.post("/tools/odoo_get_discount_policy", json={})
+        result = response.json()["result"]
+        assert result["success"] is True
+        assert result["policy"]["max_pct"] == 0.0
+
+    def test_max_pct_non_numeric_falls_back_to_zero(self, client):
+        """Defensive: an admin typo ('abc') in the parameter must NOT crash.
+        Plugin treats it as 'no control configured' (0.0)."""
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = [
+            "abc",
+            [{"id": 100, "res_id": 77}],
+            [],  # no supervisors
+        ]
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            response = client.post("/tools/odoo_get_discount_policy", json={})
+        result = response.json()["result"]
+        assert result["success"] is True
+        assert result["policy"]["max_pct"] == 0.0
+
+    def test_supervisor_group_missing(self, client):
+        """If account module is not installed, ir.model.data lookup is
+        empty — return error_code='supervisor_group_missing'."""
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = [
+            "10",
+            [],  # no row in ir.model.data → group not present
+        ]
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            response = client.post("/tools/odoo_get_discount_policy", json={})
+        result = response.json()["result"]
+        assert result["success"] is False
+        assert result["error_code"] == "supervisor_group_missing"
+        assert "account" in result["error_detail"].lower()
+
+    def test_zero_supervisors_in_group(self, client):
+        """Group exists but has no users assigned → success=True with empty
+        supervisors list (no one can authorize discounts, but that is a
+        config decision, not an error)."""
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = [
+            "10",
+            [{"id": 100, "res_id": 77}],
+            [],  # no supervisors
+        ]
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            response = client.post("/tools/odoo_get_discount_policy", json={})
+        result = response.json()["result"]
+        assert result["success"] is True
+        assert result["policy"]["max_pct"] == 10.0
+        assert result["policy"]["supervisors"] == []
+
+    def test_supervisor_login_used_when_partner_email_empty(self, client):
+        """When res.partner.email is empty BUT res.users.login looks like an
+        email, fall back to login as the canonical address."""
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = [
+            "5",
+            [{"id": 100, "res_id": 77}],
+            [{"id": 1, "name": "Sup", "login": "sup@x.ec",
+              "partner_id": [10, "Sup"]}],
+            [{"id": 10, "email": False}],  # partner has no email
+        ]
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            response = client.post("/tools/odoo_get_discount_policy", json={})
+        result = response.json()["result"]
+        sup = result["policy"]["supervisors"][0]
+        assert sup["email"] == "sup@x.ec"
+        assert sup["login"] == "sup@x.ec"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Sprint 2F — odoo_verify_seller_authorization
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestVerifySellerAuthorization:
+    """Generic 'is this email an authorized seller in the ERP?' contract.
+
+    Layered on top of ``odoo_lookup_user_by_email``: lookup + group
+    membership check, all in one round-trip.
+    """
+
+    def test_authorized_seller(self, client):
+        """Email matches an active res.users AND user is in the seller group."""
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = [
+            # --- odoo_lookup_user_by_email ---
+            # 1) login search
+            [{"id": 7, "name": "Vendedora Ana", "login": "ana@x.ec",
+              "partner_id": [42, "Vendedora Ana"], "active": True}],
+            # 2) read partner
+            [{"id": 42, "email": "ana@x.ec", "name": "Vendedora Ana"}],
+            # --- group resolution ---
+            # 3) ir.model.data sales_team.group_sale_salesman
+            [{"id": 200, "res_id": 88}],
+            # 4) read res.users.groups_id
+            [{"id": 7, "groups_id": [1, 2, 88, 99]}],
+        ]
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            response = client.post(
+                "/tools/odoo_verify_seller_authorization",
+                json={"email": "ana@x.ec"},
+            )
+        assert response.status_code == 200
+        result = response.json()["result"]
+        assert result["success"] is True
+        assert result["authorized"] is True
+        assert result["reason"] is None
+        assert result["user"]["user_id"] == 7
+        assert result["user"]["email"] == "ana@x.ec"
+        assert result["user"]["partner_id"] == 42
+
+    def test_user_exists_but_not_in_seller_group(self, client):
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = [
+            [{"id": 7, "name": "Soporte", "login": "soporte@x.ec",
+              "partner_id": [42, "Soporte"], "active": True}],
+            [{"id": 42, "email": "soporte@x.ec", "name": "Soporte"}],
+            [{"id": 200, "res_id": 88}],
+            # user has groups but NOT 88 (the seller group)
+            [{"id": 7, "groups_id": [1, 2, 99]}],
+        ]
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            response = client.post(
+                "/tools/odoo_verify_seller_authorization",
+                json={"email": "soporte@x.ec"},
+            )
+        result = response.json()["result"]
+        assert result["success"] is True
+        assert result["authorized"] is False
+        assert result["user"] is not None
+        assert result["user"]["user_id"] == 7
+        assert "Ventas" in result["reason"]
+
+    def test_user_not_found(self, client):
+        """No res.users with that email — authorized=false with explicit reason."""
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = [
+            [],  # login search empty
+            [],  # partner.email fallback also empty
+        ]
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            response = client.post(
+                "/tools/odoo_verify_seller_authorization",
+                json={"email": "ghost@nope.ec"},
+            )
+        result = response.json()["result"]
+        assert result["success"] is True
+        assert result["authorized"] is False
+        assert result["user"] is None
+        assert "registrado" in result["reason"].lower()
+
+    def test_seller_group_missing(self, client):
+        """sales_team module not installed → error_code='seller_group_missing'."""
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = [
+            [{"id": 7, "name": "Ana", "login": "ana@x.ec",
+              "partner_id": [42, "Ana"], "active": True}],
+            [{"id": 42, "email": "ana@x.ec", "name": "Ana"}],
+            [],  # ir.model.data lookup empty → group not present
+        ]
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            response = client.post(
+                "/tools/odoo_verify_seller_authorization",
+                json={"email": "ana@x.ec"},
+            )
+        result = response.json()["result"]
+        assert result["success"] is False
+        assert result["error_code"] == "seller_group_missing"
+
+    def test_invalid_email_propagates(self, client):
+        """Empty / whitespace email is rejected by the underlying lookup."""
+        mock_pool = MagicMock()
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            response = client.post(
+                "/tools/odoo_verify_seller_authorization",
+                json={"email": "   "},
+            )
+        result = response.json()["result"]
+        assert result["success"] is False
+        assert result["error_code"] == "invalid_email"
+        mock_pool.execute.assert_not_called()

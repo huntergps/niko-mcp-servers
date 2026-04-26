@@ -359,3 +359,100 @@ class TestScheduleVisitDispatch:
             )
         kwargs = mock_fn.call_args.kwargs
         assert kwargs["note"] is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Sprint 2F — generic ERP-agnostic tools registration & dispatch
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestB2BPolicyToolsListRegistration:
+    """Sprint 2F adds two backend-only tools — both prefixed with odoo_
+    (same convention as odoo_lookup_user_by_email): visible in tools/list,
+    but blocked at tools/call by the allowed_tools filter for any LLM
+    agent whose tools_enabled does not include them (i.e. all of them)."""
+
+    def test_get_discount_policy_listed(self, client):
+        body = _rpc(client, "tools/list")
+        names = {t["name"]: t for t in body["result"]["tools"]}
+        assert "odoo_get_discount_policy" in names
+        # The bare un-prefixed name MUST NOT be registered — that is the
+        # signal to LLM agents and to migration 350 that this is backend
+        # plumbing, not a tool the chatbot should ever pick.
+        assert "get_discount_policy" not in names
+        schema = names["odoo_get_discount_policy"]["inputSchema"]
+        assert schema["type"] == "object"
+        assert schema["required"] == []
+
+    def test_verify_seller_authorization_listed(self, client):
+        body = _rpc(client, "tools/list")
+        names = {t["name"]: t for t in body["result"]["tools"]}
+        assert "odoo_verify_seller_authorization" in names
+        assert "verify_seller_authorization" not in names
+        schema = names["odoo_verify_seller_authorization"]["inputSchema"]
+        assert schema["required"] == ["email"]
+        assert schema["properties"]["email"]["type"] == "string"
+
+
+class TestGetDiscountPolicyDispatch:
+    def test_basic_dispatch(self, client):
+        fake_result = {
+            "success": True,
+            "policy": {
+                "max_pct": 15.0,
+                "supervisors": [
+                    {"user_id": 1, "name": "Sup A", "email": "a@x.ec", "login": "a@x.ec"},
+                ],
+                "source": {
+                    "max_pct_key": "ir.config_parameter:sale.partner_max_sale_discount",
+                    "supervisors_group_xmlid": "account.group_account_manager",
+                },
+            },
+        }
+        with patch(
+            "mcp_odoo.tools.sales.odoo_get_discount_policy",
+            return_value=fake_result,
+        ) as mock_fn:
+            body = _rpc(
+                client,
+                "tools/call",
+                params={
+                    "name": "odoo_get_discount_policy",
+                    "arguments": {},
+                },
+            )
+        assert "isError" not in body["result"]
+        text = body["result"]["content"][0]["text"]
+        assert '"max_pct": 15.0' in text
+        # Creds forwarded positionally.
+        called_args, _ = mock_fn.call_args
+        assert called_args[0] == "test-tenant-001"
+        assert called_args[1] == "http://fake-odoo:8069"
+
+
+class TestVerifySellerAuthorizationDispatch:
+    def test_basic_dispatch(self, client):
+        fake_result = {
+            "success": True,
+            "authorized": True,
+            "user": {"user_id": 7, "name": "Ana", "email": "ana@x.ec",
+                     "login": "ana@x.ec", "partner_id": 42},
+            "reason": None,
+        }
+        with patch(
+            "mcp_odoo.tools.sales.odoo_verify_seller_authorization",
+            return_value=fake_result,
+        ) as mock_fn:
+            body = _rpc(
+                client,
+                "tools/call",
+                params={
+                    "name": "odoo_verify_seller_authorization",
+                    "arguments": {"email": "ana@x.ec"},
+                },
+            )
+        assert "isError" not in body["result"]
+        text = body["result"]["content"][0]["text"]
+        assert '"authorized": true' in text
+        kwargs = mock_fn.call_args.kwargs
+        assert kwargs == {"email": "ana@x.ec"}

@@ -1325,6 +1325,331 @@ def odoo_lookup_user_by_email(
     return result
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Sprint 2F — Generic ERP-agnostic policy & authorization
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _resolve_group_id_by_xmlid(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    module: str, name: str,
+) -> int | None:
+    """Resolve a group's database id from its XML id (module + name).
+
+    Returns the res.groups id, or None if the XML id is not present (e.g.
+    the underlying Odoo module is not installed in this tenant).
+    """
+    rows = odoo_search(
+        tenant_id, url, db, user, password,
+        "ir.model.data",
+        [["module", "=", module], ["name", "=", name]],
+        ["res_id"],
+        limit=1,
+    )
+    if not rows:
+        return None
+    res_id = rows[0].get("res_id")
+    if isinstance(res_id, int) and res_id > 0:
+        return res_id
+    return None
+
+
+def odoo_get_discount_policy(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+) -> dict:
+    """Generic 'get discount policy' contract for the ERP plugin.
+
+    Reads the ERP-specific knobs (in Odoo: an ``ir.config_parameter`` and
+    the ``account.group_account_manager`` security group) and returns a
+    plugin-agnostic shape that ``niko/`` can rely on. The Niko core never
+    has to know the Odoo internals — those leak only through the
+    ``source`` metadata which the dashboard renders as a read-only badge
+    ("this came from Odoo X parameter").
+
+    Returns
+    -------
+    {
+        "success": True,
+        "policy": {
+            "max_pct": float,         # 0.0 means 'no control configured'
+            "supervisors": [
+                {"user_id": int, "name": str, "email": str|None, "login": str}
+            ],
+            "source": {
+                "max_pct_key": "ir.config_parameter:sale.partner_max_sale_discount",
+                "supervisors_group_xmlid": "account.group_account_manager"
+            }
+        }
+    }
+    or {"success": False, "error_code": "...", "error_detail": "..."}
+    """
+    started = time.time()
+    log_args: dict = {}
+
+    # 1) Read max_pct from ir.config_parameter.
+    max_pct: float = 0.0
+    try:
+        raw = odoo_call_method(
+            tenant_id, url, db, user, password,
+            "ir.config_parameter", "get_param",
+            [], args=["sale.partner_max_sale_discount", "0"],
+        )
+        try:
+            max_pct = float(raw) if raw not in (None, "", False) else 0.0
+        except (TypeError, ValueError):
+            # Non-numeric stored value (e.g. an admin typo) → treat as
+            # "no control configured" rather than blocking the caller.
+            max_pct = 0.0
+    except Exception as e:
+        err = f"Error leyendo ir.config_parameter sale.partner_max_sale_discount: {e}"
+        _log_call("get_discount_policy", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "config_parameter_read_failed",
+            "error_detail": err,
+        }
+
+    # 2) Resolve the supervisor group via its XML id.
+    try:
+        group_id = _resolve_group_id_by_xmlid(
+            tenant_id, url, db, user, password,
+            module="account", name="group_account_manager",
+        )
+    except Exception as e:
+        err = f"Error resolviendo grupo account.group_account_manager: {e}"
+        _log_call("get_discount_policy", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "supervisor_group_lookup_failed",
+            "error_detail": err,
+        }
+
+    if group_id is None:
+        err = "Modulo account no instalado o group_account_manager no encontrado"
+        _log_call("get_discount_policy", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "supervisor_group_missing",
+            "error_detail": err,
+        }
+
+    # 3) List active supervisors in that group.
+    try:
+        sup_rows = odoo_search(
+            tenant_id, url, db, user, password,
+            "res.users",
+            [["groups_id", "in", [group_id]], ["active", "=", True]],
+            ["id", "name", "login", "partner_id"],
+            limit=200,
+        )
+    except Exception as e:
+        err = f"Error listando supervisores en grupo {group_id}: {e}"
+        _log_call("get_discount_policy", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "supervisors_lookup_failed",
+            "error_detail": err,
+        }
+
+    # 4) Read partner emails in batch for the canonical email per supervisor.
+    partner_ids: list[int] = []
+    user_to_partner: dict[int, int | None] = {}
+    for row in sup_rows or []:
+        pf = row.get("partner_id")
+        pid: int | None = None
+        if isinstance(pf, list) and len(pf) >= 2:
+            pid = pf[0]
+        elif isinstance(pf, int):
+            pid = pf
+        user_to_partner[row["id"]] = pid
+        if pid:
+            partner_ids.append(pid)
+
+    partner_email_map: dict[int, str | None] = {}
+    if partner_ids:
+        try:
+            partners = odoo_read(
+                tenant_id, url, db, user, password,
+                "res.partner", partner_ids, ["email"],
+            )
+            for p in partners or []:
+                partner_email_map[p["id"]] = p.get("email") or None
+        except Exception as e:
+            # Non-fatal — fall back to login as the email surrogate below.
+            logger.warning(
+                "ODOO_CALL get_discount_policy tenant=%s could not read partner emails: %s",
+                tenant_id, e,
+            )
+
+    supervisors: list[dict] = []
+    for row in sup_rows or []:
+        pid = user_to_partner.get(row["id"])
+        partner_email = partner_email_map.get(pid) if pid else None
+        login = row.get("login") or ""
+        # Login is often the email already in modern Odoo installs; fall
+        # back to it when partner.email is empty.
+        email = partner_email or (login if "@" in login else None)
+        supervisors.append({
+            "user_id": row["id"],
+            "name": row.get("name") or "",
+            "email": email,
+            "login": login,
+        })
+
+    result = {
+        "success": True,
+        "policy": {
+            "max_pct": max_pct,
+            "supervisors": supervisors,
+            "source": {
+                "max_pct_key": "ir.config_parameter:sale.partner_max_sale_discount",
+                "supervisors_group_xmlid": "account.group_account_manager",
+            },
+        },
+    }
+    _log_call("get_discount_policy", tenant_id, log_args,
+              {"max_pct": max_pct, "supervisor_count": len(supervisors)}, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
+def odoo_verify_seller_authorization(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    email: str,
+) -> dict:
+    """Generic 'is this email an authorized seller in the ERP?' contract.
+
+    Deeper than ``odoo_lookup_user_by_email``: not only finds the user,
+    but also confirms the user belongs to the ERP's seller security
+    group (in Odoo: ``sales_team.group_sale_salesman``). Niko's core
+    asks "is this email allowed to sell?" and the plugin owns the answer.
+
+    Returns
+    -------
+    {
+        "success": True,
+        "authorized": bool,
+        "user": {"user_id", "name", "email", "login", "partner_id"} | None,
+        "reason": str | None
+    }
+    or {"success": False, "error_code": "...", "error_detail": "..."}
+    """
+    started = time.time()
+    log_args = {"email": email}
+
+    # 1) Reuse the canonical lookup-by-email helper. It already filters
+    #    inactive users, falls back to partner.email and resolves the
+    #    canonical partner email — no need to re-implement here.
+    lookup = odoo_lookup_user_by_email(
+        tenant_id, url, db, user, password, email,
+    )
+
+    if lookup.get("success") is False:
+        code = lookup.get("error_code")
+        if code == "user_not_found":
+            _log_call("verify_seller_authorization", tenant_id, log_args,
+                      {"authorized": False, "reason": "user_not_found"}, None,
+                      int((time.time() - started) * 1000))
+            return {
+                "success": True,
+                "authorized": False,
+                "user": None,
+                "reason": "Email no registrado en res.users",
+            }
+        if code == "invalid_email":
+            # Surface the validation error to the caller; the wrapper in
+            # niko/ should never have called us with garbage.
+            _log_call("verify_seller_authorization", tenant_id, log_args,
+                      None, "invalid_email",
+                      int((time.time() - started) * 1000))
+            return lookup
+        # Any other lookup failure is an infrastructure problem.
+        _log_call("verify_seller_authorization", tenant_id, log_args,
+                  None, code or "lookup_failed",
+                  int((time.time() - started) * 1000))
+        return lookup
+
+    user_obj = lookup.get("user") or {}
+
+    # 2) Resolve the seller group via its XML id.
+    try:
+        group_id = _resolve_group_id_by_xmlid(
+            tenant_id, url, db, user, password,
+            module="sales_team", name="group_sale_salesman",
+        )
+    except Exception as e:
+        err = f"Error resolviendo grupo sales_team.group_sale_salesman: {e}"
+        _log_call("verify_seller_authorization", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "seller_group_lookup_failed",
+            "error_detail": err,
+        }
+
+    if group_id is None:
+        err = "Modulo sales_team no instalado o group_sale_salesman no encontrado"
+        _log_call("verify_seller_authorization", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "seller_group_missing",
+            "error_detail": err,
+        }
+
+    # 3) Read the user's groups_id and check membership.
+    try:
+        rows = odoo_read(
+            tenant_id, url, db, user, password,
+            "res.users", [user_obj["user_id"]], ["groups_id"],
+        )
+    except Exception as e:
+        err = f"Error leyendo res.users.groups_id para user_id={user_obj.get('user_id')}: {e}"
+        _log_call("verify_seller_authorization", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "user_groups_read_failed",
+            "error_detail": err,
+        }
+
+    user_group_ids = (rows[0].get("groups_id") or []) if rows else []
+    authorized = group_id in user_group_ids
+
+    user_payload = {
+        "user_id": user_obj.get("user_id"),
+        "name": user_obj.get("name") or "",
+        "email": user_obj.get("email"),
+        "login": user_obj.get("login") or "",
+        "partner_id": user_obj.get("partner_id"),
+    }
+
+    if authorized:
+        _log_call("verify_seller_authorization", tenant_id, log_args,
+                  {"authorized": True, "user_id": user_payload["user_id"]}, None,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": True,
+            "authorized": True,
+            "user": user_payload,
+            "reason": None,
+        }
+
+    _log_call("verify_seller_authorization", tenant_id, log_args,
+              {"authorized": False, "user_id": user_payload["user_id"]}, None,
+              int((time.time() - started) * 1000))
+    return {
+        "success": True,
+        "authorized": False,
+        "user": user_payload,
+        "reason": "Usuario existe pero no pertenece al grupo de Ventas",
+    }
+
+
 def odoo_apply_discount(
     tenant_id: str, url: str, db: str, user: str, password: str,
     order_id: int,

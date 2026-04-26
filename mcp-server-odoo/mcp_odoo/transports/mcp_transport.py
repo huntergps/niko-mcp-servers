@@ -852,6 +852,43 @@ MCP_TOOLS = [
             "required": ["email"],
         },
     },
+    # Backend-only tools — Sprint 2F. Generic ERP-agnostic contracts that
+    # niko/integrations/ wrappers consume. Keep the odoo_ prefix because
+    # they are NOT LLM-facing (no agent.tools_enabled lists them) and the
+    # allowed_tools filter on tools/call (mcp_transport.py L1018) blocks
+    # any LLM agent from calling them anyway.
+    {
+        "name": "odoo_get_discount_policy",
+        "description": (
+            "Backend RPC: lee la politica de descuento del ERP "
+            "(max_pct desde ir.config_parameter sale.partner_max_sale_discount "
+            "y la lista de supervisores autorizados desde el grupo "
+            "account.group_account_manager). Devuelve un contrato "
+            "agnostico-ERP que el core de niko consume."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "odoo_verify_seller_authorization",
+        "description": (
+            "Backend RPC: confirma que un email corresponde a un vendedor "
+            "autorizado en el ERP — busca el res.users y verifica que "
+            "pertenece al grupo sales_team.group_sale_salesman. Mas profundo "
+            "que odoo_lookup_user_by_email: lookup + chequeo de grupo en una "
+            "sola llamada."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "email": {"type": "string", "description": "Email del vendedor a verificar"},
+            },
+            "required": ["email"],
+        },
+    },
     {
         "name": "sri_import",
         "description": "Importar factura de compra del SRI usando la clave de acceso de 49 digitos. Usa esto cuando alguien envie un numero de 49 digitos.",
@@ -1383,6 +1420,17 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
     if tool_name == "odoo_lookup_user_by_email":
         from mcp_odoo.tools import sales as _sales
         result = _sales.odoo_lookup_user_by_email(*creds, email=args["email"])
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    # Backend-only — Sprint 2F generic ERP-agnostic contracts.
+    if tool_name == "odoo_get_discount_policy":
+        from mcp_odoo.tools import sales as _sales
+        result = _sales.odoo_get_discount_policy(*creds)
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "odoo_verify_seller_authorization":
+        from mcp_odoo.tools import sales as _sales
+        result = _sales.odoo_verify_seller_authorization(*creds, email=args["email"])
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "sri_import":
