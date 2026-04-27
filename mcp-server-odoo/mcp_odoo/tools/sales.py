@@ -383,7 +383,7 @@ def odoo_create_quotation(
         raw_lines = odoo_read(
             tenant_id, url, db, user, password,
             "sale.order.line", line_ids,
-            ["product_id", "name", "product_uom_qty", "price_unit",
+            ["id", "product_id", "name", "product_uom_qty", "price_unit",
              "discount", "price_subtotal", "price_tax", "price_total"],
         )
         for ln in (raw_lines or []):
@@ -393,6 +393,11 @@ def odoo_create_quotation(
             tax = ln.get("price_tax", 0) or 0
             total = ln.get("price_total", 0) or 0
             order_lines_detail.append({
+                # ``line_id`` is the REAL Odoo sale.order.line.id — the
+                # LLM MUST use this value (not a positional index) when
+                # calling update_quotation_line / remove_quotation_line /
+                # apply_discount on a specific line.
+                "line_id": ln.get("id"),
                 "product": product_name,
                 "quantity": ln.get("product_uom_qty", 1),
                 "price_unit": price_unit,
@@ -595,7 +600,7 @@ def odoo_add_to_quotation(
         raw_lines = odoo_read(
             tenant_id, url, db, user, password,
             "sale.order.line", line_ids,
-            ["product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total"],
+            ["id", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total"],
         ) if line_ids else []
 
         order_lines_detail = []
@@ -605,6 +610,7 @@ def odoo_add_to_quotation(
             subtotal = ln.get("price_subtotal", 0) or 0
             total = ln.get("price_total", 0) or 0
             order_lines_detail.append({
+                "line_id": ln.get("id"),  # real Odoo id, see create_quotation note
                 "product": product_name,
                 "quantity": ln.get("product_uom_qty", 1),
                 "price_unit": price_unit,
