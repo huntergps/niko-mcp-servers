@@ -764,16 +764,71 @@ def odoo_change_quotation_customer(
         return {"success": False, "error_code": "partner_not_found", "error_detail": err}
 
     # Apply the change.
+    # NOTE: Odoo 13 + Tecnosmart custom modules (flex_erp /
+    # tecno_discount_sale) return ``None`` from write() when the
+    # change triggers a hook with no explicit return. XML-RPC then
+    # raises ``TypeError: cannot marshal None unless allow_none is
+    # enabled`` — but the DB row IS updated. We treat that specific
+    # exception as transient and verify by re-reading.
+    write_marshal_none = False
     try:
         odoo_call_method(
             tenant_id, url, db, user, password,
             "sale.order", "write", [order_id], args=[{"partner_id": new_partner_id}],
         )
     except Exception as e:
-        err = f"Error actualizando partner_id de sale.order {order_id}: {e}"
+        msg = str(e)
+        if "cannot marshal None" in msg or "allow_none" in msg:
+            write_marshal_none = True
+            logger.warning(
+                "ODOO_CALL change_quotation_customer: write returned None "
+                "(Odoo 13 marshalling quirk on order_id=%s); verifying via "
+                "read-after-write", order_id,
+            )
+        else:
+            err = f"Error actualizando partner_id de sale.order {order_id}: {e}"
+            _log_call("change_quotation_customer", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "write_failed", "error_detail": err}
+
+    # Verify the change landed (always — covers both the "None marshal"
+    # path and the regular path; the round-trip is cheap and guards
+    # against custom-module hooks that silently revert the change).
+    try:
+        verify_rows = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id], ["partner_id", "state"],
+        )
+    except Exception as e:
+        err = f"write OK pero read-after-write falló: {e}"
         _log_call("change_quotation_customer", tenant_id, log_args, None, err,
                   int((time.time() - started) * 1000))
-        return {"success": False, "error_code": "write_failed", "error_detail": err}
+        return {
+            "success": False, "error_code": "verify_failed", "error_detail": err,
+        }
+    if not verify_rows:
+        err = "sale.order desapareció tras el write"
+        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "verify_failed", "error_detail": err}
+
+    verified_partner = verify_rows[0].get("partner_id")
+    verified_partner_id = (
+        verified_partner[0] if isinstance(verified_partner, list) and verified_partner
+        else verified_partner if isinstance(verified_partner, int) else None
+    )
+    if verified_partner_id != new_partner_id:
+        err = (
+            f"write reportó éxito pero partner_id quedó en "
+            f"{verified_partner_id} (esperado {new_partner_id}). "
+            f"Posible hook custom revirtió el cambio."
+        )
+        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False, "error_code": "write_reverted", "error_detail": err,
+            "verified_partner_id": verified_partner_id,
+        }
 
     new_partner = partner_rows[0]
     result = {
