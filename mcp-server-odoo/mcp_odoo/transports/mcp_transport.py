@@ -8,6 +8,7 @@ Multi-tenant: each MCP session carries a tenant JWT in headers.
 
 import json
 import logging
+import re
 import socket
 import xmlrpc.client
 
@@ -2617,22 +2618,140 @@ async def _get_tenant_slug(tenant_id: str) -> str:
     return slug
 
 
+# ---------------------------------------------------------------------------
+# Default-code shortcut for `search_products`.
+#
+# When the query looks like a product code (alphanumeric token, ≥4 chars,
+# at least one digit), we short-circuit the BGE-M3 semantic ranker and
+# read `default_code =ilike <query>` directly from Odoo. The semantic
+# ranker is great for descriptions ("cable patch cord") but actively
+# WRONG for codes — it prioritises lexical similarity over exact match
+# and frequently returns ACC0291 for query="CAB0527".
+#
+# Pattern is tenant-agnostic: accepts CAB0527, 001-A, PROD_2024_001,
+# 6300, etc. The "must contain a digit" rule excludes pure-letter words
+# like "RAM" or "case" that would otherwise get a useless exact-code
+# probe before falling back to semantic.
+# ---------------------------------------------------------------------------
+_DEFAULT_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_\-]{4,}$")
+
+
+def _looks_like_default_code(query: str) -> bool:
+    """Return True if ``query`` looks like a product SKU.
+
+    Rules:
+      - alphanumeric + ``_`` + ``-`` only (no spaces, no other punctuation)
+      - length ≥ 4
+      - contains at least one digit (excludes "RAM", "case", "laptop", ...)
+    """
+    if not query:
+        return False
+    q = query.strip()
+    if not _DEFAULT_CODE_PATTERN.match(q):
+        return False
+    if not any(c.isdigit() for c in q):
+        return False
+    return True
+
+
+async def _exact_code_lookup(tenant_id: str, code: str) -> list[dict]:
+    """Look up products by exact ``default_code`` (case-insensitive) in Odoo.
+
+    Returns rows shaped like the pgvector RPC output so they can be fed
+    through the same downstream pipeline (``_fetch_products_live`` +
+    ``_format_ranked_page``):
+
+        [{"odoo_id": <product.template id>,
+          "name": str,
+          "code": str,
+          "metadata": {"odoo_id": ..., "name": ..., "code": ..., "price": ...}}]
+
+    Returns ``[]`` on miss or if the tenant has no Odoo wired.
+    """
+    tc = await _get_tenant_config_by_id(tenant_id)
+    if not tc:
+        return []
+
+    from mcp_odoo.tools.generic import odoo_search as _search
+
+    try:
+        # `=ilike` is case-insensitive exact match (no wildcards). This
+        # tolerates "cab0527" (lowercase) but does not match "CAB05271".
+        rows = _search(
+            tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
+            "product.template",
+            [["default_code", "=ilike", code], ["active", "=", True]],
+            fields=[
+                "id", "name", "default_code", "list_price", "qty_available",
+            ],
+            limit=10,
+        )
+    except Exception as exc:
+        logger.warning(
+            f"_exact_code_lookup({code!r}) failed: {exc!r} — "
+            "falling back to semantic search"
+        )
+        return []
+
+    out: list[dict] = []
+    for row in rows or []:
+        rid = row.get("id")
+        if not isinstance(rid, int):
+            continue
+        out.append({
+            "odoo_id": rid,
+            "name": row.get("name") or "",
+            "code": row.get("default_code") or "",
+            "metadata": {
+                "odoo_id": rid,
+                "name": row.get("name") or "",
+                "code": row.get("default_code") or "",
+                "price": row.get("list_price") or 0,
+            },
+        })
+    return out
+
+
 async def _rag_search(
     query: str, top_k: int = 10, offset: int = 0, tenant_id: str = ""
 ) -> str:
     """Hybrid product search: pgvector RRF + ILIKE merge + live Odoo + paginated.
 
-    1. Look up the cached ranked list for (tenant, query). If hit and
+    1. If the query looks like a product code (e.g. "CAB0527"), do an
+       exact ``default_code`` lookup against Odoo first. Match → top-1
+       deterministic result. Miss → fall through to semantic.
+    2. Look up the cached ranked list for (tenant, query). If hit and
        not expired, slice it [offset:offset+top_k] and return immediately.
-    2. On cache miss: run the full hybrid search (vector RRF + ILIKE),
+    3. On cache miss: run the full hybrid search (vector RRF + ILIKE),
        live-fetch all candidates from Odoo, re-rank in-stock-first,
        cache the WHOLE ranked list for 60s, then return the requested
        page.
-    3. There is NO hard cap on top_k or candidate pool size — the user
+    4. There is NO hard cap on top_k or candidate pool size — the user
        can ask for as many as the catalog has. The pagination is for
        UX (Telegram messages have a length limit) and to absorb burst
        traffic.
     """
+    # ── Default-code shortcut ────────────────────────────────────────
+    # Bug fix: BGE-M3 ranks ACC0291 above CAB0527 for query="CAB0527"
+    # because the embedding model optimises for lexical similarity, not
+    # exact code match. When the query smells like a SKU, ask Odoo for
+    # an exact match first; only fall back to the semantic path if no
+    # row comes back.
+    if _looks_like_default_code(query):
+        exact = await _exact_code_lookup(tenant_id, query.strip())
+        if exact:
+            ids = [r["odoo_id"] for r in exact]
+            live = await _fetch_products_live(tenant_id, ids)
+            ranked: list[dict] = []
+            for r in exact:
+                r["_live"] = live.get(r["odoo_id"])
+                ranked.append(r)
+            # Cache under the normalised query key so paginated follow-ups
+            # ("siguiente") hit the cache instead of re-running the lookup.
+            _query_cache_set(tenant_id, query.strip().lower(), ranked)
+            return _format_ranked_page(ranked, top_k, offset)
+        # No exact match → fall through to semantic ranking (existing path).
+
     cache_key = query.strip().lower()
     cached_ranked = _query_cache_get(tenant_id, cache_key)
     if cached_ranked is not None:
