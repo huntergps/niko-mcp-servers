@@ -643,6 +643,128 @@ def odoo_add_to_quotation(
     return result
 
 
+def odoo_change_quotation_customer(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int,
+    new_partner_id: int,
+    salesperson_user_id: int | None = None,
+) -> dict:
+    """Reassign a draft sale.order to a different customer.
+
+    Useful when the seller realises mid-quotation that they were
+    cotizando para el cliente equivocado. Odoo allows reassigning
+    ``partner_id`` while the order is in ``draft`` or ``sent``;
+    confirmed orders are immutable.
+
+    Validations:
+    - Order exists and ``state in ('draft', 'sent')``.
+    - When ``salesperson_user_id`` is provided, ``order.user_id`` must
+      match (B2B sellers cannot reassign each other's quotations).
+    - ``new_partner_id`` exists in res.partner.
+
+    Returns ``{success: True, order_id, name, partner_id, partner_name,
+    state}`` or an error envelope.
+    """
+    started = time.time()
+    log_args = {"order_id": order_id, "new_partner_id": new_partner_id}
+
+    # Read the order.
+    try:
+        rows = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id],
+            ["state", "user_id", "partner_id", "name"],
+        )
+    except Exception as e:
+        err = f"Error consultando sale.order id={order_id}: {e}"
+        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "read_failed", "error_detail": err}
+
+    if not rows:
+        err = f"sale.order {order_id} no existe"
+        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "order_not_found", "error_detail": err}
+
+    order = rows[0]
+    state = order.get("state") or ""
+    if state not in ("draft", "sent"):
+        err = (
+            f"La cotización {order.get('name') or order_id} está en estado "
+            f"'{state}'. Solo se puede cambiar el cliente mientras está en "
+            "borrador o enviada."
+        )
+        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False, "error_code": "order_not_editable",
+            "error_detail": err, "state": state,
+        }
+
+    if salesperson_user_id is not None:
+        order_user = order.get("user_id")
+        order_user_id = (
+            order_user[0] if isinstance(order_user, list) and order_user
+            else order_user if isinstance(order_user, int) else None
+        )
+        if order_user_id and order_user_id != salesperson_user_id:
+            err = (
+                f"La cotización pertenece a otro vendedor (user_id={order_user_id}); "
+                f"no puedes reasignar el cliente de cotizaciones que no son tuyas."
+            )
+            _log_call("change_quotation_customer", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {
+                "success": False, "error_code": "not_your_quotation",
+                "error_detail": err,
+            }
+
+    # Validate new_partner_id exists.
+    try:
+        partner_rows = odoo_read(
+            tenant_id, url, db, user, password,
+            "res.partner", [new_partner_id], ["name", "vat"],
+        )
+    except Exception as e:
+        err = f"Error consultando res.partner id={new_partner_id}: {e}"
+        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "partner_lookup_failed", "error_detail": err}
+    if not partner_rows:
+        err = f"res.partner {new_partner_id} no existe"
+        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "partner_not_found", "error_detail": err}
+
+    # Apply the change.
+    try:
+        odoo_call_method(
+            tenant_id, url, db, user, password,
+            "sale.order", "write", [order_id], args=[{"partner_id": new_partner_id}],
+        )
+    except Exception as e:
+        err = f"Error actualizando partner_id de sale.order {order_id}: {e}"
+        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "write_failed", "error_detail": err}
+
+    new_partner = partner_rows[0]
+    result = {
+        "success": True,
+        "order_id": order_id,
+        "name": order.get("name") or "",
+        "state": state,
+        "partner_id": new_partner_id,
+        "partner_name": new_partner.get("name") or "",
+        "partner_vat": new_partner.get("vat") or "",
+    }
+    _log_call("change_quotation_customer", tenant_id, log_args,
+              {"order_id": order_id, "new_partner_id": new_partner_id}, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
 def odoo_get_active_quotation(
     tenant_id: str, url: str, db: str, user: str, password: str,
     partner_id: int,

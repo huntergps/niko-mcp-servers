@@ -667,6 +667,35 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "change_quotation_customer",
+        "description": (
+            "Cambiar el cliente (partner_id) de una cotizacion en borrador. "
+            "Usa cuando el vendedor descubre a mitad del flujo que la cotizacion "
+            "estaba destinada a otro cliente — Odoo permite reasignar partner_id "
+            "mientras state in ('draft','sent'). En cotizaciones confirmadas falla. "
+            "Si seller_context esta presente, valida que la cotizacion pertenezca "
+            "a este vendedor."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {
+                    "type": "integer",
+                    "description": "ID interno de Odoo de la cotizacion a reasignar.",
+                },
+                "new_partner_id": {
+                    "type": "integer",
+                    "description": (
+                        "partner_id del NUEVO cliente. Tomalo del resultado de "
+                        "search_partner (campo `odoo_id` del primer match) o "
+                        "identify_customer (campo `partner_id`)."
+                    ),
+                },
+            },
+            "required": ["order_id", "new_partner_id"],
+        },
+    },
+    {
         "name": "get_active_quotation",
         "description": (
             "Buscar la cotizacion en borrador mas reciente de un cliente. Util cuando "
@@ -1489,6 +1518,19 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         result = odoo_add_to_quotation(
             *creds, args["order_id"], args["lines"],
             salesperson_user_id=args.get("salesperson_user_id"),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "change_quotation_customer":
+        from mcp_odoo.tools.sales import odoo_change_quotation_customer
+        # Auto-inject salesperson_user_id from seller_context so the
+        # plugin can verify the quotation belongs to this seller.
+        sp_uid = seller_uid if seller_uid is not None else None
+        result = odoo_change_quotation_customer(
+            *creds,
+            int(args["order_id"]),
+            int(args["new_partner_id"]),
+            salesperson_user_id=sp_uid,
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
