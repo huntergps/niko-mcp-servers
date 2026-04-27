@@ -1224,19 +1224,18 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
                     "seller's own vat (seller_uid=%s)",
                     cedula_ruc, seller_uid,
                 )
-                # ``llm_action`` is an INTERNAL instruction to the LLM —
-                # it must NOT be relayed verbatim to the customer. The
-                # rule mcp-error-handling (priority 270) tells the LLM
-                # to silently follow it and only show the user the
-                # final result.
+                # ``llm_action`` is an INTERNAL directive to the LLM in
+                # Spanish (matches the model's working language). Rule
+                # mcp-error-handling (priority 270) tells the LLM to
+                # follow it silently and only show the final result.
                 return json.dumps({
                     "success": False,
                     "error_code": "self_lookup_blocked",
                     "llm_action": (
-                        "INTERNAL: That RUC is the seller's own. Call "
-                        "search_partner(query=<the customer name/company "
-                        "the seller mentioned>) instead. Then retry the "
-                        "flow. Do NOT show this error to the user."
+                        "INTERNA: ese RUC es del vendedor. Llama "
+                        "search_partner con el nombre del cliente que "
+                        "mencionó el vendedor. NO muestres este error "
+                        "al usuario."
                     ),
                 }, ensure_ascii=False, indent=2)
 
@@ -1258,13 +1257,12 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
                     "success": False,
                     "error_code": "missing_partner",
                     "llm_action": (
-                        "INTERNAL: partner_id is missing. Call "
-                        "search_partner(query=<customer name>), pick "
-                        "the matching partner_id from the result, then "
-                        "retry create_quotation with that partner_id "
-                        "and the same lines. Do NOT show this error to "
-                        "the user — they should see the final quotation "
-                        "or a brief 'un momento' message."
+                        "INTERNA: falta partner_id. Llama "
+                        "search_partner con el nombre del cliente, toma "
+                        "el campo `odoo_id` del primer resultado y "
+                        "vuelve a llamar create_quotation pasando ese "
+                        "valor como partner_id (entero). NO muestres "
+                        "este error al usuario."
                     ),
                 }, ensure_ascii=False, indent=2)
 
@@ -1278,12 +1276,11 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
                     "success": False,
                     "error_code": "wrong_partner",
                     "llm_action": (
-                        "INTERNAL: The partner_id you passed is the "
-                        "seller's own. Call search_partner(query=<the "
-                        "customer name/company the seller mentioned>), "
-                        "pick the correct partner_id, then retry "
-                        "create_quotation with it. Do NOT show this "
-                        "error to the user."
+                        "INTERNA: ese partner_id es del vendedor. "
+                        "Llama search_partner con el nombre del cliente, "
+                        "toma `odoo_id` del primer resultado y vuelve a "
+                        "llamar create_quotation con ese valor. NO "
+                        "muestres este error al usuario."
                     ),
                 }, ensure_ascii=False, indent=2)
 
