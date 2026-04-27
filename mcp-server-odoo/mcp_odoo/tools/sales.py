@@ -702,6 +702,32 @@ def odoo_change_quotation_customer(
             "error_detail": err, "state": state,
         }
 
+    # Guard: same_partner — the LLM passed the CURRENT partner_id again
+    # (typically because it reused the active_customer_partner_id from
+    # the seller_context header instead of reading odoo_id from the new
+    # search_partner result). Block with a clear instruction.
+    current_partner = order.get("partner_id")
+    current_partner_id = (
+        current_partner[0] if isinstance(current_partner, list) and current_partner
+        else current_partner if isinstance(current_partner, int) else None
+    )
+    if current_partner_id and current_partner_id == new_partner_id:
+        _log_call("change_quotation_customer", tenant_id, log_args, None,
+                  "same_partner_blocked",
+                  int((time.time() - started) * 1000))
+        return {
+            "success": False,
+            "error_code": "same_partner",
+            "llm_action": (
+                "INTERNA: el new_partner_id que pasaste es el cliente "
+                "ACTUAL de la cotización (no es un cambio). Para reasignar, "
+                "primero llama search_partner con el nombre/empresa del "
+                "NUEVO cliente, toma el campo `odoo_id` del primer match "
+                "y úsalo como new_partner_id. NO uses el partner_id del "
+                "seller_context ni el del cliente actual."
+            ),
+        }
+
     if salesperson_user_id is not None:
         order_user = order.get("user_id")
         order_user_id = (
