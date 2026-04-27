@@ -1387,19 +1387,26 @@ def odoo_get_discount_policy(
     log_args: dict = {}
 
     # 1) Read max_pct from ir.config_parameter.
+    # In Odoo 13, ``get_param`` is a class-level method that does not
+    # accept an ``ids`` arg, so XML-RPC ``execute_kw('ir.config_parameter',
+    # 'get_param', [[], 'key', '0'])`` fails with "takes from 2 to 3
+    # positional arguments but 4 were given". Read the row directly.
     max_pct: float = 0.0
     try:
-        raw = odoo_call_method(
+        rows = odoo_search(
             tenant_id, url, db, user, password,
-            "ir.config_parameter", "get_param",
-            [], args=["sale.partner_max_sale_discount", "0"],
+            "ir.config_parameter",
+            [["key", "=", "sale.partner_max_sale_discount"]],
+            ["value"],
+            limit=1,
         )
-        try:
-            max_pct = float(raw) if raw not in (None, "", False) else 0.0
-        except (TypeError, ValueError):
-            # Non-numeric stored value (e.g. an admin typo) → treat as
-            # "no control configured" rather than blocking the caller.
-            max_pct = 0.0
+        if rows:
+            try:
+                max_pct = float(rows[0].get("value") or 0.0)
+            except (TypeError, ValueError):
+                # Non-numeric stored value (e.g. an admin typo) → treat as
+                # "no control configured" rather than blocking the caller.
+                max_pct = 0.0
     except Exception as e:
         err = f"Error leyendo ir.config_parameter sale.partner_max_sale_discount: {e}"
         _log_call("get_discount_policy", tenant_id, log_args, None, err,
