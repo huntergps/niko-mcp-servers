@@ -1286,17 +1286,21 @@ def odoo_lookup_user_by_email(
     elif isinstance(partner_field, int):
         partner_id = partner_field
 
-    # Pull partner.email if available so the caller has the canonical email
-    # back (login is sometimes a username in older Odoo installs).
+    # Pull partner.email + vat (the seller's own RUC/cedula). The vat
+    # is needed by niko's B2B gates so the seller cannot accidentally
+    # invoke ``identify_customer`` with their own RUC and end up
+    # cotizando a sí mismo (observed in smoke test).
     partner_email: str | None = None
+    partner_vat: str | None = None
     if partner_id:
         try:
             partner_rows = odoo_read(
                 tenant_id, url, db, user, password,
-                "res.partner", [partner_id], ["email", "name"],
+                "res.partner", [partner_id], ["email", "name", "vat"],
             )
             if partner_rows:
                 partner_email = partner_rows[0].get("email") or None
+                partner_vat = partner_rows[0].get("vat") or None
                 # Refresh partner_name from canonical record (more reliable
                 # than the Many2one display string).
                 partner_name = partner_rows[0].get("name") or partner_name
@@ -1317,6 +1321,7 @@ def odoo_lookup_user_by_email(
             "email": final_email,
             "partner_id": partner_id,
             "partner_name": partner_name,
+            "partner_vat": partner_vat,
         },
     }
     _log_call("lookup_user_by_email", tenant_id, log_args,

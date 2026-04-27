@@ -1183,6 +1183,122 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
     tc = tenant_config  # shorthand
     creds = (tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"])
 
+    # Read X-Seller-Context (sent by niko core when a B2B seller has
+    # completed /login OTP). Plugin uses it to validate self-references
+    # and to inject salesperson_user_id into quotation tools so niko
+    # core does not need to know ERP-specific args.
+    seller_ctx_raw = request.headers.get("x-seller-context") or ""
+    seller_ctx: dict = {}
+    if seller_ctx_raw:
+        try:
+            seller_ctx = json.loads(seller_ctx_raw) or {}
+        except (json.JSONDecodeError, TypeError):
+            seller_ctx = {}
+    seller_uid: int | None = None
+    seller_partner_id: int | None = None
+    seller_partner_vat: str = ""
+    if seller_ctx:
+        try:
+            seller_uid = int(seller_ctx.get("odoo_user_id")) \
+                if seller_ctx.get("odoo_user_id") is not None else None
+        except (TypeError, ValueError):
+            seller_uid = None
+        try:
+            seller_partner_id = int(seller_ctx.get("partner_id")) \
+                if seller_ctx.get("partner_id") is not None else None
+        except (TypeError, ValueError):
+            seller_partner_id = None
+        seller_partner_vat = (seller_ctx.get("partner_vat") or "").strip()
+
+    # ── B2B guards: applied centrally before the tool dispatcher so
+    # individual tool functions stay simple. Each guard returns an
+    # error envelope as JSON text — the LLM reads `error_code` and
+    # corrects on the next turn.
+    if seller_uid is not None:
+        # Guard 1: identify_customer with seller's own VAT.
+        if tool_name == "identify_customer" and seller_partner_vat:
+            cedula_ruc = (str(args.get("cedula_ruc") or "")).strip()
+            if cedula_ruc and cedula_ruc == seller_partner_vat:
+                logger.warning(
+                    "BLOCKED identify_customer: cedula_ruc %s equals "
+                    "seller's own vat (seller_uid=%s)",
+                    cedula_ruc, seller_uid,
+                )
+                return json.dumps({
+                    "success": False,
+                    "error_code": "self_lookup_blocked",
+                    "error_detail": (
+                        "Ese RUC es el TUYO (eres el vendedor, no el "
+                        "cliente). Llama search_partner con el "
+                        "nombre/empresa del cliente que el vendedor "
+                        "te mencionó. Nunca uses tu propio RUC en "
+                        "identify_customer."
+                    ),
+                }, ensure_ascii=False, indent=2)
+
+        # Guard 2: create_quotation — validate partner_id + inject
+        # salesperson_user_id.
+        if tool_name == "create_quotation":
+            raw_partner = args.get("partner_id")
+            try:
+                partner_id_arg = int(raw_partner) if raw_partner is not None else None
+            except (TypeError, ValueError):
+                partner_id_arg = None
+
+            if partner_id_arg is None:
+                logger.warning(
+                    "BLOCKED create_quotation: missing partner_id "
+                    "(seller_uid=%s)", seller_uid,
+                )
+                return json.dumps({
+                    "success": False,
+                    "error_code": "missing_partner",
+                    "error_detail": (
+                        "Antes de crear la cotización debes identificar "
+                        "al cliente. Llama search_partner con el "
+                        "nombre/empresa del cliente, muéstrale los datos "
+                        "al vendedor para que confirme y vuelve a llamar "
+                        "create_quotation con el partner_id correcto. "
+                        "NO cotices al vendedor a sí mismo."
+                    ),
+                }, ensure_ascii=False, indent=2)
+
+            if seller_partner_id is not None and partner_id_arg == seller_partner_id:
+                logger.warning(
+                    "BLOCKED create_quotation: partner_id %s equals "
+                    "seller's own partner_id (seller_uid=%s)",
+                    partner_id_arg, seller_uid,
+                )
+                return json.dumps({
+                    "success": False,
+                    "error_code": "wrong_partner",
+                    "error_detail": (
+                        "El partner_id que pasaste es el VENDEDOR, no "
+                        "el cliente. Llama search_partner para encontrar "
+                        "al cliente real (por nombre, RUC o ciudad), "
+                        "pídele al vendedor que confirme y vuelve a "
+                        "llamar create_quotation con el partner_id "
+                        "correcto."
+                    ),
+                }, ensure_ascii=False, indent=2)
+
+            # Inject salesperson_user_id from seller_context (override).
+            if args.get("salesperson_user_id") != seller_uid:
+                logger.info(
+                    "INJECT create_quotation.salesperson_user_id=%s "
+                    "(was=%s)", seller_uid, args.get("salesperson_user_id"),
+                )
+                args["salesperson_user_id"] = seller_uid
+
+        # Guard 3: add_to_quotation — inject salesperson_user_id.
+        if tool_name == "add_to_quotation":
+            if args.get("salesperson_user_id") != seller_uid:
+                logger.info(
+                    "INJECT add_to_quotation.salesperson_user_id=%s "
+                    "(was=%s)", seller_uid, args.get("salesperson_user_id"),
+                )
+                args["salesperson_user_id"] = seller_uid
+
     if tool_name == "search_products":
         return await _rag_search(
             args["query"],
@@ -1340,12 +1456,16 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             end_customer_name=args.get("end_customer_name"),
             end_customer_phone=args.get("end_customer_phone"),
             end_customer_email=args.get("end_customer_email"),
+            salesperson_user_id=args.get("salesperson_user_id"),
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "add_to_quotation":
         from mcp_odoo.tools.sales import odoo_add_to_quotation
-        result = odoo_add_to_quotation(*creds, args["order_id"], args["lines"])
+        result = odoo_add_to_quotation(
+            *creds, args["order_id"], args["lines"],
+            salesperson_user_id=args.get("salesperson_user_id"),
+        )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "get_active_quotation":
