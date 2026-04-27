@@ -846,6 +846,270 @@ def odoo_change_quotation_customer(
     return result
 
 
+def odoo_update_quotation_line(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int,
+    line_id: int,
+    quantity: float,
+    salesperson_user_id: int | None = None,
+) -> dict:
+    """Update product_uom_qty on a sale.order.line.
+
+    Validations:
+    - Order is in ``draft`` or ``sent`` (immutable otherwise).
+    - Line belongs to the order (line.order_id == order_id).
+    - When ``salesperson_user_id`` provided, ``order.user_id`` must match.
+    - If ``quantity == 0`` returns a ``quantity_zero`` envelope so the
+      LLM asks the seller to confirm a delete instead of silently
+      zero-ing the line.
+
+    Returns updated order totals + the modified line on success.
+    """
+    started = time.time()
+    log_args = {"order_id": order_id, "line_id": line_id, "quantity": quantity}
+
+    try:
+        order_rows = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id],
+            ["state", "user_id", "name", "order_line"],
+        )
+    except Exception as e:
+        err = f"Error consultando sale.order {order_id}: {e}"
+        _log_call("update_quotation_line", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "read_failed", "error_detail": err}
+    if not order_rows:
+        return {"success": False, "error_code": "order_not_found",
+                "error_detail": f"sale.order {order_id} no existe"}
+    order = order_rows[0]
+    state = order.get("state") or ""
+    if state not in ("draft", "sent"):
+        return {
+            "success": False, "error_code": "order_not_editable",
+            "error_detail": (
+                f"La cotización {order.get('name') or order_id} está en "
+                f"estado '{state}'; solo se puede modificar en draft o sent."
+            ),
+        }
+
+    if salesperson_user_id is not None:
+        oid_user = order.get("user_id")
+        oid_uid = oid_user[0] if isinstance(oid_user, list) and oid_user else (
+            oid_user if isinstance(oid_user, int) else None
+        )
+        if oid_uid and oid_uid != salesperson_user_id:
+            return {
+                "success": False, "error_code": "not_your_quotation",
+                "error_detail": (
+                    f"La cotización pertenece a otro vendedor (user_id={oid_uid})."
+                ),
+            }
+
+    if line_id not in (order.get("order_line") or []):
+        return {
+            "success": False, "error_code": "line_mismatch",
+            "error_detail": (
+                f"La línea {line_id} no pertenece a la cotización "
+                f"{order.get('name') or order_id}."
+            ),
+        }
+
+    try:
+        qty_f = float(quantity)
+    except (TypeError, ValueError):
+        return {"success": False, "error_code": "invalid_quantity",
+                "error_detail": "quantity debe ser numérico"}
+    if qty_f < 0:
+        return {"success": False, "error_code": "invalid_quantity",
+                "error_detail": "quantity no puede ser negativo"}
+
+    if qty_f == 0:
+        return {
+            "success": False,
+            "error_code": "quantity_zero",
+            "llm_action": (
+                "INTERNA: el vendedor pidió cantidad 0 para una línea. "
+                "Eso equivale a eliminar la línea. Pregunta al vendedor "
+                "'¿Confirmas eliminar esta línea de la cotización?'. "
+                "Si responde sí, llama remove_quotation_line con "
+                f"order_id={order_id}, line_id={line_id}. NO ejecutes "
+                "el delete sin confirmación explícita."
+            ),
+            "order_id": order_id,
+            "line_id": line_id,
+        }
+
+    # Apply the change. Same Odoo 13 marshal-None caveat as
+    # change_quotation_customer (custom hooks may return None).
+    try:
+        odoo_call_method(
+            tenant_id, url, db, user, password,
+            "sale.order.line", "write", [line_id],
+            args=[{"product_uom_qty": qty_f}],
+        )
+    except Exception as e:
+        msg = str(e)
+        if "cannot marshal None" not in msg and "allow_none" not in msg:
+            return {"success": False, "error_code": "write_failed",
+                    "error_detail": f"Error escribiendo line {line_id}: {e}"}
+
+    # Verify + read updated line + order totals.
+    try:
+        line_rows = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order.line", [line_id],
+            ["product_id", "product_uom_qty", "price_unit", "discount",
+             "price_subtotal", "price_tax", "price_total"],
+        )
+        order_after = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id],
+            ["amount_untaxed", "amount_tax", "amount_total"],
+        )
+    except Exception as e:
+        return {"success": False, "error_code": "verify_failed",
+                "error_detail": f"write OK pero read-after-write falló: {e}"}
+
+    if not line_rows or line_rows[0].get("product_uom_qty") != qty_f:
+        return {
+            "success": False, "error_code": "write_reverted",
+            "error_detail": (
+                f"write reportó éxito pero quantity quedó en "
+                f"{line_rows[0].get('product_uom_qty') if line_rows else 'N/A'} "
+                f"(esperado {qty_f}). Hook custom revirtió."
+            ),
+        }
+
+    line = line_rows[0]
+    order_amt = order_after[0] if order_after else {}
+    product_field = line.get("product_id")
+    product_name = (
+        product_field[1] if isinstance(product_field, list) and len(product_field) > 1
+        else ""
+    )
+
+    result = {
+        "success": True,
+        "order_id": order_id,
+        "line_id": line_id,
+        "product": product_name,
+        "quantity": line.get("product_uom_qty", 0),
+        "price_unit": line.get("price_unit", 0),
+        "price_unit_display": format_price_display(line.get("price_unit", 0)),
+        "discount": line.get("discount", 0),
+        "subtotal": line.get("price_subtotal", 0),
+        "subtotal_display": format_price_display(line.get("price_subtotal", 0)),
+        "total": line.get("price_total", 0),
+        "total_display": format_price_display(line.get("price_total", 0)),
+        "order_amount_total": order_amt.get("amount_total", 0),
+        "order_amount_total_display": format_price_display(order_amt.get("amount_total", 0)),
+    }
+    _log_call("update_quotation_line", tenant_id, log_args,
+              {"order_id": order_id, "line_id": line_id, "quantity": qty_f}, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
+def odoo_remove_quotation_line(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int,
+    line_id: int,
+    salesperson_user_id: int | None = None,
+) -> dict:
+    """Delete a sale.order.line. Same draft/ownership validations as
+    update_quotation_line. The LLM should ask for explicit seller
+    confirmation BEFORE calling this — see the rule
+    ``b2b-line-edit-confirmation``."""
+    started = time.time()
+    log_args = {"order_id": order_id, "line_id": line_id}
+
+    try:
+        order_rows = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id],
+            ["state", "user_id", "name", "order_line"],
+        )
+    except Exception as e:
+        return {"success": False, "error_code": "read_failed",
+                "error_detail": f"Error consultando sale.order {order_id}: {e}"}
+    if not order_rows:
+        return {"success": False, "error_code": "order_not_found",
+                "error_detail": f"sale.order {order_id} no existe"}
+    order = order_rows[0]
+    state = order.get("state") or ""
+    if state not in ("draft", "sent"):
+        return {
+            "success": False, "error_code": "order_not_editable",
+            "error_detail": (
+                f"La cotización {order.get('name') or order_id} está en "
+                f"estado '{state}'."
+            ),
+        }
+    if salesperson_user_id is not None:
+        oid_user = order.get("user_id")
+        oid_uid = oid_user[0] if isinstance(oid_user, list) and oid_user else (
+            oid_user if isinstance(oid_user, int) else None
+        )
+        if oid_uid and oid_uid != salesperson_user_id:
+            return {
+                "success": False, "error_code": "not_your_quotation",
+                "error_detail": "La cotización pertenece a otro vendedor.",
+            }
+    if line_id not in (order.get("order_line") or []):
+        return {
+            "success": False, "error_code": "line_mismatch",
+            "error_detail": (
+                f"La línea {line_id} no pertenece a la cotización."
+            ),
+        }
+
+    try:
+        odoo_call_method(
+            tenant_id, url, db, user, password,
+            "sale.order.line", "unlink", [line_id], args=None,
+        )
+    except Exception as e:
+        msg = str(e)
+        if "cannot marshal None" not in msg and "allow_none" not in msg:
+            return {"success": False, "error_code": "delete_failed",
+                    "error_detail": f"Error eliminando line {line_id}: {e}"}
+
+    # Verify gone + new totals.
+    try:
+        order_after = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id],
+            ["amount_untaxed", "amount_tax", "amount_total", "order_line"],
+        )
+    except Exception as e:
+        return {"success": False, "error_code": "verify_failed",
+                "error_detail": f"unlink OK pero read-after falló: {e}"}
+
+    if not order_after:
+        return {"success": False, "error_code": "verify_failed",
+                "error_detail": "order desapareció tras unlink"}
+    if line_id in (order_after[0].get("order_line") or []):
+        return {
+            "success": False, "error_code": "delete_reverted",
+            "error_detail": "unlink reportó éxito pero la línea sigue presente",
+        }
+
+    order_amt = order_after[0]
+    result = {
+        "success": True,
+        "order_id": order_id,
+        "removed_line_id": line_id,
+        "remaining_lines": len(order_amt.get("order_line") or []),
+        "order_amount_total": order_amt.get("amount_total", 0),
+        "order_amount_total_display": format_price_display(order_amt.get("amount_total", 0)),
+    }
+    _log_call("remove_quotation_line", tenant_id, log_args,
+              {"order_id": order_id, "line_id": line_id}, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
 def odoo_get_active_quotation(
     tenant_id: str, url: str, db: str, user: str, password: str,
     partner_id: int,

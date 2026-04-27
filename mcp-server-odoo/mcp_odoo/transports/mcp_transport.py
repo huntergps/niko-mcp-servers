@@ -696,6 +696,50 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "update_quotation_line",
+        "description": (
+            "Modificar la cantidad (product_uom_qty) de una linea existente "
+            "en una cotizacion en borrador. Usar cuando el vendedor pide "
+            "'cambiar a 5 unidades', 'pon 10 en lugar de 3', 'quita 1 unidad' "
+            "(restas a la cantidad actual). Si la nueva cantidad es 0, el "
+            "MCP devuelve quantity_zero — pide confirmacion al vendedor para "
+            "borrar la linea con remove_quotation_line."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "integer"},
+                "line_id": {
+                    "type": "integer",
+                    "description": "ID de la linea (sale.order.line). Tomalo de get_quotation o del array order_line.",
+                },
+                "quantity": {
+                    "type": "number",
+                    "description": "Nueva cantidad final (NO incremento). Si pides 'quitar 1' calcula nueva = actual - 1.",
+                },
+            },
+            "required": ["order_id", "line_id", "quantity"],
+        },
+    },
+    {
+        "name": "remove_quotation_line",
+        "description": (
+            "Eliminar una linea de una cotizacion en borrador. SOLO llama "
+            "esta tool DESPUES de que el vendedor confirmo explicitamente "
+            "el borrado. Si llegaste aqui via update_quotation_line con "
+            "cantidad 0 → primero pregunta '¿Confirmas eliminar la linea?' "
+            "y solo si responde si llamas remove."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "integer"},
+                "line_id": {"type": "integer"},
+            },
+            "required": ["order_id", "line_id"],
+        },
+    },
+    {
         "name": "get_active_quotation",
         "description": (
             "Buscar la cotizacion en borrador mas reciente de un cliente. Util cuando "
@@ -1531,6 +1575,27 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             int(args["order_id"]),
             int(args["new_partner_id"]),
             salesperson_user_id=sp_uid,
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "update_quotation_line":
+        from mcp_odoo.tools.sales import odoo_update_quotation_line
+        result = odoo_update_quotation_line(
+            *creds,
+            int(args["order_id"]),
+            int(args["line_id"]),
+            float(args["quantity"]),
+            salesperson_user_id=seller_uid,
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "remove_quotation_line":
+        from mcp_odoo.tools.sales import odoo_remove_quotation_line
+        result = odoo_remove_quotation_line(
+            *creds,
+            int(args["order_id"]),
+            int(args["line_id"]),
+            salesperson_user_id=seller_uid,
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
