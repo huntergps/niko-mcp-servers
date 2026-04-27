@@ -1052,3 +1052,212 @@ class TestVerifySellerAuthorization:
         assert result["success"] is False
         assert result["error_code"] == "invalid_email"
         mock_pool.execute.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Sprint 6 — line_id per-line envelope invariant
+# ─────────────────────────────────────────────────────────────────────
+#
+# After Sprint 6 in niko core (commit 0d90ba7), the agent loop maintains
+# a persistent ``active_quotation_lines`` state that mirrors the
+# ``lines[]`` array of the most recent quotation envelope. The extractor
+# requires ``line_id`` per line and silently drops lines that lack it
+# (see niko.agent.active_lines._normalize_line). These tests pin down
+# the envelope shape for the three quotation tools that mutate / read
+# the order so the self-healing loop never starves for line_id.
+
+
+class TestGetQuotationLineIdEnvelope:
+    """``odoo_get_quotation`` must emit ``line_id`` for every line."""
+
+    def test_get_quotation_emits_line_id_per_line(self):
+        """A 3-line SO returns lines[] with line_id=ln.id on each row."""
+        from mcp_odoo.tools import sales as sales_mod
+
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = [
+            # 1) read sale.order header
+            [{
+                "id": 555, "name": "VENTA-3LINES", "state": "draft",
+                "partner_id": [1, "Cliente"], "amount_total": 345.0,
+                "amount_untaxed": 300.0, "amount_tax": 45.0,
+                "date_order": "2026-04-27", "create_date": "2026-04-27",
+                "order_line": [10, 11, 12],
+            }],
+            # 2) read sale.order.line — MUST include 'id' so we can
+            # echo it as 'line_id' in the envelope.
+            [
+                {"id": 10, "product_id": [50, "Cable UTP"], "name": "Cable UTP",
+                 "product_uom_qty": 1, "price_unit": 100.0, "discount": 0,
+                 "price_subtotal": 100.0, "price_tax": 15.0, "price_total": 115.0},
+                {"id": 11, "product_id": [51, "Switch 8p"], "name": "Switch 8p",
+                 "product_uom_qty": 2, "price_unit": 50.0, "discount": 0,
+                 "price_subtotal": 100.0, "price_tax": 15.0, "price_total": 115.0},
+                {"id": 12, "product_id": [52, "Patch panel"], "name": "Patch panel",
+                 "product_uom_qty": 1, "price_unit": 100.0, "discount": 0,
+                 "price_subtotal": 100.0, "price_tax": 15.0, "price_total": 115.0},
+            ],
+        ]
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            result = sales_mod.odoo_get_quotation(
+                "test-tenant-001", "http://x", "db", "u", "p", 555,
+            )
+
+        assert result["success"] is True
+        assert len(result["lines"]) == 3
+        assert [ln["line_id"] for ln in result["lines"]] == [10, 11, 12]
+        # Sanity: each line carries the canonical fields that the
+        # niko extractor reads (product, quantity, price_unit, total).
+        for ln in result["lines"]:
+            assert "product" in ln
+            assert "quantity" in ln
+            assert "price_unit" in ln
+            assert "total" in ln
+
+        # The read on sale.order.line MUST request 'id' — without it
+        # the regression resurfaces. odoo_read passes fields via the
+        # kwargs slot (index 8): execute(..., model, method, [ids],
+        # {"fields": [...]}). See mcp_odoo.tools.generic.odoo_read.
+        line_read_call = mock_pool.execute.call_args_list[1]
+        assert line_read_call.args[5] == "sale.order.line"
+        assert line_read_call.args[6] == "read"
+        fields_kwargs = line_read_call.args[8]
+        assert "id" in fields_kwargs.get("fields", []), (
+            "sale.order.line read must include 'id' so the envelope can "
+            "expose it as line_id (Sprint 6 invariant)."
+        )
+
+
+class TestUpdateQuotationLineEnvelope:
+    """``odoo_update_quotation_line`` must return the full ``lines[]``
+    array of the SO after the write — not just the modified line."""
+
+    def test_update_quotation_line_returns_full_lines_array(self):
+        """A 3-line SO + update on line 11 returns all 3 lines refreshed."""
+        from mcp_odoo.tools import sales as sales_mod
+
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = [
+            # 1) read sale.order header (state, user_id, name, order_line)
+            [{
+                "id": 555, "state": "draft", "name": "VENTA-3LINES",
+                "user_id": [7, "Ana"], "order_line": [10, 11, 12],
+            }],
+            # 2) write on sale.order.line (returns True)
+            True,
+            # 3) read sale.order header AFTER the write
+            [{
+                "id": 555, "name": "VENTA-3LINES", "state": "draft",
+                "partner_id": [1, "Cliente"], "amount_untaxed": 350.0,
+                "amount_tax": 52.5, "amount_total": 402.5,
+                "order_line": [10, 11, 12], "share_link_so": "",
+            }],
+            # 4) read ALL sale.order.line rows of the SO (line 11 now
+            # has the new qty=5).
+            [
+                {"id": 10, "product_id": [50, "Cable UTP"], "name": "Cable UTP",
+                 "product_uom_qty": 1, "price_unit": 100.0, "discount": 0,
+                 "price_subtotal": 100.0, "price_tax": 15.0, "price_total": 115.0},
+                {"id": 11, "product_id": [51, "Switch 8p"], "name": "Switch 8p",
+                 "product_uom_qty": 5, "price_unit": 50.0, "discount": 0,
+                 "price_subtotal": 250.0, "price_tax": 37.5, "price_total": 287.5},
+                {"id": 12, "product_id": [52, "Patch panel"], "name": "Patch panel",
+                 "product_uom_qty": 1, "price_unit": 100.0, "discount": 0,
+                 "price_subtotal": 100.0, "price_tax": 15.0, "price_total": 115.0},
+            ],
+        ]
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            result = sales_mod.odoo_update_quotation_line(
+                "test-tenant-001", "http://x", "db", "u", "p",
+                order_id=555, line_id=11, quantity=5,
+            )
+
+        assert result["success"] is True
+        # Backwards-compat top-level fields about the modified line
+        assert result["line_id"] == 11
+        assert result["quantity"] == 5
+        # NEW (Sprint 6): full lines[] array with all live lines + line_id
+        assert "lines" in result
+        assert len(result["lines"]) == 3
+        assert [ln["line_id"] for ln in result["lines"]] == [10, 11, 12]
+        # Modified line shows the new qty in the array as well.
+        modified = next(ln for ln in result["lines"] if ln["line_id"] == 11)
+        assert modified["quantity"] == 5
+
+    def test_update_quotation_line_quantity_zero_envelope_preserved(self):
+        """qty=0 still returns the quantity_zero envelope so the LLM
+        asks for explicit confirmation before remove_quotation_line."""
+        from mcp_odoo.tools import sales as sales_mod
+
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = [
+            # read sale.order header
+            [{
+                "id": 555, "state": "draft", "name": "VENTA-3LINES",
+                "user_id": [7, "Ana"], "order_line": [10, 11, 12],
+            }],
+        ]
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            result = sales_mod.odoo_update_quotation_line(
+                "test-tenant-001", "http://x", "db", "u", "p",
+                order_id=555, line_id=11, quantity=0,
+            )
+
+        assert result["success"] is False
+        assert result["error_code"] == "quantity_zero"
+        assert result["order_id"] == 555
+        assert result["line_id"] == 11
+        # quantity_zero short-circuits BEFORE the write — only one
+        # odoo call should have happened (the header read).
+        assert mock_pool.execute.call_count == 1
+
+
+class TestRemoveQuotationLineEnvelope:
+    """``odoo_remove_quotation_line`` must return the full ``lines[]``
+    array of the SO after the unlink so niko's active_quotation_lines
+    state stays in sync without a follow-up get_quotation."""
+
+    def test_remove_quotation_line_returns_full_lines_array(self):
+        """Removing line 11 from a 3-line SO returns lines[] with the 2
+        remaining lines, each carrying line_id."""
+        from mcp_odoo.tools import sales as sales_mod
+
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = [
+            # 1) read sale.order header
+            [{
+                "id": 555, "state": "draft", "name": "VENTA-3LINES",
+                "user_id": [7, "Ana"], "order_line": [10, 11, 12],
+            }],
+            # 2) unlink sale.order.line (returns True)
+            True,
+            # 3) read sale.order header AFTER the unlink — line 11 is gone
+            [{
+                "id": 555, "amount_untaxed": 200.0, "amount_tax": 30.0,
+                "amount_total": 230.0, "order_line": [10, 12],
+            }],
+            # 4) read remaining sale.order.line rows
+            [
+                {"id": 10, "product_id": [50, "Cable UTP"], "name": "Cable UTP",
+                 "product_uom_qty": 1, "price_unit": 100.0, "discount": 0,
+                 "price_subtotal": 100.0, "price_tax": 15.0, "price_total": 115.0},
+                {"id": 12, "product_id": [52, "Patch panel"], "name": "Patch panel",
+                 "product_uom_qty": 1, "price_unit": 100.0, "discount": 0,
+                 "price_subtotal": 100.0, "price_tax": 15.0, "price_total": 115.0},
+            ],
+        ]
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            result = sales_mod.odoo_remove_quotation_line(
+                "test-tenant-001", "http://x", "db", "u", "p",
+                order_id=555, line_id=11,
+            )
+
+        assert result["success"] is True
+        assert result["removed_line_id"] == 11
+        assert result["remaining_lines"] == 2
+        # NEW (Sprint 6): full lines[] array with the surviving lines.
+        assert "lines" in result
+        assert len(result["lines"]) == 2
+        assert [ln["line_id"] for ln in result["lines"]] == [10, 12]
+        # Sanity: removed line is NOT in the array.
+        assert 11 not in [ln["line_id"] for ln in result["lines"]]

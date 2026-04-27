@@ -960,35 +960,85 @@ def odoo_update_quotation_line(
             return {"success": False, "error_code": "write_failed",
                     "error_detail": f"Error escribiendo line {line_id}: {e}"}
 
-    # Verify + read updated line + order totals.
+    # Verify + read updated line + order totals + ALL live lines.
+    #
+    # Sprint 6 requires the full ``lines[]`` array on every quotation
+    # mutation envelope so niko core's ``active_quotation_lines`` memory
+    # block stays in sync without forcing a follow-up get_quotation.
+    # We re-read the order header (incl. order_line ids) and all live
+    # sale.order.line rows in one pass — same shape as add_to_quotation.
     try:
-        line_rows = odoo_read(
-            tenant_id, url, db, user, password,
-            "sale.order.line", [line_id],
-            ["product_id", "product_uom_qty", "price_unit", "discount",
-             "price_subtotal", "price_tax", "price_total"],
-        )
         order_after = odoo_read(
             tenant_id, url, db, user, password,
             "sale.order", [order_id],
-            ["amount_untaxed", "amount_tax", "amount_total"],
+            ["name", "state", "partner_id", "amount_untaxed", "amount_tax",
+             "amount_total", "order_line", "share_link_so"],
         )
+        if not order_after:
+            return {"success": False, "error_code": "verify_failed",
+                    "error_detail": "order desapareció tras el write"}
+        order_after_row = order_after[0]
+        all_line_ids = order_after_row.get("order_line") or []
+        all_lines_raw = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order.line", all_line_ids,
+            ["id", "product_id", "name", "product_uom_qty", "price_unit",
+             "discount", "price_subtotal", "price_tax", "price_total"],
+        ) if all_line_ids else []
     except Exception as e:
         return {"success": False, "error_code": "verify_failed",
                 "error_detail": f"write OK pero read-after-write falló: {e}"}
 
-    if not line_rows or line_rows[0].get("product_uom_qty") != qty_f:
+    # Locate the line we just wrote in the refreshed batch (avoids a
+    # second round-trip just for the modified line).
+    modified_line_row = next(
+        (ln for ln in (all_lines_raw or []) if ln.get("id") == line_id),
+        None,
+    )
+    if modified_line_row is None or modified_line_row.get("product_uom_qty") != qty_f:
+        actual_qty = (
+            modified_line_row.get("product_uom_qty") if modified_line_row else "N/A"
+        )
         return {
             "success": False, "error_code": "write_reverted",
             "error_detail": (
-                f"write reportó éxito pero quantity quedó en "
-                f"{line_rows[0].get('product_uom_qty') if line_rows else 'N/A'} "
+                f"write reportó éxito pero quantity quedó en {actual_qty} "
                 f"(esperado {qty_f}). Hook custom revirtió."
             ),
         }
 
-    line = line_rows[0]
-    order_amt = order_after[0] if order_after else {}
+    # Build the full lines[] array — same shape as create_quotation /
+    # add_to_quotation. ``line_id`` is the Odoo sale.order.line.id and
+    # is what niko's active_quotation_lines extractor anchors on.
+    lines_detail = []
+    for ln in (all_lines_raw or []):
+        product_field = ln.get("product_id")
+        pname = (
+            product_field[1] if isinstance(product_field, list) and len(product_field) > 1
+            else ln.get("name", "")
+        )
+        price_unit = ln.get("price_unit", 0) or 0
+        subtotal = ln.get("price_subtotal", 0) or 0
+        tax = ln.get("price_tax", 0) or 0
+        total = ln.get("price_total", 0) or 0
+        lines_detail.append({
+            "line_id": ln.get("id"),
+            "product": pname,
+            "quantity": ln.get("product_uom_qty", 1),
+            "price_unit": price_unit,
+            "price_unit_display": format_price_display(price_unit),
+            "discount": ln.get("discount", 0),
+            "subtotal": subtotal,
+            "subtotal_display": format_price_display(subtotal),
+            "tax": tax,
+            "tax_display": format_price_display(tax),
+            "total": total,
+            "total_display": format_price_display(total),
+        })
+
+    # Top-level fields about the modified line are kept for backwards
+    # compatibility with callers that read the response inline.
+    line = modified_line_row
     product_field = line.get("product_id")
     product_name = (
         product_field[1] if isinstance(product_field, list) and len(product_field) > 1
@@ -1008,8 +1058,13 @@ def odoo_update_quotation_line(
         "subtotal_display": format_price_display(line.get("price_subtotal", 0)),
         "total": line.get("price_total", 0),
         "total_display": format_price_display(line.get("price_total", 0)),
-        "order_amount_total": order_amt.get("amount_total", 0),
-        "order_amount_total_display": format_price_display(order_amt.get("amount_total", 0)),
+        # Full lines[] array — required by niko's active_quotation_lines
+        # state extractor (Sprint 6). Same shape as add_to_quotation.
+        "lines": lines_detail,
+        "order_amount_total": order_after_row.get("amount_total", 0),
+        "order_amount_total_display": format_price_display(
+            order_after_row.get("amount_total", 0),
+        ),
     }
     _log_call("update_quotation_line", tenant_id, log_args,
               {"order_id": order_id, "line_id": line_id, "quantity": qty_f}, None,
@@ -1081,7 +1136,9 @@ def odoo_remove_quotation_line(
             return {"success": False, "error_code": "delete_failed",
                     "error_detail": f"Error eliminando line {line_id}: {e}"}
 
-    # Verify gone + new totals.
+    # Verify gone + new totals + ALL remaining lines (Sprint 6:
+    # niko's active_quotation_lines extractor needs the fresh
+    # ``lines[]`` array on every quotation mutation).
     try:
         order_after = odoo_read(
             tenant_id, url, db, user, password,
@@ -1095,20 +1152,62 @@ def odoo_remove_quotation_line(
     if not order_after:
         return {"success": False, "error_code": "verify_failed",
                 "error_detail": "order desapareció tras unlink"}
-    if line_id in (order_after[0].get("order_line") or []):
+    remaining_line_ids = order_after[0].get("order_line") or []
+    if line_id in remaining_line_ids:
         return {
             "success": False, "error_code": "delete_reverted",
             "error_detail": "unlink reportó éxito pero la línea sigue presente",
         }
+
+    # Read remaining lines so the envelope mirrors the post-delete state.
+    try:
+        all_lines_raw = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order.line", remaining_line_ids,
+            ["id", "product_id", "name", "product_uom_qty", "price_unit",
+             "discount", "price_subtotal", "price_tax", "price_total"],
+        ) if remaining_line_ids else []
+    except Exception as e:
+        return {"success": False, "error_code": "verify_failed",
+                "error_detail": f"unlink OK pero lectura de líneas falló: {e}"}
+
+    lines_detail = []
+    for ln in (all_lines_raw or []):
+        product_field = ln.get("product_id")
+        pname = (
+            product_field[1] if isinstance(product_field, list) and len(product_field) > 1
+            else ln.get("name", "")
+        )
+        price_unit = ln.get("price_unit", 0) or 0
+        subtotal = ln.get("price_subtotal", 0) or 0
+        tax = ln.get("price_tax", 0) or 0
+        total = ln.get("price_total", 0) or 0
+        lines_detail.append({
+            "line_id": ln.get("id"),
+            "product": pname,
+            "quantity": ln.get("product_uom_qty", 1),
+            "price_unit": price_unit,
+            "price_unit_display": format_price_display(price_unit),
+            "discount": ln.get("discount", 0),
+            "subtotal": subtotal,
+            "subtotal_display": format_price_display(subtotal),
+            "tax": tax,
+            "tax_display": format_price_display(tax),
+            "total": total,
+            "total_display": format_price_display(total),
+        })
 
     order_amt = order_after[0]
     result = {
         "success": True,
         "order_id": order_id,
         "removed_line_id": line_id,
-        "remaining_lines": len(order_amt.get("order_line") or []),
+        "remaining_lines": len(remaining_line_ids),
         "order_amount_total": order_amt.get("amount_total", 0),
         "order_amount_total_display": format_price_display(order_amt.get("amount_total", 0)),
+        # Full lines[] array (post-delete) — Sprint 6 invariant for
+        # niko's active_quotation_lines memory block.
+        "lines": lines_detail,
     }
     _log_call("remove_quotation_line", tenant_id, log_args,
               {"order_id": order_id, "line_id": line_id}, None,
@@ -1334,7 +1433,12 @@ def odoo_get_quotation(
             raw_lines = odoo_read(
                 tenant_id, url, db, user, password,
                 "sale.order.line", line_ids,
-                ["product_id", "name", "product_uom_qty", "price_unit",
+                # ``id`` is required so the Sprint 6 ``active_quotation_lines``
+                # state in niko core can mirror the canonical line_id per
+                # row — without it the LLM falls back to positional indices
+                # and the 3-tier resolver in active_lines.py cannot land
+                # an exact match. See create_quotation for the same pattern.
+                ["id", "product_id", "name", "product_uom_qty", "price_unit",
                  "discount", "price_subtotal", "price_tax", "price_total"],
             )
             for ln in (raw_lines or []):
@@ -1344,6 +1448,12 @@ def odoo_get_quotation(
                 tax = ln.get("price_tax", 0) or 0
                 total = ln.get("price_total", 0) or 0
                 lines_detail.append({
+                    # ``line_id`` mirrors create_quotation/add_to_quotation
+                    # — the LLM (and niko's active_quotation_lines memory
+                    # block) MUST use this real Odoo sale.order.line.id
+                    # when calling update_quotation_line /
+                    # remove_quotation_line / apply_discount.
+                    "line_id": ln.get("id"),
                     "product": pname,
                     "quantity": ln.get("product_uom_qty", 1),
                     "price_unit": price_unit,
