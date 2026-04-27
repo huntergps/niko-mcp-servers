@@ -1248,6 +1248,28 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             except (TypeError, ValueError):
                 partner_id_arg = None
 
+            # Auto-inject partner_id from the persisted active_customer
+            # state when the LLM forgot to pass it. This breaks the
+            # missing_partner → search_partner → retry loop that
+            # surfaced as GraphRecursionError. Niko orchestrator
+            # populates seller_ctx.active_customer_partner_id whenever
+            # a previous turn's search_partner returned a unique match.
+            if partner_id_arg is None:
+                try:
+                    ac_pid = int(seller_ctx.get("active_customer_partner_id")) \
+                        if seller_ctx.get("active_customer_partner_id") is not None else None
+                except (TypeError, ValueError):
+                    ac_pid = None
+                if ac_pid is not None:
+                    logger.info(
+                        "INJECT create_quotation.partner_id=%d from "
+                        "active_customer (seller_uid=%s, name=%r)",
+                        ac_pid, seller_uid,
+                        seller_ctx.get("active_customer_name") or "",
+                    )
+                    args["partner_id"] = ac_pid
+                    partner_id_arg = ac_pid
+
             if partner_id_arg is None:
                 logger.warning(
                     "BLOCKED create_quotation: missing partner_id "
