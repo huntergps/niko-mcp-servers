@@ -1044,24 +1044,27 @@ MCP_TOOLS = [
         "name": "create_partner",
         "description": (
             "Crear un nuevo cliente/contacto en Odoo. "
-            "REQUIERE confirmed=true para ejecutar. Sin confirmed, solo muestra preview. "
-            "Flujo: 1) Llama SIN confirmed con los datos → valida cedula, consulta SRI, devuelve preview. "
-            "2) Muestra al cliente todos los datos y pide confirmacion. "
-            "3) Si confirma, llama DE NUEVO con confirmed=true → crea el cliente."
+            "El tool consulta el SRI automaticamente para obtener nombre, direccion y datos fiscales — "
+            "NUNCA le pidas nombre ni direccion al usuario, el SRI los provee. "
+            "Solo necesitas recopilar del usuario: correo electronico (obligatorio) y telefono (opcional). "
+            "Flujo OBLIGATORIO: "
+            "1) Llama con solo vat (sin confirmed ni name/street) → el tool consulta SRI y devuelve preview. "
+            "2) Muestra el preview al cliente; pide SOLO email y telefono. "
+            "3) Si confirma, llama de nuevo con confirmed=true + email + phone → crea el cliente."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Nombre completo del cliente"},
-                "vat": {"type": "string", "description": "Cedula o RUC"},
-                "email": {"type": "string", "description": "Correo electronico"},
-                "phone": {"type": "string", "description": "Telefono"},
-                "mobile": {"type": "string", "description": "Celular"},
-                "street": {"type": "string", "description": "Direccion"},
-                "city": {"type": "string", "description": "Ciudad"},
-                "confirmed": {"type": "boolean", "description": "true para ejecutar, false/omitido para preview"},
+                "vat": {"type": "string", "description": "Cedula (10 digitos) o RUC (13 digitos)"},
+                "email": {"type": "string", "description": "Correo electronico (pedirlo al usuario)"},
+                "phone": {"type": "string", "description": "Telefono (pedirlo al usuario, opcional)"},
+                "mobile": {"type": "string", "description": "Celular (opcional)"},
+                "name": {"type": "string", "description": "Nombre completo — omitir, el SRI lo provee automaticamente"},
+                "street": {"type": "string", "description": "Direccion — omitir, el SRI la provee automaticamente"},
+                "city": {"type": "string", "description": "Ciudad — omitir, el SRI la provee automaticamente"},
+                "confirmed": {"type": "boolean", "description": "true para crear, false/omitido para preview"},
             },
-            "required": ["name", "vat"],
+            "required": ["vat"],
         },
     },
     {
