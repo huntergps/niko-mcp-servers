@@ -3,9 +3,7 @@
 import logging
 import time
 import traceback
-from datetime import datetime
 
-from mcp_odoo.tools.formatters import format_price_display
 from mcp_odoo.tools.generic import odoo_search, odoo_read, odoo_create, odoo_call_method
 
 logger = logging.getLogger("mcp_odoo.sales")
@@ -31,125 +29,23 @@ def _log_call(tool: str, tenant_id: str, args: dict, result: dict | None, error:
         logger.info("ODOO_CALL %s", payload)
 
 
-def _resolve_lines_to_template_ids(
-    tenant_id: str, url: str, db: str, user: str, password: str,
-    lines: list[dict],
-) -> tuple[list[dict] | None, dict | None]:
-    """Resolve each line's product_code (preferred) / product_id (legacy) into
-    a canonical template_id, in batch.
+def _build_card(order_data: dict) -> dict:
+    """Build a standard _card dict from any order response.
 
-    The LLM speaks SKUs (e.g. "VID0581") because they appear literally in
-    every search_products result. Numeric template_ids, on the other hand,
-    are easy to fabricate when the model loses context. So this function
-    accepts whichever the caller sent, but PREFERS product_code when both
-    are present, and resolves all SKUs in ONE Odoo query (batch search on
-    default_code IN [...]).
-
-    Returns:
-        (resolved_lines, error_dict)
-        - resolved_lines: same list as input, with each item now carrying a
-          definite "_template_id" int field (consumed by the variant
-          resolver downstream). Original keys are preserved.
-        - error_dict: a {success: False, ...} payload if any SKU could not
-          be resolved (or any line was missing both fields). When non-None,
-          resolved_lines is None.
+    ERP-agnostic: the orchestrator reads _card instead of ERP-specific fields
+    to build OrderCard objects for Telegram/WhatsApp inline keyboards.
     """
-    if not lines:
-        return None, {
-            "success": False,
-            "error_code": "no_lines",
-            "error_detail": "lines vacio: se requiere al menos un producto",
-        }
-
-    # Validate per-line shape and split by which identifier was provided.
-    codes_to_resolve: set[str] = set()
-    for idx, line in enumerate(lines):
-        code = line.get("product_code")
-        pid = line.get("product_id")
-        if code and isinstance(code, str) and code.strip():
-            codes_to_resolve.add(code.strip())
-            if pid:
-                logger.info(
-                    "ODOO_CALL resolve_lines tenant=%s line=%d both product_code=%r and product_id=%r passed; preferring product_code",
-                    tenant_id, idx, code, pid,
-                )
-        elif isinstance(pid, int) and pid > 0:
-            logger.warning(
-                "ODOO_CALL resolve_lines tenant=%s line=%d using legacy product_id=%d (deprecated; prefer product_code/SKU)",
-                tenant_id, idx, pid,
-            )
-        else:
-            return None, {
-                "success": False,
-                "error_code": "missing_product_identifier",
-                "error_detail": (
-                    f"Linea {idx}: cada linea debe traer 'product_code' "
-                    f"(SKU del catalogo, preferido) o 'product_id' (template_id, legacy). "
-                    f"Recibi: {line!r}"
-                ),
-                "line_index": idx,
-            }
-
-    # Batch resolve every SKU in one Odoo query.
-    code_to_template_id: dict[str, int] = {}
-    if codes_to_resolve:
-        try:
-            rows = odoo_search(
-                tenant_id, url, db, user, password,
-                "product.template",
-                [["default_code", "in", list(codes_to_resolve)], ["active", "=", True]],
-                ["id", "default_code"],
-                limit=len(codes_to_resolve) * 2,  # account for multiple variants per code (rare)
-            )
-        except Exception as e:
-            return None, {
-                "success": False,
-                "error_code": "sku_lookup_failed",
-                "error_detail": (
-                    f"Error consultando Odoo para resolver SKUs {sorted(codes_to_resolve)}: {e}"
-                ),
-                "missing_skus": sorted(codes_to_resolve),
-            }
-
-        # default_code SHOULD be unique on product.template, but if a tenant
-        # has duplicates we keep the first and warn.
-        for row in rows or []:
-            code = row.get("default_code")
-            if not code:
-                continue
-            if code in code_to_template_id:
-                logger.warning(
-                    "ODOO_CALL resolve_lines tenant=%s duplicate default_code=%r; keeping first match id=%d",
-                    tenant_id, code, code_to_template_id[code],
-                )
-                continue
-            code_to_template_id[code] = row["id"]
-
-        missing = sorted(c for c in codes_to_resolve if c not in code_to_template_id)
-        if missing:
-            return None, {
-                "success": False,
-                "error_code": "sku_not_found",
-                "error_detail": (
-                    f"SKUs no encontrados en el catalogo (o inactivos): {missing}. "
-                    f"Llama search_products primero para obtener el codigo exacto."
-                ),
-                "missing_skus": missing,
-            }
-
-    # Walk lines again, attach the canonical template_id.
-    resolved: list[dict] = []
-    for line in lines:
-        code = (line.get("product_code") or "").strip() or None
-        pid = line.get("product_id")
-        if code:
-            tmpl_id = code_to_template_id[code]
-        else:
-            tmpl_id = pid  # legacy path
-        new_line = dict(line)
-        new_line["_template_id"] = tmpl_id
-        resolved.append(new_line)
-    return resolved, None
+    partner = order_data.get("partner") or {}
+    return {
+        "order_id": order_data.get("order_id") or order_data.get("id"),
+        "order_name": order_data.get("name", ""),
+        "partner_name": (
+            partner.get("name", "") if isinstance(partner, dict) else str(partner)
+        ),
+        "state_label": order_data.get("state_label", order_data.get("state", "")),
+        "total": float(order_data.get("total", order_data.get("amount_total", 0))),
+        "lines_count": len(order_data.get("lines", [])),
+    }
 
 
 def odoo_create_quotation(
@@ -160,37 +56,25 @@ def odoo_create_quotation(
     end_customer_name: str | None = None,
     end_customer_phone: str | None = None,
     end_customer_email: str | None = None,
-    salesperson_user_id: int | None = None,
 ) -> dict:
     """Create a sale order (quotation/proforma) in draft state.
 
     Args:
         partner_id: res.partner ID
-        lines: List of dicts. Each line MUST carry one of:
-               - product_code (str): SKU as it appears in search_products
-                 (PREFERRED — the LLM cannot fabricate a SKU because they
-                 follow a strict format and are echoed verbatim in every
-                 search result).
-               - product_id (int): legacy product.template id (deprecated;
-                 prone to LLM hallucination across turns).
-               Optional per line: quantity (default 1), price_unit, discount.
+        lines: List of dicts with {product_id, quantity, price_unit (optional)}
         notes: Optional notes for the order
         end_customer_name: Name of the end customer (consumidor final)
         end_customer_phone: Phone of the end customer
         end_customer_email: Email of the end customer
-        salesperson_user_id: res.users id of the salesperson that owns the
-            quotation. Sets sale.order.user_id. When None, Odoo defaults to
-            the connection user.
 
     Returns the created order details (read-after-write).
-    On failure returns {success: False, error_code, error_detail, ...}.
+    On failure returns {success: False, error_code, error_detail, partner_id, lines}.
     """
     started = time.time()
     log_args = {
         "partner_id": partner_id,
         "lines_count": len(lines),
         "first_line": lines[0] if lines else None,
-        "salesperson_user_id": salesperson_user_id,
     }
 
     # ── Pre-flight validation ────────────────────────────────────────────
@@ -236,21 +120,6 @@ def odoo_create_quotation(
             "partner_id": partner_id,
         }
 
-    # ── Resolve product_code (SKU) → template_id in batch ──────────────
-    # The LLM passes SKUs ("VID0581") because they appear literally in every
-    # search_products result and their format is hard to fabricate. Legacy
-    # product_id (numeric template_id) is still accepted for backwards
-    # compatibility, but flagged in logs.
-    resolved_lines, resolve_err = _resolve_lines_to_template_ids(
-        tenant_id, url, db, user, password, lines,
-    )
-    if resolve_err is not None:
-        resolve_err.setdefault("partner_id", partner_id)
-        _log_call("create_quotation", tenant_id, log_args, None,
-                  resolve_err.get("error_detail"),
-                  int((time.time() - started) * 1000))
-        return resolve_err
-
     # The entire RAG/search/details pipeline canonicalizes on `product.template`
     # IDs (that's what _fetch_products_live, get_product_details and the
     # embedding store all use, matching what the Odoo UI shows). But
@@ -258,7 +127,7 @@ def odoo_create_quotation(
     # this at the ORM level. So at THIS boundary (and only here) we resolve
     # template_id → first active variant. We also capture uom_id because
     # TecnoSmart's flex_erp override KeyError's on missing 'product_uom'.
-    template_ids = list({line["_template_id"] for line in resolved_lines})
+    template_ids = list({line["product_id"] for line in lines})
     try:
         variants = odoo_search(
             tenant_id, url, db, user, password,
@@ -299,8 +168,8 @@ def odoo_create_quotation(
         }
 
     order_lines = []
-    for line in resolved_lines:
-        tmpl_id = line["_template_id"]
+    for line in lines:
+        tmpl_id = line["product_id"]  # treated as template_id throughout
         variant_pid = variant_by_template[tmpl_id]
         line_vals = {
             "product_id": variant_pid,
@@ -327,11 +196,6 @@ def odoo_create_quotation(
         values["end_customer_phone"] = end_customer_phone
     if end_customer_email:
         values["end_customer_email"] = end_customer_email
-
-    # Salesperson assignment (Sprint 2 B2B). When None, Odoo defaults to
-    # the connection user — same behavior as before.
-    if salesperson_user_id is not None and isinstance(salesperson_user_id, int) and salesperson_user_id > 0:
-        values["user_id"] = salesperson_user_id
 
     # ── Create the sale.order ────────────────────────────────────────────
     try:
@@ -383,39 +247,23 @@ def odoo_create_quotation(
         raw_lines = odoo_read(
             tenant_id, url, db, user, password,
             "sale.order.line", line_ids,
-            ["id", "product_id", "name", "product_uom_qty", "price_unit",
+            ["product_id", "name", "product_uom_qty", "price_unit",
              "discount", "price_subtotal", "price_tax", "price_total"],
         )
         for ln in (raw_lines or []):
             product_name = ln["product_id"][1] if isinstance(ln.get("product_id"), list) else ln.get("name", "")
-            price_unit = ln.get("price_unit", 0) or 0
-            subtotal = ln.get("price_subtotal", 0) or 0
-            tax = ln.get("price_tax", 0) or 0
-            total = ln.get("price_total", 0) or 0
             order_lines_detail.append({
-                # ``line_id`` is the REAL Odoo sale.order.line.id — the
-                # LLM MUST use this value (not a positional index) when
-                # calling update_quotation_line / remove_quotation_line /
-                # apply_discount on a specific line.
-                "line_id": ln.get("id"),
                 "product": product_name,
                 "quantity": ln.get("product_uom_qty", 1),
-                "price_unit": price_unit,
-                "price_unit_display": format_price_display(price_unit),
+                "price_unit": ln.get("price_unit", 0),
                 "discount": ln.get("discount", 0),
-                "subtotal": subtotal,
-                "subtotal_display": format_price_display(subtotal),
-                "tax": tax,
-                "tax_display": format_price_display(tax),
-                "total": total,
-                "total_display": format_price_display(total),
+                "subtotal": ln.get("price_subtotal", 0),
+                "tax": ln.get("price_tax", 0),
+                "total": ln.get("price_total", 0),
             })
 
     partner_name = order["partner_id"][1] if isinstance(order.get("partner_id"), list) else str(order.get("partner_id", ""))
 
-    subtotal_amt = order["amount_untaxed"]
-    tax_amt = order["amount_tax"]
-    total_amt = order["amount_total"]
     result = {
         "success": True,
         "order_id": order_id,
@@ -423,14 +271,12 @@ def odoo_create_quotation(
         "state": order["state"],
         "partner": partner_name,
         "lines": order_lines_detail,
-        "subtotal": subtotal_amt,
-        "subtotal_display": format_price_display(subtotal_amt),
-        "tax": tax_amt,
-        "tax_display": format_price_display(tax_amt),
-        "total": total_amt,
-        "total_display": format_price_display(total_amt),
+        "subtotal": order["amount_untaxed"],
+        "tax": order["amount_tax"],
+        "total": order["amount_total"],
         "share_link": order.get("share_link_so") or "",
     }
+    result["_card"] = _build_card(result)
     _log_call("create_quotation", tenant_id, log_args, result, None, int((time.time() - started) * 1000))
     return result
 
@@ -439,7 +285,6 @@ def odoo_add_to_quotation(
     tenant_id: str, url: str, db: str, user: str, password: str,
     order_id: int,
     lines: list[dict],
-    salesperson_user_id: int | None = None,
 ) -> dict:
     """Append product lines to an existing sale.order in draft state.
 
@@ -449,30 +294,12 @@ def odoo_add_to_quotation(
 
     Args:
         order_id: existing sale.order ID
-        lines: List of dicts. Each line MUST carry one of:
-               - product_code (str): SKU as it appears in search_products
-                 (PREFERRED).
-               - product_id (int): legacy template_id (deprecated).
-               Optional per line: quantity (default 1), price_unit, discount.
-        salesperson_user_id: Forwarded for API symmetry with
-            create_quotation. Since this tool ONLY merges into an existing
-            order, the salesperson on that order is NEVER overwritten —
-            we log a no-op when this argument is supplied.
+        lines: [{product_id (template_id), quantity}, ...]
 
     Returns the updated order summary (same shape as create_quotation).
     """
     started = time.time()
-    log_args = {
-        "order_id": order_id,
-        "lines_count": len(lines),
-        "salesperson_user_id": salesperson_user_id,
-    }
-    if salesperson_user_id is not None:
-        logger.info(
-            "ODOO_CALL add_to_quotation tenant=%s order=%s salesperson_user_id=%s ignored "
-            "(merge path never overwrites sale.order.user_id)",
-            tenant_id, order_id, salesperson_user_id,
-        )
+    log_args = {"order_id": order_id, "lines_count": len(lines)}
 
     if not isinstance(order_id, int) or order_id <= 0:
         err = "order_id requerido y debe ser entero positivo"
@@ -511,19 +338,8 @@ def odoo_add_to_quotation(
             "state": order["state"],
         }
 
-    # ── Resolve product_code (SKU) → template_id in batch ──────────────
-    resolved_lines, resolve_err = _resolve_lines_to_template_ids(
-        tenant_id, url, db, user, password, lines,
-    )
-    if resolve_err is not None:
-        resolve_err.setdefault("order_id", order_id)
-        _log_call("add_to_quotation", tenant_id, log_args, None,
-                  resolve_err.get("error_detail"),
-                  int((time.time() - started) * 1000))
-        return resolve_err
-
     # Resolve template_ids → variant + uom (same logic as create_quotation)
-    template_ids = list({line["_template_id"] for line in resolved_lines})
+    template_ids = list({line["product_id"] for line in lines})
     try:
         variants = odoo_search(
             tenant_id, url, db, user, password,
@@ -553,8 +369,8 @@ def odoo_add_to_quotation(
 
     # Build new sale.order.line records and write to existing order via (0,0,vals) commands
     new_line_cmds = []
-    for line in resolved_lines:
-        tmpl_id = line["_template_id"]
+    for line in lines:
+        tmpl_id = line["product_id"]
         variant_pid = variant_by_template[tmpl_id]
         line_vals = {
             "order_id": order_id,
@@ -600,25 +416,18 @@ def odoo_add_to_quotation(
         raw_lines = odoo_read(
             tenant_id, url, db, user, password,
             "sale.order.line", line_ids,
-            ["id", "product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total"],
+            ["product_id", "product_uom_qty", "price_unit", "price_subtotal", "price_total"],
         ) if line_ids else []
 
         order_lines_detail = []
         for ln in raw_lines:
             product_name = ln["product_id"][1] if isinstance(ln.get("product_id"), list) else ""
-            price_unit = ln.get("price_unit", 0) or 0
-            subtotal = ln.get("price_subtotal", 0) or 0
-            total = ln.get("price_total", 0) or 0
             order_lines_detail.append({
-                "line_id": ln.get("id"),  # real Odoo id, see create_quotation note
                 "product": product_name,
                 "quantity": ln.get("product_uom_qty", 1),
-                "price_unit": price_unit,
-                "price_unit_display": format_price_display(price_unit),
-                "subtotal": subtotal,
-                "subtotal_display": format_price_display(subtotal),
-                "total": total,
-                "total_display": format_price_display(total),
+                "price_unit": ln.get("price_unit", 0),
+                "subtotal": ln.get("price_subtotal", 0),
+                "total": ln.get("price_total", 0),
             })
     except Exception as e:
         err = f"Lines created but read-after-write failed: {e}"
@@ -626,9 +435,6 @@ def odoo_add_to_quotation(
         return {"success": False, "error_code": "read_after_write_failed", "error_detail": err, "order_id": order_id}
 
     partner_name = order["partner_id"][1] if isinstance(order.get("partner_id"), list) else ""
-    subtotal_amt = order["amount_untaxed"]
-    tax_amt = order["amount_tax"]
-    total_amt = order["amount_total"]
     result = {
         "success": True,
         "order_id": order_id,
@@ -637,581 +443,13 @@ def odoo_add_to_quotation(
         "partner": partner_name,
         "lines": order_lines_detail,
         "lines_added": len(new_line_cmds),
-        "subtotal": subtotal_amt,
-        "subtotal_display": format_price_display(subtotal_amt),
-        "tax": tax_amt,
-        "tax_display": format_price_display(tax_amt),
-        "total": total_amt,
-        "total_display": format_price_display(total_amt),
+        "subtotal": order["amount_untaxed"],
+        "tax": order["amount_tax"],
+        "total": order["amount_total"],
         "share_link": order.get("share_link_so") or "",
     }
+    result["_card"] = _build_card(result)
     _log_call("add_to_quotation", tenant_id, log_args, result, None, int((time.time() - started) * 1000))
-    return result
-
-
-def odoo_change_quotation_customer(
-    tenant_id: str, url: str, db: str, user: str, password: str,
-    order_id: int,
-    new_partner_id: int,
-    salesperson_user_id: int | None = None,
-) -> dict:
-    """Reassign a draft sale.order to a different customer.
-
-    Useful when the seller realises mid-quotation that they were
-    cotizando para el cliente equivocado. Odoo allows reassigning
-    ``partner_id`` while the order is in ``draft`` or ``sent``;
-    confirmed orders are immutable.
-
-    Validations:
-    - Order exists and ``state in ('draft', 'sent')``.
-    - When ``salesperson_user_id`` is provided, ``order.user_id`` must
-      match (B2B sellers cannot reassign each other's quotations).
-    - ``new_partner_id`` exists in res.partner.
-
-    Returns ``{success: True, order_id, name, partner_id, partner_name,
-    state}`` or an error envelope.
-    """
-    started = time.time()
-    log_args = {"order_id": order_id, "new_partner_id": new_partner_id}
-
-    # Read the order.
-    try:
-        rows = odoo_read(
-            tenant_id, url, db, user, password,
-            "sale.order", [order_id],
-            ["state", "user_id", "partner_id", "name"],
-        )
-    except Exception as e:
-        err = f"Error consultando sale.order id={order_id}: {e}"
-        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {"success": False, "error_code": "read_failed", "error_detail": err}
-
-    if not rows:
-        err = f"sale.order {order_id} no existe"
-        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {"success": False, "error_code": "order_not_found", "error_detail": err}
-
-    order = rows[0]
-    state = order.get("state") or ""
-    if state not in ("draft", "sent"):
-        err = (
-            f"La cotización {order.get('name') or order_id} está en estado "
-            f"'{state}'. Solo se puede cambiar el cliente mientras está en "
-            "borrador o enviada."
-        )
-        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False, "error_code": "order_not_editable",
-            "error_detail": err, "state": state,
-        }
-
-    # Guard: same_partner — the LLM passed the CURRENT partner_id again
-    # (typically because it reused the active_customer_partner_id from
-    # the seller_context header instead of reading odoo_id from the new
-    # search_partner result). Block with a clear instruction.
-    current_partner = order.get("partner_id")
-    current_partner_id = (
-        current_partner[0] if isinstance(current_partner, list) and current_partner
-        else current_partner if isinstance(current_partner, int) else None
-    )
-    if current_partner_id and current_partner_id == new_partner_id:
-        _log_call("change_quotation_customer", tenant_id, log_args, None,
-                  "same_partner_blocked",
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "same_partner",
-            "llm_action": (
-                "INTERNA: el new_partner_id que pasaste es el cliente "
-                "ACTUAL de la cotización (no es un cambio). Para reasignar, "
-                "primero llama search_partner con el nombre/empresa del "
-                "NUEVO cliente, toma el campo `odoo_id` del primer match "
-                "y úsalo como new_partner_id. NO uses el partner_id del "
-                "seller_context ni el del cliente actual."
-            ),
-        }
-
-    if salesperson_user_id is not None:
-        order_user = order.get("user_id")
-        order_user_id = (
-            order_user[0] if isinstance(order_user, list) and order_user
-            else order_user if isinstance(order_user, int) else None
-        )
-        if order_user_id and order_user_id != salesperson_user_id:
-            err = (
-                f"La cotización pertenece a otro vendedor (user_id={order_user_id}); "
-                f"no puedes reasignar el cliente de cotizaciones que no son tuyas."
-            )
-            _log_call("change_quotation_customer", tenant_id, log_args, None, err,
-                      int((time.time() - started) * 1000))
-            return {
-                "success": False, "error_code": "not_your_quotation",
-                "error_detail": err,
-            }
-
-    # Validate new_partner_id exists.
-    try:
-        partner_rows = odoo_read(
-            tenant_id, url, db, user, password,
-            "res.partner", [new_partner_id], ["name", "vat"],
-        )
-    except Exception as e:
-        err = f"Error consultando res.partner id={new_partner_id}: {e}"
-        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {"success": False, "error_code": "partner_lookup_failed", "error_detail": err}
-    if not partner_rows:
-        err = f"res.partner {new_partner_id} no existe"
-        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {"success": False, "error_code": "partner_not_found", "error_detail": err}
-
-    # Apply the change.
-    # NOTE: Odoo 13 + Tecnosmart custom modules (flex_erp /
-    # tecno_discount_sale) return ``None`` from write() when the
-    # change triggers a hook with no explicit return. XML-RPC then
-    # raises ``TypeError: cannot marshal None unless allow_none is
-    # enabled`` — but the DB row IS updated. We treat that specific
-    # exception as transient and verify by re-reading.
-    write_marshal_none = False
-    try:
-        odoo_call_method(
-            tenant_id, url, db, user, password,
-            "sale.order", "write", [order_id], args=[{"partner_id": new_partner_id}],
-        )
-    except Exception as e:
-        msg = str(e)
-        if "cannot marshal None" in msg or "allow_none" in msg:
-            write_marshal_none = True
-            logger.warning(
-                "ODOO_CALL change_quotation_customer: write returned None "
-                "(Odoo 13 marshalling quirk on order_id=%s); verifying via "
-                "read-after-write", order_id,
-            )
-        else:
-            err = f"Error actualizando partner_id de sale.order {order_id}: {e}"
-            _log_call("change_quotation_customer", tenant_id, log_args, None, err,
-                      int((time.time() - started) * 1000))
-            return {"success": False, "error_code": "write_failed", "error_detail": err}
-
-    # Verify the change landed (always — covers both the "None marshal"
-    # path and the regular path; the round-trip is cheap and guards
-    # against custom-module hooks that silently revert the change).
-    try:
-        verify_rows = odoo_read(
-            tenant_id, url, db, user, password,
-            "sale.order", [order_id], ["partner_id", "state"],
-        )
-    except Exception as e:
-        err = f"write OK pero read-after-write falló: {e}"
-        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False, "error_code": "verify_failed", "error_detail": err,
-        }
-    if not verify_rows:
-        err = "sale.order desapareció tras el write"
-        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {"success": False, "error_code": "verify_failed", "error_detail": err}
-
-    verified_partner = verify_rows[0].get("partner_id")
-    verified_partner_id = (
-        verified_partner[0] if isinstance(verified_partner, list) and verified_partner
-        else verified_partner if isinstance(verified_partner, int) else None
-    )
-    if verified_partner_id != new_partner_id:
-        err = (
-            f"write reportó éxito pero partner_id quedó en "
-            f"{verified_partner_id} (esperado {new_partner_id}). "
-            f"Posible hook custom revirtió el cambio."
-        )
-        _log_call("change_quotation_customer", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False, "error_code": "write_reverted", "error_detail": err,
-            "verified_partner_id": verified_partner_id,
-        }
-
-    new_partner = partner_rows[0]
-    result = {
-        "success": True,
-        "order_id": order_id,
-        "name": order.get("name") or "",
-        "state": state,
-        "partner_id": new_partner_id,
-        "partner_name": new_partner.get("name") or "",
-        "partner_vat": new_partner.get("vat") or "",
-    }
-    _log_call("change_quotation_customer", tenant_id, log_args,
-              {"order_id": order_id, "new_partner_id": new_partner_id}, None,
-              int((time.time() - started) * 1000))
-    return result
-
-
-def odoo_update_quotation_line(
-    tenant_id: str, url: str, db: str, user: str, password: str,
-    order_id: int,
-    line_id: int,
-    quantity: float,
-    salesperson_user_id: int | None = None,
-) -> dict:
-    """Update product_uom_qty on a sale.order.line.
-
-    Validations:
-    - Order is in ``draft`` or ``sent`` (immutable otherwise).
-    - Line belongs to the order (line.order_id == order_id).
-    - When ``salesperson_user_id`` provided, ``order.user_id`` must match.
-    - If ``quantity == 0`` returns a ``quantity_zero`` envelope so the
-      LLM asks the seller to confirm a delete instead of silently
-      zero-ing the line.
-
-    Returns updated order totals + the modified line on success.
-    """
-    started = time.time()
-    log_args = {"order_id": order_id, "line_id": line_id, "quantity": quantity}
-
-    try:
-        order_rows = odoo_read(
-            tenant_id, url, db, user, password,
-            "sale.order", [order_id],
-            ["state", "user_id", "name", "order_line"],
-        )
-    except Exception as e:
-        err = f"Error consultando sale.order {order_id}: {e}"
-        _log_call("update_quotation_line", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {"success": False, "error_code": "read_failed", "error_detail": err}
-    if not order_rows:
-        return {"success": False, "error_code": "order_not_found",
-                "error_detail": f"sale.order {order_id} no existe"}
-    order = order_rows[0]
-    state = order.get("state") or ""
-    if state not in ("draft", "sent"):
-        return {
-            "success": False, "error_code": "order_not_editable",
-            "error_detail": (
-                f"La cotización {order.get('name') or order_id} está en "
-                f"estado '{state}'; solo se puede modificar en draft o sent."
-            ),
-        }
-
-    if salesperson_user_id is not None:
-        oid_user = order.get("user_id")
-        oid_uid = oid_user[0] if isinstance(oid_user, list) and oid_user else (
-            oid_user if isinstance(oid_user, int) else None
-        )
-        if oid_uid and oid_uid != salesperson_user_id:
-            return {
-                "success": False, "error_code": "not_your_quotation",
-                "error_detail": (
-                    f"La cotización pertenece a otro vendedor (user_id={oid_uid})."
-                ),
-            }
-
-    if line_id not in (order.get("order_line") or []):
-        return {
-            "success": False, "error_code": "line_mismatch",
-            "error_detail": (
-                f"La línea {line_id} no pertenece a la cotización "
-                f"{order.get('name') or order_id}."
-            ),
-        }
-
-    try:
-        qty_f = float(quantity)
-    except (TypeError, ValueError):
-        return {"success": False, "error_code": "invalid_quantity",
-                "error_detail": "quantity debe ser numérico"}
-    if qty_f < 0:
-        return {"success": False, "error_code": "invalid_quantity",
-                "error_detail": "quantity no puede ser negativo"}
-
-    if qty_f == 0:
-        return {
-            "success": False,
-            "error_code": "quantity_zero",
-            "llm_action": (
-                "INTERNA: el vendedor pidió cantidad 0 para una línea. "
-                "Eso equivale a eliminar la línea. Pregunta al vendedor "
-                "'¿Confirmas eliminar esta línea de la cotización?'. "
-                "Si responde sí, llama remove_quotation_line con "
-                f"order_id={order_id}, line_id={line_id}. NO ejecutes "
-                "el delete sin confirmación explícita."
-            ),
-            "order_id": order_id,
-            "line_id": line_id,
-        }
-
-    # Apply the change. Same Odoo 13 marshal-None caveat as
-    # change_quotation_customer (custom hooks may return None).
-    try:
-        odoo_call_method(
-            tenant_id, url, db, user, password,
-            "sale.order.line", "write", [line_id],
-            args=[{"product_uom_qty": qty_f}],
-        )
-    except Exception as e:
-        msg = str(e)
-        if "cannot marshal None" not in msg and "allow_none" not in msg:
-            return {"success": False, "error_code": "write_failed",
-                    "error_detail": f"Error escribiendo line {line_id}: {e}"}
-
-    # Verify + read updated line + order totals + ALL live lines.
-    #
-    # Sprint 6 requires the full ``lines[]`` array on every quotation
-    # mutation envelope so niko core's ``active_quotation_lines`` memory
-    # block stays in sync without forcing a follow-up get_quotation.
-    # We re-read the order header (incl. order_line ids) and all live
-    # sale.order.line rows in one pass — same shape as add_to_quotation.
-    try:
-        order_after = odoo_read(
-            tenant_id, url, db, user, password,
-            "sale.order", [order_id],
-            ["name", "state", "partner_id", "amount_untaxed", "amount_tax",
-             "amount_total", "order_line", "share_link_so"],
-        )
-        if not order_after:
-            return {"success": False, "error_code": "verify_failed",
-                    "error_detail": "order desapareció tras el write"}
-        order_after_row = order_after[0]
-        all_line_ids = order_after_row.get("order_line") or []
-        all_lines_raw = odoo_read(
-            tenant_id, url, db, user, password,
-            "sale.order.line", all_line_ids,
-            ["id", "product_id", "name", "product_uom_qty", "price_unit",
-             "discount", "price_subtotal", "price_tax", "price_total"],
-        ) if all_line_ids else []
-    except Exception as e:
-        return {"success": False, "error_code": "verify_failed",
-                "error_detail": f"write OK pero read-after-write falló: {e}"}
-
-    # Locate the line we just wrote in the refreshed batch (avoids a
-    # second round-trip just for the modified line).
-    modified_line_row = next(
-        (ln for ln in (all_lines_raw or []) if ln.get("id") == line_id),
-        None,
-    )
-    if modified_line_row is None or modified_line_row.get("product_uom_qty") != qty_f:
-        actual_qty = (
-            modified_line_row.get("product_uom_qty") if modified_line_row else "N/A"
-        )
-        return {
-            "success": False, "error_code": "write_reverted",
-            "error_detail": (
-                f"write reportó éxito pero quantity quedó en {actual_qty} "
-                f"(esperado {qty_f}). Hook custom revirtió."
-            ),
-        }
-
-    # Build the full lines[] array — same shape as create_quotation /
-    # add_to_quotation. ``line_id`` is the Odoo sale.order.line.id and
-    # is what niko's active_quotation_lines extractor anchors on.
-    lines_detail = []
-    for ln in (all_lines_raw or []):
-        product_field = ln.get("product_id")
-        pname = (
-            product_field[1] if isinstance(product_field, list) and len(product_field) > 1
-            else ln.get("name", "")
-        )
-        price_unit = ln.get("price_unit", 0) or 0
-        subtotal = ln.get("price_subtotal", 0) or 0
-        tax = ln.get("price_tax", 0) or 0
-        total = ln.get("price_total", 0) or 0
-        lines_detail.append({
-            "line_id": ln.get("id"),
-            "product": pname,
-            "quantity": ln.get("product_uom_qty", 1),
-            "price_unit": price_unit,
-            "price_unit_display": format_price_display(price_unit),
-            "discount": ln.get("discount", 0),
-            "subtotal": subtotal,
-            "subtotal_display": format_price_display(subtotal),
-            "tax": tax,
-            "tax_display": format_price_display(tax),
-            "total": total,
-            "total_display": format_price_display(total),
-        })
-
-    # Top-level fields about the modified line are kept for backwards
-    # compatibility with callers that read the response inline.
-    line = modified_line_row
-    product_field = line.get("product_id")
-    product_name = (
-        product_field[1] if isinstance(product_field, list) and len(product_field) > 1
-        else ""
-    )
-
-    result = {
-        "success": True,
-        "order_id": order_id,
-        "line_id": line_id,
-        "product": product_name,
-        "quantity": line.get("product_uom_qty", 0),
-        "price_unit": line.get("price_unit", 0),
-        "price_unit_display": format_price_display(line.get("price_unit", 0)),
-        "discount": line.get("discount", 0),
-        "subtotal": line.get("price_subtotal", 0),
-        "subtotal_display": format_price_display(line.get("price_subtotal", 0)),
-        "total": line.get("price_total", 0),
-        "total_display": format_price_display(line.get("price_total", 0)),
-        # Full lines[] array — required by niko's active_quotation_lines
-        # state extractor (Sprint 6). Same shape as add_to_quotation.
-        "lines": lines_detail,
-        "order_amount_total": order_after_row.get("amount_total", 0),
-        "order_amount_total_display": format_price_display(
-            order_after_row.get("amount_total", 0),
-        ),
-    }
-    _log_call("update_quotation_line", tenant_id, log_args,
-              {"order_id": order_id, "line_id": line_id, "quantity": qty_f}, None,
-              int((time.time() - started) * 1000))
-    return result
-
-
-def odoo_remove_quotation_line(
-    tenant_id: str, url: str, db: str, user: str, password: str,
-    order_id: int,
-    line_id: int,
-    salesperson_user_id: int | None = None,
-) -> dict:
-    """Delete a sale.order.line. Same draft/ownership validations as
-    update_quotation_line. The LLM should ask for explicit seller
-    confirmation BEFORE calling this — see the rule
-    ``b2b-line-edit-confirmation``."""
-    started = time.time()
-    log_args = {"order_id": order_id, "line_id": line_id}
-
-    try:
-        order_rows = odoo_read(
-            tenant_id, url, db, user, password,
-            "sale.order", [order_id],
-            ["state", "user_id", "name", "order_line"],
-        )
-    except Exception as e:
-        return {"success": False, "error_code": "read_failed",
-                "error_detail": f"Error consultando sale.order {order_id}: {e}"}
-    if not order_rows:
-        return {"success": False, "error_code": "order_not_found",
-                "error_detail": f"sale.order {order_id} no existe"}
-    order = order_rows[0]
-    state = order.get("state") or ""
-    if state not in ("draft", "sent"):
-        return {
-            "success": False, "error_code": "order_not_editable",
-            "error_detail": (
-                f"La cotización {order.get('name') or order_id} está en "
-                f"estado '{state}'."
-            ),
-        }
-    if salesperson_user_id is not None:
-        oid_user = order.get("user_id")
-        oid_uid = oid_user[0] if isinstance(oid_user, list) and oid_user else (
-            oid_user if isinstance(oid_user, int) else None
-        )
-        if oid_uid and oid_uid != salesperson_user_id:
-            return {
-                "success": False, "error_code": "not_your_quotation",
-                "error_detail": "La cotización pertenece a otro vendedor.",
-            }
-    if line_id not in (order.get("order_line") or []):
-        return {
-            "success": False, "error_code": "line_mismatch",
-            "error_detail": (
-                f"La línea {line_id} no pertenece a la cotización."
-            ),
-        }
-
-    try:
-        odoo_call_method(
-            tenant_id, url, db, user, password,
-            "sale.order.line", "unlink", [line_id], args=None,
-        )
-    except Exception as e:
-        msg = str(e)
-        if "cannot marshal None" not in msg and "allow_none" not in msg:
-            return {"success": False, "error_code": "delete_failed",
-                    "error_detail": f"Error eliminando line {line_id}: {e}"}
-
-    # Verify gone + new totals + ALL remaining lines (Sprint 6:
-    # niko's active_quotation_lines extractor needs the fresh
-    # ``lines[]`` array on every quotation mutation).
-    try:
-        order_after = odoo_read(
-            tenant_id, url, db, user, password,
-            "sale.order", [order_id],
-            ["amount_untaxed", "amount_tax", "amount_total", "order_line"],
-        )
-    except Exception as e:
-        return {"success": False, "error_code": "verify_failed",
-                "error_detail": f"unlink OK pero read-after falló: {e}"}
-
-    if not order_after:
-        return {"success": False, "error_code": "verify_failed",
-                "error_detail": "order desapareció tras unlink"}
-    remaining_line_ids = order_after[0].get("order_line") or []
-    if line_id in remaining_line_ids:
-        return {
-            "success": False, "error_code": "delete_reverted",
-            "error_detail": "unlink reportó éxito pero la línea sigue presente",
-        }
-
-    # Read remaining lines so the envelope mirrors the post-delete state.
-    try:
-        all_lines_raw = odoo_read(
-            tenant_id, url, db, user, password,
-            "sale.order.line", remaining_line_ids,
-            ["id", "product_id", "name", "product_uom_qty", "price_unit",
-             "discount", "price_subtotal", "price_tax", "price_total"],
-        ) if remaining_line_ids else []
-    except Exception as e:
-        return {"success": False, "error_code": "verify_failed",
-                "error_detail": f"unlink OK pero lectura de líneas falló: {e}"}
-
-    lines_detail = []
-    for ln in (all_lines_raw or []):
-        product_field = ln.get("product_id")
-        pname = (
-            product_field[1] if isinstance(product_field, list) and len(product_field) > 1
-            else ln.get("name", "")
-        )
-        price_unit = ln.get("price_unit", 0) or 0
-        subtotal = ln.get("price_subtotal", 0) or 0
-        tax = ln.get("price_tax", 0) or 0
-        total = ln.get("price_total", 0) or 0
-        lines_detail.append({
-            "line_id": ln.get("id"),
-            "product": pname,
-            "quantity": ln.get("product_uom_qty", 1),
-            "price_unit": price_unit,
-            "price_unit_display": format_price_display(price_unit),
-            "discount": ln.get("discount", 0),
-            "subtotal": subtotal,
-            "subtotal_display": format_price_display(subtotal),
-            "tax": tax,
-            "tax_display": format_price_display(tax),
-            "total": total,
-            "total_display": format_price_display(total),
-        })
-
-    order_amt = order_after[0]
-    result = {
-        "success": True,
-        "order_id": order_id,
-        "removed_line_id": line_id,
-        "remaining_lines": len(remaining_line_ids),
-        "order_amount_total": order_amt.get("amount_total", 0),
-        "order_amount_total_display": format_price_display(order_amt.get("amount_total", 0)),
-        # Full lines[] array (post-delete) — Sprint 6 invariant for
-        # niko's active_quotation_lines memory block.
-        "lines": lines_detail,
-    }
-    _log_call("remove_quotation_line", tenant_id, log_args,
-              {"order_id": order_id, "line_id": line_id}, None,
-              int((time.time() - started) * 1000))
     return result
 
 
@@ -1266,28 +504,25 @@ def odoo_get_active_quotation(
             ["product_id", "product_uom_qty", "price_total"],
         ) if line_ids else []
 
-        lines_detail = []
-        for ln in raw_lines:
-            total = ln.get("price_total", 0) or 0
-            lines_detail.append({
+        lines_detail = [
+            {
                 "product": ln["product_id"][1] if isinstance(ln.get("product_id"), list) else "",
                 "quantity": ln.get("product_uom_qty", 1),
-                "total": total,
-                "total_display": format_price_display(total),
-            })
+                "total": ln.get("price_total", 0),
+            }
+            for ln in raw_lines
+        ]
     except Exception as e:
         err = f"Error leyendo cotizacion: {e}"
         _log_call("get_active_quotation", tenant_id, log_args, None, err, int((time.time() - started) * 1000))
         return {"success": False, "error_code": "read_failed", "error_detail": err}
 
-    total_amt = order["amount_total"]
     result = {
         "success": True,
         "order_id": order_id,
         "name": order["name"],
         "state": order["state"],
-        "total": total_amt,
-        "total_display": format_price_display(total_amt),
+        "total": order["amount_total"],
         "lines": lines_detail,
     }
     _log_call("get_active_quotation", tenant_id, log_args, result, None, int((time.time() - started) * 1000))
@@ -1356,35 +591,32 @@ def odoo_list_quotations(
 
     if not rows:
         result = {"success": True, "count": 0, "orders": [], "partner_id": partner_id}
+        result["display_type"] = "list_data"
         _log_call("list_quotations", tenant_id, log_args, result, None, int((time.time() - started) * 1000))
         return result
 
     orders_summary = []
     for r in rows:
         line_ids = r.get("order_line", []) or []
-        total_amt = r["amount_total"]
-        subtotal_amt = r["amount_untaxed"]
         orders_summary.append({
             "order_id": r["id"],
             "name": r["name"],
             "state": r["state"],
             "state_label": _STATE_LABEL.get(r["state"], r["state"]),
-            "total": total_amt,
-            "total_display": format_price_display(total_amt),
-            "subtotal": subtotal_amt,
-            "subtotal_display": format_price_display(subtotal_amt),
+            "total": r["amount_total"],
+            "subtotal": r["amount_untaxed"],
             "date_order": r.get("date_order") or r.get("create_date"),
             "lines_count": len(line_ids),
             "share_link": r.get("share_link_so") or "",
         })
 
     result = {
-        "display_type": "list_data",
         "success": True,
         "count": len(orders_summary),
         "partner_id": partner_id,
         "orders": orders_summary,
     }
+    result["display_type"] = "list_data"
     _log_call("list_quotations", tenant_id, log_args, {"count": len(orders_summary)}, None, int((time.time() - started) * 1000))
     return result
 
@@ -1434,38 +666,19 @@ def odoo_get_quotation(
             raw_lines = odoo_read(
                 tenant_id, url, db, user, password,
                 "sale.order.line", line_ids,
-                # ``id`` is required so the Sprint 6 ``active_quotation_lines``
-                # state in niko core can mirror the canonical line_id per
-                # row — without it the LLM falls back to positional indices
-                # and the 3-tier resolver in active_lines.py cannot land
-                # an exact match. See create_quotation for the same pattern.
-                ["id", "product_id", "name", "product_uom_qty", "price_unit",
+                ["product_id", "name", "product_uom_qty", "price_unit",
                  "discount", "price_subtotal", "price_tax", "price_total"],
             )
             for ln in (raw_lines or []):
                 pname = ln["product_id"][1] if isinstance(ln.get("product_id"), list) else ln.get("name", "")
-                price_unit = ln.get("price_unit", 0) or 0
-                subtotal = ln.get("price_subtotal", 0) or 0
-                tax = ln.get("price_tax", 0) or 0
-                total = ln.get("price_total", 0) or 0
                 lines_detail.append({
-                    # ``line_id`` mirrors create_quotation/add_to_quotation
-                    # — the LLM (and niko's active_quotation_lines memory
-                    # block) MUST use this real Odoo sale.order.line.id
-                    # when calling update_quotation_line /
-                    # remove_quotation_line / apply_discount.
-                    "line_id": ln.get("id"),
                     "product": pname,
                     "quantity": ln.get("product_uom_qty", 1),
-                    "price_unit": price_unit,
-                    "price_unit_display": format_price_display(price_unit),
+                    "price_unit": ln.get("price_unit", 0),
                     "discount": ln.get("discount", 0),
-                    "subtotal": subtotal,
-                    "subtotal_display": format_price_display(subtotal),
-                    "tax": tax,
-                    "tax_display": format_price_display(tax),
-                    "total": total,
-                    "total_display": format_price_display(total),
+                    "subtotal": ln.get("price_subtotal", 0),
+                    "tax": ln.get("price_tax", 0),
+                    "total": ln.get("price_total", 0),
                 })
         except Exception as e:
             err = f"Order {order['name']} read OK but lines failed: {e}"
@@ -1474,9 +687,6 @@ def odoo_get_quotation(
 
     partner_name = order["partner_id"][1] if isinstance(order.get("partner_id"), list) else ""
 
-    subtotal_amt = order["amount_untaxed"]
-    tax_amt = order["amount_tax"]
-    total_amt = order["amount_total"]
     result = {
         "success": True,
         "order_id": order["id"],
@@ -1484,16 +694,14 @@ def odoo_get_quotation(
         "state": order["state"],
         "state_label": _STATE_LABEL.get(order["state"], order["state"]),
         "partner": partner_name,
-        "subtotal": subtotal_amt,
-        "subtotal_display": format_price_display(subtotal_amt),
-        "tax": tax_amt,
-        "tax_display": format_price_display(tax_amt),
-        "total": total_amt,
-        "total_display": format_price_display(total_amt),
+        "subtotal": order["amount_untaxed"],
+        "tax": order["amount_tax"],
+        "total": order["amount_total"],
         "date_order": order.get("date_order") or order.get("create_date"),
         "lines_count": len(lines_detail),
         "lines": lines_detail,
     }
+    result["_card"] = _build_card(result)
     _log_call("get_quotation", tenant_id, log_args, {"name": order["name"], "lines": len(lines_detail)}, None, int((time.time() - started) * 1000))
     return result
 
@@ -1768,1057 +976,29 @@ def odoo_check_balance(
     }
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Sprint 2 — B2B Sales Assistant
-# ─────────────────────────────────────────────────────────────────────
-
-
-def odoo_lookup_user_by_email(
-    tenant_id: str, url: str, db: str, user: str, password: str,
-    email: str,
-) -> dict:
-    """Locate a res.users record by email (login OR partner.email).
-
-    Used by seller_otp.py to validate that a Telegram user requesting
-    /login corresponds to an actual Odoo salesperson before sending an
-    OTP.
-
-    Returns
-    -------
-    {success: True, user: {user_id, name, login, email, partner_id, partner_name}}
-    {success: False, error_code, error_detail}
-    """
-    started = time.time()
-    log_args = {"email": email}
-
-    if not email or not isinstance(email, str) or not email.strip():
-        err = "email requerido y debe ser un texto no vacio"
-        _log_call("lookup_user_by_email", tenant_id, log_args, None, err, 0)
-        return {
-            "success": False,
-            "error_code": "invalid_email",
-            "error_detail": err,
-        }
-
-    needle = email.strip()
-    fields = ["id", "name", "login", "partner_id", "active"]
-
-    try:
-        rows = odoo_search(
-            tenant_id, url, db, user, password,
-            "res.users",
-            [["login", "=ilike", needle]],
-            fields,
-            limit=10,
-        )
-    except Exception as e:
-        err = f"Error consultando res.users por login={needle!r}: {e}"
-        _log_call("lookup_user_by_email", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "lookup_failed",
-            "error_detail": err,
-        }
-
-    if not rows:
-        # Fallback: search by partner.email (the user's partner record).
-        try:
-            rows = odoo_search(
-                tenant_id, url, db, user, password,
-                "res.users",
-                [["partner_id.email", "=ilike", needle]],
-                fields,
-                limit=10,
-            )
-        except Exception as e:
-            err = f"Error consultando res.users por partner.email={needle!r}: {e}"
-            _log_call("lookup_user_by_email", tenant_id, log_args, None, err,
-                      int((time.time() - started) * 1000))
-            return {
-                "success": False,
-                "error_code": "lookup_failed",
-                "error_detail": err,
-            }
-
-    # Filter inactive accounts — they cannot log in.
-    active_rows = [r for r in (rows or []) if r.get("active")]
-    if not active_rows:
-        err = "No hay un vendedor con ese email en Odoo"
-        _log_call("lookup_user_by_email", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "user_not_found",
-            "error_detail": err,
-        }
-
-    if len(active_rows) > 1:
-        logger.warning(
-            "ODOO_CALL lookup_user_by_email tenant=%s email=%r returned %d active users; "
-            "picking lowest id",
-            tenant_id, needle, len(active_rows),
-        )
-
-    chosen = min(active_rows, key=lambda r: r["id"])
-    partner_field = chosen.get("partner_id")
-    partner_id: int | None = None
-    partner_name: str | None = None
-    if isinstance(partner_field, list) and len(partner_field) >= 2:
-        partner_id = partner_field[0]
-        partner_name = partner_field[1]
-    elif isinstance(partner_field, int):
-        partner_id = partner_field
-
-    # Pull partner.email + vat (the seller's own RUC/cedula). The vat
-    # is needed by niko's B2B gates so the seller cannot accidentally
-    # invoke ``identify_customer`` with their own RUC and end up
-    # cotizando a sí mismo (observed in smoke test).
-    partner_email: str | None = None
-    partner_vat: str | None = None
-    if partner_id:
-        try:
-            partner_rows = odoo_read(
-                tenant_id, url, db, user, password,
-                "res.partner", [partner_id], ["email", "name", "vat"],
-            )
-            if partner_rows:
-                partner_email = partner_rows[0].get("email") or None
-                partner_vat = partner_rows[0].get("vat") or None
-                # Refresh partner_name from canonical record (more reliable
-                # than the Many2one display string).
-                partner_name = partner_rows[0].get("name") or partner_name
-        except Exception as e:
-            logger.warning(
-                "ODOO_CALL lookup_user_by_email tenant=%s could not read partner_id=%s: %s",
-                tenant_id, partner_id, e,
-            )
-
-    final_email = partner_email or chosen.get("login") or None
-
-    result = {
-        "success": True,
-        "user": {
-            "user_id": chosen["id"],
-            "name": chosen.get("name") or "",
-            "login": chosen.get("login") or "",
-            "email": final_email,
-            "partner_id": partner_id,
-            "partner_name": partner_name,
-            "partner_vat": partner_vat,
-        },
-    }
-    _log_call("lookup_user_by_email", tenant_id, log_args,
-              {"user_id": chosen["id"]}, None,
-              int((time.time() - started) * 1000))
-    return result
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Sprint 2F — Generic ERP-agnostic policy & authorization
-# ─────────────────────────────────────────────────────────────────────
-
-
-def _resolve_group_id_by_xmlid(
-    tenant_id: str, url: str, db: str, user: str, password: str,
-    module: str, name: str,
-) -> int | None:
-    """Resolve a group's database id from its XML id (module + name).
-
-    Returns the res.groups id, or None if the XML id is not present (e.g.
-    the underlying Odoo module is not installed in this tenant).
-    """
-    rows = odoo_search(
-        tenant_id, url, db, user, password,
-        "ir.model.data",
-        [["module", "=", module], ["name", "=", name]],
-        ["res_id"],
-        limit=1,
-    )
-    if not rows:
-        return None
-    res_id = rows[0].get("res_id")
-    if isinstance(res_id, int) and res_id > 0:
-        return res_id
-    return None
-
-
-def odoo_get_discount_policy(
-    tenant_id: str, url: str, db: str, user: str, password: str,
-) -> dict:
-    """Generic 'get discount policy' contract for the ERP plugin.
-
-    Reads the ERP-specific knobs (in Odoo: an ``ir.config_parameter`` and
-    the ``account.group_account_manager`` security group) and returns a
-    plugin-agnostic shape that ``niko/`` can rely on. The Niko core never
-    has to know the Odoo internals — those leak only through the
-    ``source`` metadata which the dashboard renders as a read-only badge
-    ("this came from Odoo X parameter").
-
-    Returns
-    -------
-    {
-        "success": True,
-        "policy": {
-            "max_pct": float,         # 0.0 means 'no control configured'
-            "supervisors": [
-                {"user_id": int, "name": str, "email": str|None, "login": str}
-            ],
-            "source": {
-                "max_pct_key": "ir.config_parameter:sale.partner_max_sale_discount",
-                "supervisors_group_xmlid": "account.group_account_manager"
-            }
-        }
-    }
-    or {"success": False, "error_code": "...", "error_detail": "..."}
-    """
-    started = time.time()
-    log_args: dict = {}
-
-    # 1) Read max_pct from ir.config_parameter.
-    # In Odoo 13, ``get_param`` is a class-level method that does not
-    # accept an ``ids`` arg, so XML-RPC ``execute_kw('ir.config_parameter',
-    # 'get_param', [[], 'key', '0'])`` fails with "takes from 2 to 3
-    # positional arguments but 4 were given". Read the row directly.
-    max_pct: float = 0.0
-    try:
-        rows = odoo_search(
-            tenant_id, url, db, user, password,
-            "ir.config_parameter",
-            [["key", "=", "sale.partner_max_sale_discount"]],
-            ["value"],
-            limit=1,
-        )
-        if rows:
-            try:
-                max_pct = float(rows[0].get("value") or 0.0)
-            except (TypeError, ValueError):
-                # Non-numeric stored value (e.g. an admin typo) → treat as
-                # "no control configured" rather than blocking the caller.
-                max_pct = 0.0
-    except Exception as e:
-        err = f"Error leyendo ir.config_parameter sale.partner_max_sale_discount: {e}"
-        _log_call("get_discount_policy", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "config_parameter_read_failed",
-            "error_detail": err,
-        }
-
-    # 2) Resolve the supervisor group via its XML id.
-    try:
-        group_id = _resolve_group_id_by_xmlid(
-            tenant_id, url, db, user, password,
-            module="account", name="group_account_manager",
-        )
-    except Exception as e:
-        err = f"Error resolviendo grupo account.group_account_manager: {e}"
-        _log_call("get_discount_policy", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "supervisor_group_lookup_failed",
-            "error_detail": err,
-        }
-
-    if group_id is None:
-        err = "Modulo account no instalado o group_account_manager no encontrado"
-        _log_call("get_discount_policy", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "supervisor_group_missing",
-            "error_detail": err,
-        }
-
-    # 3) List active supervisors in that group.
-    try:
-        sup_rows = odoo_search(
-            tenant_id, url, db, user, password,
-            "res.users",
-            [["groups_id", "in", [group_id]], ["active", "=", True]],
-            ["id", "name", "login", "partner_id"],
-            limit=200,
-        )
-    except Exception as e:
-        err = f"Error listando supervisores en grupo {group_id}: {e}"
-        _log_call("get_discount_policy", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "supervisors_lookup_failed",
-            "error_detail": err,
-        }
-
-    # 4) Read partner emails in batch for the canonical email per supervisor.
-    partner_ids: list[int] = []
-    user_to_partner: dict[int, int | None] = {}
-    for row in sup_rows or []:
-        pf = row.get("partner_id")
-        pid: int | None = None
-        if isinstance(pf, list) and len(pf) >= 2:
-            pid = pf[0]
-        elif isinstance(pf, int):
-            pid = pf
-        user_to_partner[row["id"]] = pid
-        if pid:
-            partner_ids.append(pid)
-
-    partner_email_map: dict[int, str | None] = {}
-    if partner_ids:
-        try:
-            partners = odoo_read(
-                tenant_id, url, db, user, password,
-                "res.partner", partner_ids, ["email"],
-            )
-            for p in partners or []:
-                partner_email_map[p["id"]] = p.get("email") or None
-        except Exception as e:
-            # Non-fatal — fall back to login as the email surrogate below.
-            logger.warning(
-                "ODOO_CALL get_discount_policy tenant=%s could not read partner emails: %s",
-                tenant_id, e,
-            )
-
-    supervisors: list[dict] = []
-    for row in sup_rows or []:
-        pid = user_to_partner.get(row["id"])
-        partner_email = partner_email_map.get(pid) if pid else None
-        login = row.get("login") or ""
-        # Login is often the email already in modern Odoo installs; fall
-        # back to it when partner.email is empty.
-        email = partner_email or (login if "@" in login else None)
-        supervisors.append({
-            "user_id": row["id"],
-            "name": row.get("name") or "",
-            "email": email,
-            "login": login,
-        })
-
-    result = {
-        "success": True,
-        "policy": {
-            "max_pct": max_pct,
-            "supervisors": supervisors,
-            "source": {
-                "max_pct_key": "ir.config_parameter:sale.partner_max_sale_discount",
-                "supervisors_group_xmlid": "account.group_account_manager",
-            },
-        },
-    }
-    _log_call("get_discount_policy", tenant_id, log_args,
-              {"max_pct": max_pct, "supervisor_count": len(supervisors)}, None,
-              int((time.time() - started) * 1000))
-    return result
-
-
-def odoo_verify_seller_authorization(
-    tenant_id: str, url: str, db: str, user: str, password: str,
-    email: str,
-) -> dict:
-    """Generic 'is this email an authorized seller in the ERP?' contract.
-
-    Deeper than ``odoo_lookup_user_by_email``: not only finds the user,
-    but also confirms the user belongs to the ERP's seller security
-    group (in Odoo: ``sales_team.group_sale_salesman``). Niko's core
-    asks "is this email allowed to sell?" and the plugin owns the answer.
-
-    Returns
-    -------
-    {
-        "success": True,
-        "authorized": bool,
-        "user": {"user_id", "name", "email", "login", "partner_id"} | None,
-        "reason": str | None
-    }
-    or {"success": False, "error_code": "...", "error_detail": "..."}
-    """
-    started = time.time()
-    log_args = {"email": email}
-
-    # 1) Reuse the canonical lookup-by-email helper. It already filters
-    #    inactive users, falls back to partner.email and resolves the
-    #    canonical partner email — no need to re-implement here.
-    lookup = odoo_lookup_user_by_email(
-        tenant_id, url, db, user, password, email,
-    )
-
-    if lookup.get("success") is False:
-        code = lookup.get("error_code")
-        if code == "user_not_found":
-            _log_call("verify_seller_authorization", tenant_id, log_args,
-                      {"authorized": False, "reason": "user_not_found"}, None,
-                      int((time.time() - started) * 1000))
-            return {
-                "success": True,
-                "authorized": False,
-                "user": None,
-                "reason": "Email no registrado en res.users",
-            }
-        if code == "invalid_email":
-            # Surface the validation error to the caller; the wrapper in
-            # niko/ should never have called us with garbage.
-            _log_call("verify_seller_authorization", tenant_id, log_args,
-                      None, "invalid_email",
-                      int((time.time() - started) * 1000))
-            return lookup
-        # Any other lookup failure is an infrastructure problem.
-        _log_call("verify_seller_authorization", tenant_id, log_args,
-                  None, code or "lookup_failed",
-                  int((time.time() - started) * 1000))
-        return lookup
-
-    user_obj = lookup.get("user") or {}
-
-    # 2) Resolve the seller group via its XML id.
-    try:
-        group_id = _resolve_group_id_by_xmlid(
-            tenant_id, url, db, user, password,
-            module="sales_team", name="group_sale_salesman",
-        )
-    except Exception as e:
-        err = f"Error resolviendo grupo sales_team.group_sale_salesman: {e}"
-        _log_call("verify_seller_authorization", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "seller_group_lookup_failed",
-            "error_detail": err,
-        }
-
-    if group_id is None:
-        err = "Modulo sales_team no instalado o group_sale_salesman no encontrado"
-        _log_call("verify_seller_authorization", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "seller_group_missing",
-            "error_detail": err,
-        }
-
-    # 3) Read the user's groups_id and check membership.
-    try:
-        rows = odoo_read(
-            tenant_id, url, db, user, password,
-            "res.users", [user_obj["user_id"]], ["groups_id"],
-        )
-    except Exception as e:
-        err = f"Error leyendo res.users.groups_id para user_id={user_obj.get('user_id')}: {e}"
-        _log_call("verify_seller_authorization", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "user_groups_read_failed",
-            "error_detail": err,
-        }
-
-    user_group_ids = (rows[0].get("groups_id") or []) if rows else []
-    authorized = group_id in user_group_ids
-
-    user_payload = {
-        "user_id": user_obj.get("user_id"),
-        "name": user_obj.get("name") or "",
-        "email": user_obj.get("email"),
-        "login": user_obj.get("login") or "",
-        "partner_id": user_obj.get("partner_id"),
-    }
-
-    if authorized:
-        _log_call("verify_seller_authorization", tenant_id, log_args,
-                  {"authorized": True, "user_id": user_payload["user_id"]}, None,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": True,
-            "authorized": True,
-            "user": user_payload,
-            "reason": None,
-        }
-
-    _log_call("verify_seller_authorization", tenant_id, log_args,
-              {"authorized": False, "user_id": user_payload["user_id"]}, None,
-              int((time.time() - started) * 1000))
-    return {
-        "success": True,
-        "authorized": False,
-        "user": user_payload,
-        "reason": "Usuario existe pero no pertenece al grupo de Ventas",
-    }
-
-
-def odoo_apply_discount(
-    tenant_id: str, url: str, db: str, user: str, password: str,
-    order_id: int,
-    discount_pct: float,
-    line_id: int | None = None,
-    reason: str | None = None,
-) -> dict:
-    """Apply a percentage discount to a quotation.
-
-    If `line_id` is given, only that line is updated. Otherwise every line
-    on the order is updated. The orchestrator validates the discount
-    against approval thresholds — this tool just applies what is asked.
-
-    Returns
-    -------
-    {success: True, order_id, lines_updated, discount_pct,
-     new_amount_total, new_amount_untaxed}
-    {success: False, error_code, error_detail, ...}
-    """
-    started = time.time()
-    log_args = {
-        "order_id": order_id,
-        "discount_pct": discount_pct,
-        "line_id": line_id,
-        "reason": reason,
-    }
-
-    # Validation -----------------------------------------------------------
-    if not isinstance(order_id, int) or order_id <= 0:
-        err = "order_id requerido y debe ser entero positivo"
-        _log_call("apply_discount", tenant_id, log_args, None, err, 0)
-        return {"success": False, "error_code": "invalid_order_id", "error_detail": err}
-
-    if not isinstance(discount_pct, (int, float)) or isinstance(discount_pct, bool):
-        err = "discount_pct debe ser numerico"
-        _log_call("apply_discount", tenant_id, log_args, None, err, 0)
-        return {"success": False, "error_code": "invalid_discount", "error_detail": err}
-
-    if discount_pct < 0 or discount_pct > 100:
-        err = f"discount_pct fuera de rango (0-100): {discount_pct}"
-        _log_call("apply_discount", tenant_id, log_args, None, err, 0)
-        return {"success": False, "error_code": "invalid_discount", "error_detail": err}
-
-    if line_id is not None and (not isinstance(line_id, int) or line_id <= 0):
-        err = "line_id debe ser entero positivo o None"
-        _log_call("apply_discount", tenant_id, log_args, None, err, 0)
-        return {"success": False, "error_code": "invalid_line_id", "error_detail": err}
-
-    # Read order and check editable state ---------------------------------
-    try:
-        orders = odoo_read(
-            tenant_id, url, db, user, password,
-            "sale.order", [order_id],
-            ["id", "name", "state", "order_line", "user_id"],
-        )
-    except Exception as e:
-        err = f"Error leyendo sale.order {order_id}: {e}"
-        _log_call("apply_discount", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {"success": False, "error_code": "order_read_failed", "error_detail": err}
-
-    if not orders:
-        err = f"sale.order {order_id} no existe"
-        _log_call("apply_discount", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {"success": False, "error_code": "order_not_found", "error_detail": err}
-
-    order = orders[0]
-    if order["state"] not in ("draft", "sent"):
-        err = (
-            f"sale.order {order['name']} esta en estado '{order['state']}', "
-            f"no se puede modificar el descuento"
-        )
-        _log_call("apply_discount", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "order_not_editable",
-            "error_detail": err,
-            "order_id": order_id,
-            "state": order["state"],
-        }
-
-    all_line_ids: list[int] = list(order.get("order_line") or [])
-    if not all_line_ids:
-        err = f"sale.order {order['name']} no tiene lineas"
-        _log_call("apply_discount", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {"success": False, "error_code": "no_lines", "error_detail": err}
-
-    # Resolve target line ids ---------------------------------------------
-    if line_id is not None:
-        # Confirm the line belongs to this order.
-        try:
-            line_rows = odoo_read(
-                tenant_id, url, db, user, password,
-                "sale.order.line", [line_id], ["id", "order_id"],
-            )
-        except Exception as e:
-            err = f"Error leyendo sale.order.line {line_id}: {e}"
-            _log_call("apply_discount", tenant_id, log_args, None, err,
-                      int((time.time() - started) * 1000))
-            return {"success": False, "error_code": "line_read_failed", "error_detail": err}
-
-        if not line_rows:
-            err = f"sale.order.line {line_id} no existe"
-            _log_call("apply_discount", tenant_id, log_args, None, err,
-                      int((time.time() - started) * 1000))
-            return {"success": False, "error_code": "line_not_found", "error_detail": err}
-
-        line_row = line_rows[0]
-        line_order = line_row.get("order_id")
-        line_order_id = (
-            line_order[0] if isinstance(line_order, list) and line_order
-            else line_order
-        )
-        if line_order_id != order_id:
-            err = (
-                f"La linea {line_id} pertenece a la orden {line_order_id}, "
-                f"no a {order_id}"
-            )
-            _log_call("apply_discount", tenant_id, log_args, None, err,
-                      int((time.time() - started) * 1000))
-            return {
-                "success": False,
-                "error_code": "line_mismatch",
-                "error_detail": err,
-                "order_id": order_id,
-                "line_id": line_id,
-            }
-        target_ids = [line_id]
-    else:
-        target_ids = all_line_ids
-
-    # Apply the discount ---------------------------------------------------
-    try:
-        odoo_call_method(
-            tenant_id, url, db, user, password,
-            "sale.order.line", "write", target_ids,
-            args=[{"discount": discount_pct}],
-        )
-    except Exception as e:
-        elapsed = int((time.time() - started) * 1000)
-        tb = traceback.format_exc()
-        logger.error(
-            "ODOO_CALL apply_discount FAILED tenant=%s order=%s lines=%s err=%s\n%s",
-            tenant_id, order_id, target_ids, e, tb,
-        )
-        _log_call("apply_discount", tenant_id, log_args, None, str(e), elapsed)
-        return {
-            "success": False,
-            "error_code": "discount_write_failed",
-            "error_detail": str(e),
-            "order_id": order_id,
-        }
-
-    # Optionally log a chatter note (best-effort — never block the result).
-    if reason:
-        try:
-            note_body = (
-                f"Descuento {discount_pct}% aplicado. Motivo: {reason}"
-            )
-            odoo_call_method(
-                tenant_id, url, db, user, password,
-                "sale.order", "message_post", [order_id],
-                kwargs={"body": note_body, "subtype_xmlid": "mail.mt_note"},
-            )
-        except Exception as e:
-            logger.warning(
-                "ODOO_CALL apply_discount tenant=%s order=%s message_post failed: %s",
-                tenant_id, order_id, e,
-            )
-
-    # Re-read totals -------------------------------------------------------
-    try:
-        refreshed = odoo_read(
-            tenant_id, url, db, user, password,
-            "sale.order", [order_id],
-            ["amount_total", "amount_untaxed", "amount_tax"],
-        )
-        head = refreshed[0] if refreshed else {}
-        new_total = head.get("amount_total", 0) or 0
-        new_untaxed = head.get("amount_untaxed", 0) or 0
-    except Exception as e:
-        err = f"Descuento aplicado pero no pudimos releer totales: {e}"
-        _log_call("apply_discount", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "read_after_write_failed",
-            "error_detail": err,
-            "order_id": order_id,
-        }
-
-    result = {
-        "success": True,
-        "order_id": order_id,
-        "lines_updated": len(target_ids),
-        "discount_pct": discount_pct,
-        "new_amount_total": new_total,
-        "new_amount_total_display": format_price_display(new_total),
-        "new_amount_untaxed": new_untaxed,
-        "new_amount_untaxed_display": format_price_display(new_untaxed),
-    }
-    _log_call("apply_discount", tenant_id, log_args, result, None,
-              int((time.time() - started) * 1000))
-    return result
-
-
-_ALLOWED_QUOTATION_STATES = {"draft", "sent", "sale", "done", "cancel"}
-
-
-def odoo_list_my_quotations(
-    tenant_id: str, url: str, db: str, user: str, password: str,
-    salesperson_user_id: int,
-    state: list[str] | None = None,
-    limit: int = 20,
-) -> dict:
-    """List quotations owned by a specific salesperson.
-
-    Default state filter is ['draft', 'sent'] (active quotations the seller
-    might still close). Use the `state` arg to widen the filter.
-    """
-    started = time.time()
-    log_args = {
-        "salesperson_user_id": salesperson_user_id,
-        "state": state,
-        "limit": limit,
-    }
-
-    if not isinstance(salesperson_user_id, int) or salesperson_user_id <= 0:
-        err = "salesperson_user_id requerido y debe ser entero positivo"
-        _log_call("list_my_quotations", tenant_id, log_args, None, err, 0)
-        return {
-            "success": False,
-            "error_code": "invalid_salesperson_user_id",
-            "error_detail": err,
-        }
-
-    states = state or ["draft", "sent"]
-    if not isinstance(states, list) or not states:
-        err = "state debe ser una lista no vacia"
-        _log_call("list_my_quotations", tenant_id, log_args, None, err, 0)
-        return {
-            "success": False,
-            "error_code": "invalid_state",
-            "error_detail": err,
-        }
-
-    bad = [s for s in states if s not in _ALLOWED_QUOTATION_STATES]
-    if bad:
-        err = (
-            f"Estados invalidos: {bad}. "
-            f"Usa cualquiera de {sorted(_ALLOWED_QUOTATION_STATES)}"
-        )
-        _log_call("list_my_quotations", tenant_id, log_args, None, err, 0)
-        return {
-            "success": False,
-            "error_code": "invalid_state",
-            "error_detail": err,
-        }
-
-    if not isinstance(limit, int) or limit <= 0:
-        limit = 20
-    limit = min(limit, 200)
-
-    domain = [
-        ["user_id", "=", salesperson_user_id],
-        ["state", "in", states],
-    ]
-
-    try:
-        orders = odoo_search(
-            tenant_id, url, db, user, password,
-            "sale.order",
-            domain,
-            ["id", "name", "partner_id", "amount_total", "state",
-             "date_order", "order_line"],
-            limit=limit,
-            order="date_order DESC",
-        )
-    except Exception as e:
-        err = f"Error consultando cotizaciones del vendedor {salesperson_user_id}: {e}"
-        _log_call("list_my_quotations", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "search_failed",
-            "error_detail": err,
-        }
-
-    # Batch-load the partners (best effort; missing data simply omitted).
-    partner_ids: list[int] = []
-    for o in orders or []:
-        pf = o.get("partner_id")
-        if isinstance(pf, list) and pf:
-            partner_ids.append(pf[0])
-        elif isinstance(pf, int):
-            partner_ids.append(pf)
-    partner_ids = sorted(set(partner_ids))
-
-    partner_index: dict[int, dict] = {}
-    if partner_ids:
-        try:
-            partner_rows = odoo_read(
-                tenant_id, url, db, user, password,
-                "res.partner", partner_ids, ["id", "name", "vat"],
-            )
-            for pr in partner_rows or []:
-                partner_index[pr["id"]] = pr
-        except Exception as e:
-            logger.warning(
-                "ODOO_CALL list_my_quotations tenant=%s could not read partners %s: %s",
-                tenant_id, partner_ids, e,
-            )
-
-    quotations = []
-    for o in orders or []:
-        pf = o.get("partner_id")
-        if isinstance(pf, list) and pf:
-            partner_id_val = pf[0]
-            partner_display = pf[1] if len(pf) > 1 else ""
-        elif isinstance(pf, int):
-            partner_id_val = pf
-            partner_display = ""
-        else:
-            partner_id_val = None
-            partner_display = ""
-
-        partner_record = partner_index.get(partner_id_val) if partner_id_val else None
-        partner_name = (partner_record or {}).get("name") or partner_display or ""
-        partner_vat = (partner_record or {}).get("vat") or None
-
-        amount_total = o.get("amount_total", 0) or 0
-        line_ids = o.get("order_line") or []
-
-        quotations.append({
-            "order_id": o["id"],
-            "name": o.get("name") or "",
-            "partner_id": partner_id_val,
-            "partner_name": partner_name,
-            "partner_vat": partner_vat,
-            "amount_total": amount_total,
-            "amount_total_display": format_price_display(amount_total),
-            "state": o.get("state") or "",
-            "state_label": _STATE_LABEL.get(o.get("state") or "", o.get("state") or ""),
-            "date_order": str(o.get("date_order") or ""),
-            "line_count": len(line_ids),
-        })
-
-    result = {
-        "success": True,
-        "count": len(quotations),
-        "quotations": quotations,
-    }
-    _log_call("list_my_quotations", tenant_id, log_args,
-              {"count": len(quotations)}, None,
-              int((time.time() - started) * 1000))
-    return result
-
-
-def odoo_schedule_visit(
+def get_latest_quotation(
     tenant_id: str, url: str, db: str, user: str, password: str,
     partner_id: int,
-    summary: str,
-    date_deadline: str,
-    salesperson_user_id: int,
-    note: str | None = None,
+    states: list[str] | None = None,
 ) -> dict:
-    """Create a mail.activity (Meeting type) on the partner.
+    """Fetch the most recent quotation for a partner (limit=1, newest first).
 
-    The activity shows up in the salesperson's calendar/CRM as a pending
-    visit. `date_deadline` must be a YYYY-MM-DD string.
+    Returns full order detail (same format as get_quotation) plus _card metadata.
+    Use when the customer asks for 'mi última proforma', 'la más reciente', etc.
     """
-    started = time.time()
-    log_args = {
-        "partner_id": partner_id,
-        "summary": summary,
-        "date_deadline": date_deadline,
-        "salesperson_user_id": salesperson_user_id,
-        "has_note": bool(note),
-    }
+    states = states or ["draft", "sent"]
+    # Step 1: get the most recent order_id
+    list_result = odoo_list_quotations(
+        tenant_id, url, db, user, password,
+        partner_id=partner_id, limit=1, states=states,
+    )
+    if not list_result.get("success") or not list_result.get("orders"):
+        return {"success": False, "error_code": "no_quotations",
+                "error_detail": "No se encontraron cotizaciones para este cliente."}
 
-    # Argument validation -------------------------------------------------
-    if not isinstance(partner_id, int) or partner_id <= 0:
-        err = "partner_id requerido y debe ser entero positivo"
-        _log_call("schedule_visit", tenant_id, log_args, None, err, 0)
-        return {"success": False, "error_code": "invalid_partner_id", "error_detail": err}
-
-    if not isinstance(salesperson_user_id, int) or salesperson_user_id <= 0:
-        err = "salesperson_user_id requerido y debe ser entero positivo"
-        _log_call("schedule_visit", tenant_id, log_args, None, err, 0)
-        return {
-            "success": False,
-            "error_code": "invalid_salesperson_user_id",
-            "error_detail": err,
-        }
-
-    if not summary or not isinstance(summary, str) or not summary.strip():
-        err = "summary requerido y debe ser texto no vacio"
-        _log_call("schedule_visit", tenant_id, log_args, None, err, 0)
-        return {"success": False, "error_code": "invalid_summary", "error_detail": err}
-
-    if not date_deadline or not isinstance(date_deadline, str):
-        err = "date_deadline requerido en formato YYYY-MM-DD"
-        _log_call("schedule_visit", tenant_id, log_args, None, err, 0)
-        return {"success": False, "error_code": "invalid_date", "error_detail": err}
-
-    try:
-        datetime.strptime(date_deadline, "%Y-%m-%d")
-    except ValueError:
-        err = f"date_deadline debe estar en formato YYYY-MM-DD, recibi {date_deadline!r}"
-        _log_call("schedule_visit", tenant_id, log_args, None, err, 0)
-        return {"success": False, "error_code": "invalid_date", "error_detail": err}
-
-    # Resolve the Meeting activity type id --------------------------------
-    try:
-        meeting_rows = odoo_search(
-            tenant_id, url, db, user, password,
-            "mail.activity.type",
-            [["name", "=", "Meeting"]],
-            ["id", "name"],
-            limit=1,
-        )
-    except Exception as e:
-        err = f"Error consultando mail.activity.type: {e}"
-        _log_call("schedule_visit", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "activity_type_lookup_failed",
-            "error_detail": err,
-        }
-
-    if not meeting_rows:
-        # Fallback for non-English Odoo installs.
-        try:
-            meeting_rows = odoo_search(
-                tenant_id, url, db, user, password,
-                "mail.activity.type",
-                [["name", "ilike", "meeting"]],
-                ["id", "name"],
-                limit=1,
-            )
-        except Exception as e:
-            err = f"Error consultando mail.activity.type (fallback): {e}"
-            _log_call("schedule_visit", tenant_id, log_args, None, err,
-                      int((time.time() - started) * 1000))
-            return {
-                "success": False,
-                "error_code": "activity_type_lookup_failed",
-                "error_detail": err,
-            }
-
-    if not meeting_rows:
-        err = (
-            "No encontre el tipo de actividad 'Meeting' en Odoo. "
-            "Pide al admin que active mail.mail_activity_data_meeting."
-        )
-        _log_call("schedule_visit", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "meeting_activity_type_missing",
-            "error_detail": err,
-        }
-    meeting_type_id = meeting_rows[0]["id"]
-
-    # Resolve ir.model id for res.partner ---------------------------------
-    try:
-        model_rows = odoo_search(
-            tenant_id, url, db, user, password,
-            "ir.model",
-            [["model", "=", "res.partner"]],
-            ["id", "model"],
-            limit=1,
-        )
-    except Exception as e:
-        err = f"Error consultando ir.model res.partner: {e}"
-        _log_call("schedule_visit", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "model_lookup_failed",
-            "error_detail": err,
-        }
-
-    if not model_rows:
-        err = "No encontre ir.model para res.partner; no puedo crear la actividad"
-        _log_call("schedule_visit", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "partner_model_missing",
-            "error_detail": err,
-        }
-    partner_model_id = model_rows[0]["id"]
-
-    # Validate partner exists ---------------------------------------------
-    try:
-        partner_rows = odoo_read(
-            tenant_id, url, db, user, password,
-            "res.partner", [partner_id], ["id", "name"],
-        )
-    except Exception as e:
-        err = f"Error leyendo partner {partner_id}: {e}"
-        _log_call("schedule_visit", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "partner_read_failed",
-            "error_detail": err,
-        }
-
-    if not partner_rows:
-        err = f"Partner id={partner_id} no existe en Odoo"
-        _log_call("schedule_visit", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {
-            "success": False,
-            "error_code": "partner_not_found",
-            "error_detail": err,
-            "partner_id": partner_id,
-        }
-
-    partner_name = partner_rows[0].get("name") or ""
-
-    # Build vals + create -------------------------------------------------
-    vals: dict = {
-        "activity_type_id": meeting_type_id,
-        "res_model_id": partner_model_id,
-        "res_model": "res.partner",
-        "res_id": partner_id,
-        "user_id": salesperson_user_id,
-        "summary": summary.strip(),
-        "date_deadline": date_deadline,
-    }
-    if note:
-        if note.lstrip().startswith("<"):
-            vals["note"] = note
-        else:
-            vals["note"] = f"<p>{note}</p>"
-
-    try:
-        activity_id = odoo_create(
-            tenant_id, url, db, user, password,
-            "mail.activity", vals,
-        )
-    except Exception as e:
-        elapsed = int((time.time() - started) * 1000)
-        tb = traceback.format_exc()
-        logger.error(
-            "ODOO_CALL schedule_visit FAILED tenant=%s partner=%s err=%s\n%s",
-            tenant_id, partner_id, e, tb,
-        )
-        _log_call("schedule_visit", tenant_id, log_args, None, str(e), elapsed)
-        return {
-            "success": False,
-            "error_code": "activity_create_failed",
-            "error_detail": str(e),
-            "partner_id": partner_id,
-        }
-
-    result = {
-        "success": True,
-        "activity_id": activity_id,
-        "partner_id": partner_id,
-        "partner_name": partner_name,
-        "summary": summary.strip(),
-        "date_deadline": date_deadline,
-        "salesperson_user_id": salesperson_user_id,
-    }
-    _log_call("schedule_visit", tenant_id, log_args,
-              {"activity_id": activity_id}, None,
-              int((time.time() - started) * 1000))
-    return result
+    order_id = list_result["orders"][0]["order_id"]
+    # Step 2: get full detail
+    detail = odoo_get_quotation(
+        tenant_id, url, db, user, password, order_id=order_id,
+    )
+    return detail  # already has _card from odoo_get_quotation

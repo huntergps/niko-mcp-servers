@@ -8,7 +8,6 @@ Multi-tenant: each MCP session carries a tenant JWT in headers.
 
 import json
 import logging
-import re
 import socket
 import xmlrpc.client
 
@@ -44,17 +43,6 @@ def _postgrest_headers(supabase_key: str, *, schema: str = "public",
     if prefer:
         h["Prefer"] = prefer
     return h
-
-
-# ---------------------------------------------------------------------------
-# Price display formatter
-# ---------------------------------------------------------------------------
-#
-# Tokenizer-safe "USD 1,383.00" renderer lives in mcp_odoo.tools.formatters
-# so both this transport and the sales tools share one implementation. See
-# that module for the background on why the comma separator matters.
-
-from mcp_odoo.tools.formatters import format_price_display as _format_price_display
 
 
 # ---------------------------------------------------------------------------
@@ -580,11 +568,6 @@ MCP_TOOLS = [
         "name": "create_quotation",
         "description": (
             "Crear una cotizacion/proforma en Odoo para un cliente con lineas de productos. "
-            "Cada linea DEBE traer **product_code** (SKU del catalogo, ej. 'VID0581') — los "
-            "SKUs vienen del campo `code` de cada resultado de `search_products`. "
-            "Si NO tienes el SKU exacto, llama `search_products` primero. NUNCA inventes "
-            "codigos. El campo `product_id` (template_id numerico) sigue aceptado solo por "
-            "compatibilidad legacy y se va a remover. "
             "IMPORTANTE: Antes de llamar esta herramienta, confirma con el cliente el resumen "
             "de productos, cantidades y precios. "
             "Para ventas a CONSUMIDOR FINAL (RUC 9999999999999): si la empresa requiere datos "
@@ -599,23 +582,10 @@ MCP_TOOLS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "product_code": {
-                                "type": "string",
-                                "description": (
-                                    "Codigo SKU del catalogo (ej. 'VID0581'). PREFERIDO. "
-                                    "Tomalo del campo `code` del resultado de search_products."
-                                ),
-                            },
-                            "product_id": {
-                                "type": "integer",
-                                "description": (
-                                    "DEPRECATED — usa product_code. Aceptado por compat. "
-                                    "Es el template_id numerico de Odoo."
-                                ),
-                            },
+                            "product_id": {"type": "integer"},
                             "quantity": {"type": "number", "default": 1},
                         },
-                        # Cada linea debe traer product_code O product_id; el handler valida.
+                        "required": ["product_id"],
                     },
                 },
                 "notes": {"type": "string", "description": "Notas adicionales", "default": ""},
@@ -631,9 +601,7 @@ MCP_TOOLS = [
         "description": (
             "Agregar uno o mas productos a una cotizacion EXISTENTE en estado borrador. "
             "USA ESTA en lugar de create_quotation cuando ya creaste una cotizacion para el "
-            "cliente y quiere agregar mas productos. NO crea una orden nueva — modifica la existente. "
-            "Cada linea DEBE traer **product_code** (SKU del catalogo). El campo `product_id` "
-            "(template_id) se acepta solo por compat legacy."
+            "cliente y quiere agregar mas productos. NO crea una orden nueva — modifica la existente."
         ),
         "inputSchema": {
             "type": "object",
@@ -644,100 +612,14 @@ MCP_TOOLS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "product_code": {
-                                "type": "string",
-                                "description": (
-                                    "Codigo SKU del catalogo (ej. 'VID0581'). PREFERIDO. "
-                                    "Tomalo del campo `code` del resultado de search_products."
-                                ),
-                            },
-                            "product_id": {
-                                "type": "integer",
-                                "description": (
-                                    "DEPRECATED — usa product_code. Aceptado por compat. "
-                                    "Es el template_id numerico de Odoo."
-                                ),
-                            },
+                            "product_id": {"type": "integer", "description": "template_id del producto"},
                             "quantity": {"type": "number", "default": 1},
                         },
-                        # Cada linea debe traer product_code O product_id; el handler valida.
+                        "required": ["product_id"],
                     },
                 },
             },
             "required": ["order_id", "lines"],
-        },
-    },
-    {
-        "name": "change_quotation_customer",
-        "description": (
-            "Cambiar el cliente (partner_id) de una cotizacion en borrador. "
-            "Usa cuando el vendedor descubre a mitad del flujo que la cotizacion "
-            "estaba destinada a otro cliente — Odoo permite reasignar partner_id "
-            "mientras state in ('draft','sent'). En cotizaciones confirmadas falla. "
-            "Si seller_context esta presente, valida que la cotizacion pertenezca "
-            "a este vendedor."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "order_id": {
-                    "type": "integer",
-                    "description": "ID interno de Odoo de la cotizacion a reasignar.",
-                },
-                "new_partner_id": {
-                    "type": "integer",
-                    "description": (
-                        "partner_id del NUEVO cliente. Tomalo del resultado de "
-                        "search_partner (campo `odoo_id` del primer match) o "
-                        "identify_customer (campo `partner_id`)."
-                    ),
-                },
-            },
-            "required": ["order_id", "new_partner_id"],
-        },
-    },
-    {
-        "name": "update_quotation_line",
-        "description": (
-            "Modificar la cantidad (product_uom_qty) de una linea existente "
-            "en una cotizacion en borrador. Usar cuando el vendedor pide "
-            "'cambiar a 5 unidades', 'pon 10 en lugar de 3', 'quita 1 unidad' "
-            "(restas a la cantidad actual). Si la nueva cantidad es 0, el "
-            "MCP devuelve quantity_zero — pide confirmacion al vendedor para "
-            "borrar la linea con remove_quotation_line."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "order_id": {"type": "integer"},
-                "line_id": {
-                    "type": "integer",
-                    "description": "ID de la linea (sale.order.line). Tomalo de get_quotation o del array order_line.",
-                },
-                "quantity": {
-                    "type": "number",
-                    "description": "Nueva cantidad final (NO incremento). Si pides 'quitar 1' calcula nueva = actual - 1.",
-                },
-            },
-            "required": ["order_id", "line_id", "quantity"],
-        },
-    },
-    {
-        "name": "remove_quotation_line",
-        "description": (
-            "Eliminar una linea de una cotizacion en borrador. SOLO llama "
-            "esta tool DESPUES de que el vendedor confirmo explicitamente "
-            "el borrado. Si llegaste aqui via update_quotation_line con "
-            "cantidad 0 → primero pregunta '¿Confirmas eliminar la linea?' "
-            "y solo si responde si llamas remove."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "order_id": {"type": "integer"},
-                "line_id": {"type": "integer"},
-            },
-            "required": ["order_id", "line_id"],
         },
     },
     {
@@ -796,6 +678,31 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "get_latest_quotation",
+        "description": (
+            "Obtiene la cotización/proforma más reciente del cliente identificado. "
+            "Úsala cuando el usuario pida 'mi última proforma', 'la más reciente', "
+            "'la nueva', 'la última cotización', 'mi pedido más reciente', etc. "
+            "Devuelve el detalle completo igual que get_quotation."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {
+                    "type": "integer",
+                    "description": "ID del cliente (odoo_id de res.partner)"
+                },
+                "states": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Estados a filtrar. Default: ['draft','sent']. Para ventas confirmadas: ['sale','done']",
+                    "default": ["draft", "sent"]
+                }
+            },
+            "required": ["partner_id"]
+        },
+    },
+    {
         "name": "render_quotation_pdf",
         "description": (
             "Descargar la cotizacion como PDF oficial de Odoo (template completo: logo, "
@@ -841,126 +748,6 @@ MCP_TOOLS = [
                 "order_id": {"type": "integer", "description": "ID de la orden/cotizacion en Odoo"},
             },
             "required": ["order_id"],
-        },
-    },
-    {
-        "name": "apply_discount",
-        "description": (
-            "Aplicar un porcentaje de descuento a una cotizacion en estado 'draft' o 'sent'. "
-            "Si pasas line_id, el descuento se aplica solo a esa linea. "
-            "Si no pasas line_id, se aplica a TODAS las lineas del pedido. "
-            "Recuerda: este tool NO valida si el descuento esta dentro del umbral del agente — "
-            "esa validacion ocurre antes (vias guardrails / approval flow). "
-            "Tras aplicar, los totales (amount_total, amount_untaxed) se recalculan automaticamente "
-            "y se devuelven en el resultado."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "order_id": {"type": "integer", "description": "ID interno de Odoo de la cotizacion"},
-                "discount_pct": {"type": "number", "description": "Porcentaje de descuento (0-100). Ej: 5 = 5%"},
-                "line_id": {"type": "integer", "description": "Opcional: ID de la linea especifica. Sin esto, aplica a todas las lineas."},
-                "reason": {"type": "string", "description": "Opcional: motivo del descuento. Se guarda como nota interna en la cotizacion."},
-            },
-            "required": ["order_id", "discount_pct"],
-        },
-    },
-    {
-        "name": "list_my_quotations",
-        "description": (
-            "Listar las cotizaciones de un vendedor especifico (sale.order.user_id). "
-            "Por defecto trae las cotizaciones activas (state in ['draft','sent']). "
-            "Util para que un vendedor B2B revise sus pendientes o para retomar cotizaciones "
-            "abiertas con un cliente. Ordenado por fecha descendente, limite default 20."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "salesperson_user_id": {"type": "integer", "description": "ID del usuario Odoo (res.users.id) del vendedor"},
-                "state": {
-                    "type": "array",
-                    "items": {"type": "string", "enum": ["draft", "sent", "sale", "done", "cancel"]},
-                    "description": "Filtro de estados. Default: ['draft','sent']",
-                },
-                "limit": {"type": "integer", "description": "Maximo de resultados", "default": 20},
-            },
-            "required": ["salesperson_user_id"],
-        },
-    },
-    {
-        "name": "schedule_visit",
-        "description": (
-            "Agendar una visita a un cliente creando un mail.activity tipo 'Meeting' en su ficha. "
-            "El vendedor responsable (salesperson_user_id) la vera en su CRM/calendario. "
-            "Usar cuando el vendedor B2B pida 'agendar visita a Juan Perez el viernes'."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "partner_id": {"type": "integer", "description": "ID del partner (res.partner.id) — el cliente a visitar"},
-                "summary": {"type": "string", "description": "Titulo corto de la visita (ej: 'Demo producto X')"},
-                "date_deadline": {"type": "string", "description": "Fecha de la visita en formato YYYY-MM-DD"},
-                "salesperson_user_id": {"type": "integer", "description": "ID del vendedor responsable (res.users.id)"},
-                "note": {"type": "string", "description": "Opcional: nota detallada (puede contener HTML)"},
-            },
-            "required": ["partner_id", "summary", "date_deadline", "salesperson_user_id"],
-        },
-    },
-    # Backend-only tool — invocada por niko/auth/seller_otp.py durante el flujo
-    # /login del bot B2B. NO incluida en tools_enabled de ningun agente (no
-    # es LLM-facing); el filtro allowed_tools en tools/call la deja invisible
-    # al LLM aunque aparezca en este registro. Mantiene el prefijo odoo_
-    # porque la convencion sin-prefijo es solo para tools que el LLM ve.
-    {
-        "name": "odoo_lookup_user_by_email",
-        "description": (
-            "Backend RPC: localiza un res.users de Odoo por email "
-            "(login OR partner_id.email). Usado por el flujo /login del bot "
-            "B2B para validar que el vendedor existe antes de enviar OTP."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "email": {"type": "string", "description": "Email del vendedor a validar"},
-            },
-            "required": ["email"],
-        },
-    },
-    # Backend-only tools — Sprint 2F. Generic ERP-agnostic contracts that
-    # niko/integrations/ wrappers consume. Keep the odoo_ prefix because
-    # they are NOT LLM-facing (no agent.tools_enabled lists them) and the
-    # allowed_tools filter on tools/call (mcp_transport.py L1018) blocks
-    # any LLM agent from calling them anyway.
-    {
-        "name": "odoo_get_discount_policy",
-        "description": (
-            "Backend RPC: lee la politica de descuento del ERP "
-            "(max_pct desde ir.config_parameter sale.partner_max_sale_discount "
-            "y la lista de supervisores autorizados desde el grupo "
-            "account.group_account_manager). Devuelve un contrato "
-            "agnostico-ERP que el core de niko consume."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
-    },
-    {
-        "name": "odoo_verify_seller_authorization",
-        "description": (
-            "Backend RPC: confirma que un email corresponde a un vendedor "
-            "autorizado en el ERP — busca el res.users y verifica que "
-            "pertenece al grupo sales_team.group_sale_salesman. Mas profundo "
-            "que odoo_lookup_user_by_email: lookup + chequeo de grupo en una "
-            "sola llamada."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "email": {"type": "string", "description": "Email del vendedor a verificar"},
-            },
-            "required": ["email"],
         },
     },
     {
@@ -1260,146 +1047,6 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
     tc = tenant_config  # shorthand
     creds = (tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"])
 
-    # Read X-Seller-Context (sent by niko core when a B2B seller has
-    # completed /login OTP). Plugin uses it to validate self-references
-    # and to inject salesperson_user_id into quotation tools so niko
-    # core does not need to know ERP-specific args.
-    seller_ctx_raw = request.headers.get("x-seller-context") or ""
-    seller_ctx: dict = {}
-    if seller_ctx_raw:
-        try:
-            seller_ctx = json.loads(seller_ctx_raw) or {}
-        except (json.JSONDecodeError, TypeError):
-            seller_ctx = {}
-    seller_uid: int | None = None
-    seller_partner_id: int | None = None
-    seller_partner_vat: str = ""
-    if seller_ctx:
-        try:
-            seller_uid = int(seller_ctx.get("odoo_user_id")) \
-                if seller_ctx.get("odoo_user_id") is not None else None
-        except (TypeError, ValueError):
-            seller_uid = None
-        try:
-            seller_partner_id = int(seller_ctx.get("partner_id")) \
-                if seller_ctx.get("partner_id") is not None else None
-        except (TypeError, ValueError):
-            seller_partner_id = None
-        seller_partner_vat = (seller_ctx.get("partner_vat") or "").strip()
-
-    # ── B2B guards: applied centrally before the tool dispatcher so
-    # individual tool functions stay simple. Each guard returns an
-    # error envelope as JSON text — the LLM reads `error_code` and
-    # corrects on the next turn.
-    if seller_uid is not None:
-        # Guard 1: identify_customer with seller's own VAT.
-        if tool_name == "identify_customer" and seller_partner_vat:
-            cedula_ruc = (str(args.get("cedula_ruc") or "")).strip()
-            if cedula_ruc and cedula_ruc == seller_partner_vat:
-                logger.warning(
-                    "BLOCKED identify_customer: cedula_ruc %s equals "
-                    "seller's own vat (seller_uid=%s)",
-                    cedula_ruc, seller_uid,
-                )
-                # ``llm_action`` is an INTERNAL directive to the LLM in
-                # Spanish (matches the model's working language). Rule
-                # mcp-error-handling (priority 270) tells the LLM to
-                # follow it silently and only show the final result.
-                return json.dumps({
-                    "success": False,
-                    "error_code": "self_lookup_blocked",
-                    "llm_action": (
-                        "INTERNA: ese RUC es del vendedor. Llama "
-                        "search_partner con el nombre del cliente que "
-                        "mencionó el vendedor. NO muestres este error "
-                        "al usuario."
-                    ),
-                }, ensure_ascii=False, indent=2)
-
-        # Guard 2: create_quotation — validate partner_id + inject
-        # salesperson_user_id.
-        if tool_name == "create_quotation":
-            raw_partner = args.get("partner_id")
-            try:
-                partner_id_arg = int(raw_partner) if raw_partner is not None else None
-            except (TypeError, ValueError):
-                partner_id_arg = None
-
-            # Auto-inject partner_id from the persisted active_customer
-            # state when the LLM forgot to pass it. This breaks the
-            # missing_partner → search_partner → retry loop that
-            # surfaced as GraphRecursionError. Niko orchestrator
-            # populates seller_ctx.active_customer_partner_id whenever
-            # a previous turn's search_partner returned a unique match.
-            if partner_id_arg is None:
-                try:
-                    ac_pid = int(seller_ctx.get("active_customer_partner_id")) \
-                        if seller_ctx.get("active_customer_partner_id") is not None else None
-                except (TypeError, ValueError):
-                    ac_pid = None
-                if ac_pid is not None:
-                    logger.info(
-                        "INJECT create_quotation.partner_id=%d from "
-                        "active_customer (seller_uid=%s, name=%r)",
-                        ac_pid, seller_uid,
-                        seller_ctx.get("active_customer_name") or "",
-                    )
-                    args["partner_id"] = ac_pid
-                    partner_id_arg = ac_pid
-
-            if partner_id_arg is None:
-                logger.warning(
-                    "BLOCKED create_quotation: missing partner_id "
-                    "(seller_uid=%s)", seller_uid,
-                )
-                return json.dumps({
-                    "success": False,
-                    "error_code": "missing_partner",
-                    "llm_action": (
-                        "INTERNA: falta partner_id. Llama "
-                        "search_partner con el nombre del cliente, toma "
-                        "el campo `odoo_id` del primer resultado y "
-                        "vuelve a llamar create_quotation pasando ese "
-                        "valor como partner_id (entero). NO muestres "
-                        "este error al usuario."
-                    ),
-                }, ensure_ascii=False, indent=2)
-
-            if seller_partner_id is not None and partner_id_arg == seller_partner_id:
-                logger.warning(
-                    "BLOCKED create_quotation: partner_id %s equals "
-                    "seller's own partner_id (seller_uid=%s)",
-                    partner_id_arg, seller_uid,
-                )
-                return json.dumps({
-                    "success": False,
-                    "error_code": "wrong_partner",
-                    "llm_action": (
-                        "INTERNA: ese partner_id es del vendedor. "
-                        "Llama search_partner con el nombre del cliente, "
-                        "toma `odoo_id` del primer resultado y vuelve a "
-                        "llamar create_quotation con ese valor. NO "
-                        "muestres este error al usuario."
-                    ),
-                }, ensure_ascii=False, indent=2)
-
-            # Inject salesperson_user_id from seller_context (override).
-            if args.get("salesperson_user_id") != seller_uid:
-                logger.info(
-                    "INJECT create_quotation.salesperson_user_id=%s "
-                    "(was=%s)", seller_uid, args.get("salesperson_user_id"),
-                )
-                args["salesperson_user_id"] = seller_uid
-
-        # Guard 3: add_to_quotation — inject salesperson_user_id.
-        if tool_name == "add_to_quotation":
-            if args.get("salesperson_user_id") != seller_uid:
-                logger.info(
-                    "INJECT add_to_quotation.salesperson_user_id=%s "
-                    "(was=%s)", seller_uid, args.get("salesperson_user_id"),
-                )
-                args["salesperson_user_id"] = seller_uid
-
     if tool_name == "search_products":
         return await _rag_search(
             args["query"],
@@ -1447,19 +1094,12 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
                 f"{base_url}/web/image/product.template/{p['id']}/image_256"
                 if has_image else None
             )
-            raw_price = p.get("list_price", 0) or 0
-            raw_cost = p.get("standard_price", 0) or 0
             results.append({
                 "id": p["id"],
                 "code": p.get("default_code", ""),
                 "name": p.get("name", ""),
-                # Keep the numeric fields so any existing caller keeps
-                # working; ALSO emit display strings that the LLM should
-                # copy verbatim (tokenizer-safe comma-separated format).
-                "price": raw_price,
-                "price_display": _format_price_display(raw_price) if raw_price else "consultar",
-                "cost": raw_cost,
-                "cost_display": _format_price_display(raw_cost) if raw_cost else "consultar",
+                "price": p.get("list_price", 0),
+                "cost": p.get("standard_price", 0),
                 "stock": p.get("qty_available", 0),
                 "available": p.get("virtual_available", 0),
                 "description": p.get("description_sale") or "",
@@ -1557,50 +1197,12 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             end_customer_name=args.get("end_customer_name"),
             end_customer_phone=args.get("end_customer_phone"),
             end_customer_email=args.get("end_customer_email"),
-            salesperson_user_id=args.get("salesperson_user_id"),
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "add_to_quotation":
         from mcp_odoo.tools.sales import odoo_add_to_quotation
-        result = odoo_add_to_quotation(
-            *creds, args["order_id"], args["lines"],
-            salesperson_user_id=args.get("salesperson_user_id"),
-        )
-        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
-
-    if tool_name == "change_quotation_customer":
-        from mcp_odoo.tools.sales import odoo_change_quotation_customer
-        # Auto-inject salesperson_user_id from seller_context so the
-        # plugin can verify the quotation belongs to this seller.
-        sp_uid = seller_uid if seller_uid is not None else None
-        result = odoo_change_quotation_customer(
-            *creds,
-            int(args["order_id"]),
-            int(args["new_partner_id"]),
-            salesperson_user_id=sp_uid,
-        )
-        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
-
-    if tool_name == "update_quotation_line":
-        from mcp_odoo.tools.sales import odoo_update_quotation_line
-        result = odoo_update_quotation_line(
-            *creds,
-            int(args["order_id"]),
-            int(args["line_id"]),
-            float(args["quantity"]),
-            salesperson_user_id=seller_uid,
-        )
-        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
-
-    if tool_name == "remove_quotation_line":
-        from mcp_odoo.tools.sales import odoo_remove_quotation_line
-        result = odoo_remove_quotation_line(
-            *creds,
-            int(args["order_id"]),
-            int(args["line_id"]),
-            salesperson_user_id=seller_uid,
-        )
+        result = odoo_add_to_quotation(*creds, args["order_id"], args["lines"])
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "get_active_quotation":
@@ -1623,6 +1225,15 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         result = odoo_get_quotation(*creds, args["order_id"])
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
+    if tool_name == "get_latest_quotation":
+        from mcp_odoo.tools.sales import get_latest_quotation
+        result = get_latest_quotation(
+            *creds,
+            partner_id=int(args["partner_id"]),
+            states=args.get("states"),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
     if tool_name == "render_quotation_pdf":
         from mcp_odoo.tools.sales import odoo_render_quotation_pdf
         result = odoo_render_quotation_pdf(*creds, args["order_id"])
@@ -1636,56 +1247,6 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
     if tool_name == "confirm_quotation":
         from mcp_odoo.tools.sales import odoo_confirm_sale_order
         result = odoo_confirm_sale_order(*creds, args["order_id"])
-        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
-
-    if tool_name == "apply_discount":
-        from mcp_odoo.tools import sales as _sales
-        result = _sales.odoo_apply_discount(
-            *creds,
-            order_id=int(args["order_id"]),
-            discount_pct=float(args["discount_pct"]),
-            line_id=int(args["line_id"]) if args.get("line_id") is not None else None,
-            reason=args.get("reason"),
-        )
-        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
-
-    if tool_name == "list_my_quotations":
-        from mcp_odoo.tools import sales as _sales
-        result = _sales.odoo_list_my_quotations(
-            *creds,
-            salesperson_user_id=int(args["salesperson_user_id"]),
-            state=args.get("state"),
-            limit=int(args.get("limit", 20)),
-        )
-        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
-
-    if tool_name == "schedule_visit":
-        from mcp_odoo.tools import sales as _sales
-        result = _sales.odoo_schedule_visit(
-            *creds,
-            partner_id=int(args["partner_id"]),
-            summary=args["summary"],
-            date_deadline=args["date_deadline"],
-            salesperson_user_id=int(args["salesperson_user_id"]),
-            note=args.get("note"),
-        )
-        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
-
-    # Backend-only — niko/auth/seller_otp.py via lookup_odoo_user_by_email wrapper.
-    if tool_name == "odoo_lookup_user_by_email":
-        from mcp_odoo.tools import sales as _sales
-        result = _sales.odoo_lookup_user_by_email(*creds, email=args["email"])
-        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
-
-    # Backend-only — Sprint 2F generic ERP-agnostic contracts.
-    if tool_name == "odoo_get_discount_policy":
-        from mcp_odoo.tools import sales as _sales
-        result = _sales.odoo_get_discount_policy(*creds)
-        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
-
-    if tool_name == "odoo_verify_seller_authorization":
-        from mcp_odoo.tools import sales as _sales
-        result = _sales.odoo_verify_seller_authorization(*creds, email=args["email"])
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "sri_import":
@@ -2621,140 +2182,22 @@ async def _get_tenant_slug(tenant_id: str) -> str:
     return slug
 
 
-# ---------------------------------------------------------------------------
-# Default-code shortcut for `search_products`.
-#
-# When the query looks like a product code (alphanumeric token, ≥4 chars,
-# at least one digit), we short-circuit the BGE-M3 semantic ranker and
-# read `default_code =ilike <query>` directly from Odoo. The semantic
-# ranker is great for descriptions ("cable patch cord") but actively
-# WRONG for codes — it prioritises lexical similarity over exact match
-# and frequently returns ACC0291 for query="CAB0527".
-#
-# Pattern is tenant-agnostic: accepts CAB0527, 001-A, PROD_2024_001,
-# 6300, etc. The "must contain a digit" rule excludes pure-letter words
-# like "RAM" or "case" that would otherwise get a useless exact-code
-# probe before falling back to semantic.
-# ---------------------------------------------------------------------------
-_DEFAULT_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_\-]{4,}$")
-
-
-def _looks_like_default_code(query: str) -> bool:
-    """Return True if ``query`` looks like a product SKU.
-
-    Rules:
-      - alphanumeric + ``_`` + ``-`` only (no spaces, no other punctuation)
-      - length ≥ 4
-      - contains at least one digit (excludes "RAM", "case", "laptop", ...)
-    """
-    if not query:
-        return False
-    q = query.strip()
-    if not _DEFAULT_CODE_PATTERN.match(q):
-        return False
-    if not any(c.isdigit() for c in q):
-        return False
-    return True
-
-
-async def _exact_code_lookup(tenant_id: str, code: str) -> list[dict]:
-    """Look up products by exact ``default_code`` (case-insensitive) in Odoo.
-
-    Returns rows shaped like the pgvector RPC output so they can be fed
-    through the same downstream pipeline (``_fetch_products_live`` +
-    ``_format_ranked_page``):
-
-        [{"odoo_id": <product.template id>,
-          "name": str,
-          "code": str,
-          "metadata": {"odoo_id": ..., "name": ..., "code": ..., "price": ...}}]
-
-    Returns ``[]`` on miss or if the tenant has no Odoo wired.
-    """
-    tc = await _get_tenant_config_by_id(tenant_id)
-    if not tc:
-        return []
-
-    from mcp_odoo.tools.generic import odoo_search as _search
-
-    try:
-        # `=ilike` is case-insensitive exact match (no wildcards). This
-        # tolerates "cab0527" (lowercase) but does not match "CAB05271".
-        rows = _search(
-            tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
-            "product.template",
-            [["default_code", "=ilike", code], ["active", "=", True]],
-            fields=[
-                "id", "name", "default_code", "list_price", "qty_available",
-            ],
-            limit=10,
-        )
-    except Exception as exc:
-        logger.warning(
-            f"_exact_code_lookup({code!r}) failed: {exc!r} — "
-            "falling back to semantic search"
-        )
-        return []
-
-    out: list[dict] = []
-    for row in rows or []:
-        rid = row.get("id")
-        if not isinstance(rid, int):
-            continue
-        out.append({
-            "odoo_id": rid,
-            "name": row.get("name") or "",
-            "code": row.get("default_code") or "",
-            "metadata": {
-                "odoo_id": rid,
-                "name": row.get("name") or "",
-                "code": row.get("default_code") or "",
-                "price": row.get("list_price") or 0,
-            },
-        })
-    return out
-
-
 async def _rag_search(
     query: str, top_k: int = 10, offset: int = 0, tenant_id: str = ""
 ) -> str:
     """Hybrid product search: pgvector RRF + ILIKE merge + live Odoo + paginated.
 
-    1. If the query looks like a product code (e.g. "CAB0527"), do an
-       exact ``default_code`` lookup against Odoo first. Match → top-1
-       deterministic result. Miss → fall through to semantic.
-    2. Look up the cached ranked list for (tenant, query). If hit and
+    1. Look up the cached ranked list for (tenant, query). If hit and
        not expired, slice it [offset:offset+top_k] and return immediately.
-    3. On cache miss: run the full hybrid search (vector RRF + ILIKE),
+    2. On cache miss: run the full hybrid search (vector RRF + ILIKE),
        live-fetch all candidates from Odoo, re-rank in-stock-first,
        cache the WHOLE ranked list for 60s, then return the requested
        page.
-    4. There is NO hard cap on top_k or candidate pool size — the user
+    3. There is NO hard cap on top_k or candidate pool size — the user
        can ask for as many as the catalog has. The pagination is for
        UX (Telegram messages have a length limit) and to absorb burst
        traffic.
     """
-    # ── Default-code shortcut ────────────────────────────────────────
-    # Bug fix: BGE-M3 ranks ACC0291 above CAB0527 for query="CAB0527"
-    # because the embedding model optimises for lexical similarity, not
-    # exact code match. When the query smells like a SKU, ask Odoo for
-    # an exact match first; only fall back to the semantic path if no
-    # row comes back.
-    if _looks_like_default_code(query):
-        exact = await _exact_code_lookup(tenant_id, query.strip())
-        if exact:
-            ids = [r["odoo_id"] for r in exact]
-            live = await _fetch_products_live(tenant_id, ids)
-            ranked: list[dict] = []
-            for r in exact:
-                r["_live"] = live.get(r["odoo_id"])
-                ranked.append(r)
-            # Cache under the normalised query key so paginated follow-ups
-            # ("siguiente") hit the cache instead of re-running the lookup.
-            _query_cache_set(tenant_id, query.strip().lower(), ranked)
-            return _format_ranked_page(ranked, top_k, offset)
-        # No exact match → fall through to semantic ranking (existing path).
-
     cache_key = query.strip().lower()
     cached_ranked = _query_cache_get(tenant_id, cache_key)
     if cached_ranked is not None:
@@ -3003,26 +2446,18 @@ def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
         code_inline = f"  ·  {code}" if code else ""
         title = f"{badge}  {name}{code_inline}"
 
-        # Use tokenizer-safe formatter ("USD 1,383.00" — comma thousands
-        # separator prevents the BPE merge that drops the first digit of
-        # 4+ digit prices on Qwen2.5/Qwen3 AWQ models. See
-        # _format_price_display() docstring for details.
-        price_display = _format_price_display(price) if price else "consultar"
         if price:
-            price_part = f"💰 {price_display}"
+            price_part = f"💰 USD {price:.2f}"
         else:
             price_part = "💰 consultar"
 
         if qty is None:
             stock_part = ""  # tenant without Odoo wired
-            stock_display = ""
         elif qty > 0:
             qty_str = str(int(qty)) if qty == int(qty) else f"{qty:.2f}"
             stock_part = f"   📦 {qty_str} disponibles"
-            stock_display = f"{qty_str} disponibles"
         else:
             stock_part = "   📦 agotado"
-            stock_display = "agotado"
 
         line_text = f"{title}\n      {price_part}{stock_part}"
 
@@ -3030,13 +2465,6 @@ def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
             "template_id": tmpl_id,
             "code": code or "",
             "line_text": line_text,
-            # Structured fields (safe for LLM arithmetic) alongside the
-            # already-rendered line_text. The LLM should PREFER line_text
-            # for display and only touch price_raw for calculations.
-            "price_raw": float(price) if price else 0.0,
-            "price_display": price_display,
-            "stock_raw": (float(qty) if qty is not None else None),
-            "stock_display": stock_display,
         })
 
     # Header
@@ -3079,19 +2507,9 @@ def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
             "Para responder al usuario: escribe header, luego una linea en blanco, "
             "luego cada line_text en orden separados por linea en blanco, luego "
             "linea en blanco, luego footer. NUNCA muestres template_id al usuario. "
-            "Memoriza la posicion (1,2,3...) -> code (SKU) para usar despues en "
-            "create_quotation/add_to_quotation. "
-            "REGLA DE COTIZACION: al llamar create_quotation o add_to_quotation, "
-            "en cada linea pasa **product_code** con el valor exacto del campo `code` "
-            "que aparece en este JSON (ej. 'VID0581'). NUNCA inventes SKUs. NUNCA "
-            "uses product_id (template_id numerico) — es legacy. Si no tienes el "
-            "SKU exacto del producto que el cliente pidio, llama search_products "
-            "otra vez. "
-            "REGLA DE PRECIOS: el campo line_text ya contiene el precio formateado "
-            "correctamente (ej: 'USD 1,383.00'). Coopialo VERBATIM — nunca reformatees "
-            "el precio ni lo conviertas a '$NNNN' porque eso puede corromper los "
-            "digitos. Si necesitas hacer aritmetica, usa price_raw (float) en vez "
-            "de parsear line_text."
+            "Memoriza la posicion (1,2,3...) -> template_id para usar despues en "
+            "create_quotation. NUNCA inventes template_id; usa exactamente el numero "
+            "que aparece en este JSON."
         ),
     }
     return _json.dumps(payload, ensure_ascii=False)
@@ -3145,9 +2563,13 @@ async def _rag_search_partners(query: str, top_k: int = 5, tenant_id: str = "") 
         resp.raise_for_status()
         results = resp.json()
 
+    import json as _json_partners
+
     if not results:
-        return json.dumps({"display_type": "list_data", "results": "No encontre contactos que coincidan con esa busqueda."})
-    import json
+        return _json_partners.dumps(
+            {"display_type": "list_data", "results": "No encontre contactos que coincidan con esa busqueda."},
+            ensure_ascii=False,
+        )
 
     lines = []
     for r in results:
@@ -3160,5 +2582,7 @@ async def _rag_search_partners(query: str, top_k: int = 5, tenant_id: str = "") 
             f"Tel: {meta.get('phone', '')} | Tipo: {partner_type} (score: {score:.2f})"
         )
     summary = f"Encontre {len(results)} contactos:\n" + "\n".join(lines)
-    import json
-    return json.dumps({"display_type": "list_data", "results": summary}, ensure_ascii=False)
+    return _json_partners.dumps(
+        {"display_type": "list_data", "results": summary},
+        ensure_ascii=False,
+    )
