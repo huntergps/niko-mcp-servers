@@ -3071,6 +3071,7 @@ def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
     footer = "\n".join(footer_parts)
 
     payload = {
+        "display_type": "list_data",
         "header": header,
         "rows": rows,
         "footer": footer,
@@ -3145,7 +3146,8 @@ async def _rag_search_partners(query: str, top_k: int = 5, tenant_id: str = "") 
         results = resp.json()
 
     if not results:
-        return "No encontre contactos que coincidan con esa busqueda."
+        return json.dumps({"display_type": "list_data", "results": "No encontre contactos que coincidan con esa busqueda."})
+    import json
 
     lines = []
     for r in results:
@@ -3157,4 +3159,6 @@ async def _rag_search_partners(query: str, top_k: int = 5, tenant_id: str = "") 
             f"{meta.get('city', '')} | {meta.get('email', '')} | "
             f"Tel: {meta.get('phone', '')} | Tipo: {partner_type} (score: {score:.2f})"
         )
-    return f"Encontre {len(results)} contactos:\n" + "\n".join(lines)
+    summary = f"Encontre {len(results)} contactos:\n" + "\n".join(lines)
+    import json
+    return json.dumps({"display_type": "list_data", "results": summary}, ensure_ascii=False)

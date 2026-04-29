@@ -1379,6 +1379,7 @@ def odoo_list_quotations(
         })
 
     result = {
+        "display_type": "list_data",
         "success": True,
         "count": len(orders_summary),
         "partner_id": partner_id,
