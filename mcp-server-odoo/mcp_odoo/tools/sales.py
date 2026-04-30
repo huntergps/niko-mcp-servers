@@ -318,29 +318,30 @@ def odoo_add_to_quotation(
         _log_call("add_to_quotation", tenant_id, log_args, None, err, 0)
         return {"success": False, "error_code": "no_lines", "error_detail": err}
 
-    # Validate that the order_id matches the quotation the user explicitly
-    # selected in this session (forwarded via X-Active-Quotation-Id header).
-    # This prevents the LLM from autonomously acting on a quotation it inferred
-    # via get_latest_quotation without the user having confirmed the selection.
-    if session_active_quotation_id is None:
-        return {
-            "success": False,
-            "error_code": "no_active_quotation",
-            "error_detail": (
-                "No hay cotización activa en la sesión del usuario. "
-                "Pregunta al usuario qué cotización quiere modificar, o si desea crear una nueva."
-            ),
-        }
-    if order_id != session_active_quotation_id:
-        return {
-            "success": False,
-            "error_code": "quotation_not_in_session",
-            "error_detail": (
-                f"La cotización {order_id} no fue seleccionada por el usuario en esta sesión. "
-                f"La cotización activa en sesión es {session_active_quotation_id}. "
-                "Pregunta al usuario cuál cotización quiere modificar antes de proceder."
-            ),
-        }
+    # Dry-runs (confirmed=False) pass through so the LLM can show a preview
+    # and the user can decide. Actual writes (confirmed=True) require that the
+    # user explicitly selected this quotation in the current session (set via
+    # X-Active-Quotation-Id header after OrderCard selection or get_latest_quotation).
+    if confirmed:
+        if session_active_quotation_id is None:
+            return {
+                "success": False,
+                "error_code": "no_active_quotation",
+                "error_detail": (
+                    "No hay cotización activa en la sesión del usuario. "
+                    "Pregunta al usuario qué cotización quiere modificar, o si desea crear una nueva."
+                ),
+            }
+        if order_id != session_active_quotation_id:
+            return {
+                "success": False,
+                "error_code": "quotation_not_in_session",
+                "error_detail": (
+                    f"La cotización {order_id} no fue seleccionada por el usuario en esta sesión. "
+                    f"La cotización activa en sesión es {session_active_quotation_id}. "
+                    "Pregunta al usuario cuál cotización quiere modificar antes de proceder."
+                ),
+            }
 
     # Verify order exists and is editable (draft/sent)
     try:
