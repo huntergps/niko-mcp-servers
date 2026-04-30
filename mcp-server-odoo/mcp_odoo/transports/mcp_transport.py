@@ -603,7 +603,10 @@ MCP_TOOLS = [
             "Si NO tienes order_id: (1) revisa el SystemMessage de cotización activa; (2) si el usuario dijo "
             "'última/penúltima/etc', llama get_latest_quotation primero; (3) si no es claro, PREGUNTA al "
             "usuario. NUNCA inventes order_id. NUNCA llames list_quotations para 'encontrar' un order_id "
-            "cuando ya tienes uno en el contexto."
+            "cuando ya tienes uno en el contexto. "
+            "FLUJO OBLIGATORIO: llama primero con confirmed=false para obtener un preview. "
+            "Muéstraselo al usuario. Solo llama con confirmed=true tras recibir confirmación explícita "
+            "('sí', 'confirmo', 'dale')."
         ),
         "inputSchema": {
             "type": "object",
@@ -619,6 +622,11 @@ MCP_TOOLS = [
                         },
                         "required": ["product_id"],
                     },
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Pon true SOLO después de mostrar el preview al usuario y recibir confirmación explícita. Default: false (retorna preview solamente).",
+                    "default": False,
                 },
             },
             "required": ["order_id", "lines"],
@@ -732,12 +740,20 @@ MCP_TOOLS = [
         "name": "send_quotation",
         "description": (
             "Enviar cotizacion por correo electronico al cliente. "
-            "Usa despues de crear la cotizacion, si el cliente solicita recibirla por email."
+            "Usa despues de crear la cotizacion, si el cliente solicita recibirla por email. "
+            "ACCION IRREVERSIBLE. "
+            "FLUJO OBLIGATORIO: llama primero con confirmed=false para obtener un preview. "
+            "Muéstraselo al usuario. Solo llama con confirmed=true tras recibir confirmación explícita."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "order_id": {"type": "integer", "description": "ID de la orden/cotizacion en Odoo"},
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Pon true SOLO después de mostrar el preview al usuario y recibir confirmación explícita. Default: false (retorna preview solamente).",
+                    "default": False,
+                },
             },
             "required": ["order_id"],
         },
@@ -745,13 +761,21 @@ MCP_TOOLS = [
     {
         "name": "confirm_quotation",
         "description": (
-            "Confirmar una cotizacion y convertirla en orden de venta. "
-            "Solo usar cuando el cliente pida confirmar/aprobar la cotizacion."
+            "Confirmar una cotizacion y convertirla en orden de venta. ACCION IRREVERSIBLE. "
+            "Solo usar cuando el cliente pida confirmar/aprobar la cotizacion. "
+            "FLUJO OBLIGATORIO: llama primero con confirmed=false para obtener un preview. "
+            "Muéstraselo al usuario. Solo llama con confirmed=true tras recibir confirmación explícita "
+            "('sí', 'confirmo', 'dale')."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "order_id": {"type": "integer", "description": "ID de la orden/cotizacion en Odoo"},
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Pon true SOLO después de mostrar el preview al usuario y recibir confirmación explícita. Default: false (retorna preview solamente).",
+                    "default": False,
+                },
             },
             "required": ["order_id"],
         },
@@ -1208,7 +1232,12 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
 
     if tool_name == "add_to_quotation":
         from mcp_odoo.tools.sales import odoo_add_to_quotation
-        result = odoo_add_to_quotation(*creds, args["order_id"], args["lines"])
+        result = odoo_add_to_quotation(
+            *creds,
+            args["order_id"],
+            args["lines"],
+            confirmed=bool(args.get("confirmed", False)),
+        )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "get_active_quotation":
@@ -1247,12 +1276,20 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
 
     if tool_name == "send_quotation":
         from mcp_odoo.tools.sales import odoo_send_quotation
-        result = odoo_send_quotation(*creds, args["order_id"])
+        result = odoo_send_quotation(
+            *creds,
+            args["order_id"],
+            confirmed=bool(args.get("confirmed", False)),
+        )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "confirm_quotation":
         from mcp_odoo.tools.sales import odoo_confirm_sale_order
-        result = odoo_confirm_sale_order(*creds, args["order_id"])
+        result = odoo_confirm_sale_order(
+            *creds,
+            args["order_id"],
+            confirmed=bool(args.get("confirmed", False)),
+        )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "sri_import":

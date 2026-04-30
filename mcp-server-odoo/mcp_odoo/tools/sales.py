@@ -285,6 +285,7 @@ def odoo_add_to_quotation(
     tenant_id: str, url: str, db: str, user: str, password: str,
     order_id: int,
     lines: list[dict],
+    confirmed: bool = False,
 ) -> dict:
     """Append product lines to an existing sale.order in draft state.
 
@@ -292,14 +293,20 @@ def odoo_add_to_quotation(
     quotation and wants to add another product to it. The order must be
     in 'draft' or 'sent' state — confirmed orders are immutable.
 
+    IMPORTANT: Call first with confirmed=False (default) to get a preview.
+    Show the preview to the user. Only call with confirmed=True after receiving
+    explicit confirmation ('sí', 'confirmo', 'dale').
+
     Args:
         order_id: existing sale.order ID
         lines: [{product_id (template_id), quantity}, ...]
+        confirmed: False = dry-run preview only; True = execute the write
 
-    Returns the updated order summary (same shape as create_quotation).
+    Returns the updated order summary (same shape as create_quotation) when
+    confirmed=True, or a preview dict when confirmed=False.
     """
     started = time.time()
-    log_args = {"order_id": order_id, "lines_count": len(lines)}
+    log_args = {"order_id": order_id, "lines_count": len(lines), "confirmed": confirmed}
 
     if not isinstance(order_id, int) or order_id <= 0:
         err = "order_id requerido y debe ser entero positivo"
@@ -314,7 +321,7 @@ def odoo_add_to_quotation(
     try:
         orders = odoo_read(
             tenant_id, url, db, user, password,
-            "sale.order", [order_id], ["id", "state", "partner_id", "name"],
+            "sale.order", [order_id], ["id", "state", "partner_id", "name", "amount_total"],
         )
     except Exception as e:
         err = f"Error leyendo sale.order {order_id}: {e}"
@@ -337,6 +344,32 @@ def odoo_add_to_quotation(
             "order_id": order_id,
             "state": order["state"],
         }
+
+    # Dry-run / preview — return what would be done without writing to Odoo
+    if not confirmed:
+        line_descriptions = []
+        for ln in lines:
+            pid = ln.get("product_id", "?")
+            qty = ln.get("quantity", 1)
+            line_descriptions.append(f"product_id={pid} x{qty}")
+        order_name = order.get("name", f"orden {order_id}")
+        current_total = order.get("amount_total", 0)
+        preview_msg = (
+            f"Agregaras {', '.join(line_descriptions)} a {order_name} "
+            f"(total actual: USD {current_total:.2f}). "
+            "Llama de nuevo con confirmed=true para proceder."
+        )
+        result = {
+            "success": False,
+            "requires_confirmation": True,
+            "preview": preview_msg,
+            "action": "add_to_quotation",
+            "order_id": order_id,
+            "order_name": order_name,
+            "lines_to_add": line_descriptions,
+        }
+        _log_call("add_to_quotation", tenant_id, log_args, result, None, int((time.time() - started) * 1000))
+        return result
 
     # Resolve template_ids → variant + uom (same logic as create_quotation)
     template_ids = list({line["product_id"] for line in lines})
@@ -832,12 +865,50 @@ def odoo_render_quotation_pdf(
 def odoo_send_quotation(
     tenant_id: str, url: str, db: str, user: str, password: str,
     order_id: int,
+    confirmed: bool = False,
 ) -> dict:
     """Send quotation by email to the customer (action_quotation_send).
 
     This triggers Odoo's built-in email template for quotations.
     The order state changes from 'draft' to 'sent'.
+
+    IMPORTANT: Sending an email is irreversible. Call first with confirmed=False
+    (default) to get a preview. Show the preview to the user. Only call with
+    confirmed=True after receiving explicit confirmation.
+
+    Args:
+        order_id: sale.order ID to send
+        confirmed: False = dry-run preview only; True = execute the send
     """
+    # Read order info for preview or send
+    orders = odoo_read(
+        tenant_id, url, db, user, password,
+        "sale.order", [order_id],
+        ["name", "state", "partner_id", "amount_total"],
+    )
+    order = orders[0] if orders else {}
+    partner_raw = order.get("partner_id")
+    partner_name = partner_raw[1] if isinstance(partner_raw, list) else str(partner_raw or "")
+    order_name = order.get("name", f"orden {order_id}")
+
+    # Dry-run / preview — return what would be done without sending
+    if not confirmed:
+        preview_msg = (
+            f"Enviaras la cotizacion {order_name} por correo a {partner_name} "
+            f"(total: USD {order.get('amount_total', 0):.2f}). "
+            "Esta accion es irreversible. "
+            "Llama de nuevo con confirmed=true para enviar."
+        )
+        return {
+            "success": False,
+            "requires_confirmation": True,
+            "preview": preview_msg,
+            "action": "send_quotation",
+            "order_id": order_id,
+            "order_name": order_name,
+            "partner": partner_name,
+        }
+
     try:
         # Use action_quotation_send which marks as sent and sends email
         odoo_call_method(
@@ -854,13 +925,14 @@ def odoo_send_quotation(
         except Exception as e2:
             return {"success": False, "error": f"No se pudo enviar: {e2}"}
 
+    # Re-read state after send
     orders = odoo_read(
         tenant_id, url, db, user, password,
         "sale.order", [order_id],
         ["name", "state", "partner_id"],
     )
     order = orders[0] if orders else {}
-    partner_name = order["partner_id"][1] if isinstance(order.get("partner_id"), list) else ""
+    partner_name = order["partner_id"][1] if isinstance(order.get("partner_id"), list) else partner_name
     return {
         "success": True,
         "order_id": order_id,
@@ -874,8 +946,50 @@ def odoo_send_quotation(
 def odoo_confirm_sale_order(
     tenant_id: str, url: str, db: str, user: str, password: str,
     order_id: int,
+    confirmed: bool = False,
 ) -> dict:
-    """Confirm a draft sale order (quotation → sale order)."""
+    """Confirm a draft sale order (quotation → sale order). IRREVERSIBLE.
+
+    IMPORTANT: Confirming a sale order is irreversible — it cannot be reverted
+    to draft easily and triggers stock reservations and billing flows.
+    Call first with confirmed=False (default) to get a preview.
+    Show the preview to the user. Only call with confirmed=True after receiving
+    explicit confirmation ('sí', 'confirmo', 'dale').
+
+    Args:
+        order_id: sale.order ID to confirm
+        confirmed: False = dry-run preview only; True = execute the confirmation
+    """
+    # Read order info needed for preview or post-confirm verification
+    orders = odoo_read(
+        tenant_id, url, db, user, password,
+        "sale.order", [order_id],
+        ["name", "state", "amount_total", "partner_id"],
+    )
+    order = orders[0] if orders else {}
+    order_name = order.get("name", f"orden {order_id}")
+    partner_raw = order.get("partner_id")
+    partner_name = partner_raw[1] if isinstance(partner_raw, list) else str(partner_raw or "")
+
+    # Dry-run / preview — return what would be done without confirming
+    if not confirmed:
+        preview_msg = (
+            f"Confirmaras la cotizacion {order_name} de {partner_name} "
+            f"(total: USD {order.get('amount_total', 0):.2f}). "
+            "Esta accion es IRREVERSIBLE: convierte la proforma en orden de venta. "
+            "Llama de nuevo con confirmed=true para confirmar."
+        )
+        return {
+            "success": False,
+            "requires_confirmation": True,
+            "preview": preview_msg,
+            "action": "confirm_quotation",
+            "order_id": order_id,
+            "order_name": order_name,
+            "partner": partner_name,
+            "total": order.get("amount_total", 0),
+        }
+
     try:
         odoo_call_method(
             tenant_id, url, db, user, password,
