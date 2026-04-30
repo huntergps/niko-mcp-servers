@@ -599,9 +599,11 @@ MCP_TOOLS = [
     {
         "name": "add_to_quotation",
         "description": (
-            "Agregar uno o mas productos a una cotizacion EXISTENTE en estado borrador. "
-            "USA ESTA en lugar de create_quotation cuando ya creaste una cotizacion para el "
-            "cliente y quiere agregar mas productos. NO crea una orden nueva — modifica la existente."
+            "Agregar productos a una cotización EXISTENTE en estado borrador. REQUIERE order_id válido. "
+            "Si NO tienes order_id: (1) revisa el SystemMessage de cotización activa; (2) si el usuario dijo "
+            "'última/penúltima/etc', llama get_latest_quotation primero; (3) si no es claro, PREGUNTA al "
+            "usuario. NUNCA inventes order_id. NUNCA llames list_quotations para 'encontrar' un order_id "
+            "cuando ya tienes uno en el contexto."
         ),
         "inputSchema": {
             "type": "object",
@@ -625,9 +627,11 @@ MCP_TOOLS = [
     {
         "name": "get_active_quotation",
         "description": (
-            "Buscar la cotizacion en borrador mas reciente de un cliente. Util cuando "
-            "perdiste el track del order_id o cuando el cliente regresa despues. Devuelve "
-            "order_id, name, total y lineas si existe; success:false si no hay borradores activos."
+            "DEPRECATED en flujos nuevos. Solo úsala como fallback cuando no tienes order_id ni "
+            "el usuario te dio una pista ordinal. Para 'mi última proforma' usa get_latest_quotation. "
+            "Si el SystemMessage te dice 'NO HAY COTIZACIÓN ACTIVA EN ESTA SESIÓN', NO uses esta — "
+            "PREGUNTA al usuario qué quiere hacer. Devuelve {success, order_id, name, total, lines} o "
+            "{success:false, error_code:'no_active_quote'}."
         ),
         "inputSchema": {
             "type": "object",
@@ -640,12 +644,12 @@ MCP_TOOLS = [
     {
         "name": "list_quotations",
         "description": (
-            "Listar las cotizaciones/ordenes de venta recientes de un cliente — formato COMPACTO "
-            "(solo cabecera + totales, SIN lineas). SIEMPRE usa esta tool cuando el cliente pida "
-            "ver sus cotizaciones, su historial, sus ultimas compras. NUNCA respondas de memoria — "
-            "el modelo alucina lineas. Cada orden devuelve order_id, name, state, state_label, "
-            "total, subtotal, fecha y lines_count. Si el cliente pide el detalle de UNA cotizacion "
-            "especifica, usa get_quotation despues."
+            "Listar cotizaciones recientes — formato COMPACTO (cabecera + totales, SIN líneas). "
+            "USA cuando el usuario pida VER su lista/historial ('muéstrame mis cotizaciones', "
+            "'qué cotizaciones tengo'). NO USES cuando el usuario quiere AGREGAR/MODIFICAR algo: "
+            "para 'agregar a la última' usa get_latest_quotation; para 'agregar a la activa' usa "
+            "el order_id del SystemMessage. NO USES si ya tienes order_id en el contexto. "
+            "Devuelve {orders:[{order_id, name, state, state_label, total, subtotal, date_order, lines_count}]}."
         ),
         "inputSchema": {
             "type": "object",
@@ -664,10 +668,11 @@ MCP_TOOLS = [
     {
         "name": "get_quotation",
         "description": (
-            "Leer el detalle COMPLETO (cabecera + todas las lineas) de UNA cotizacion por order_id. "
-            "Usa esto SOLO cuando el cliente pida ver el detalle de una cotizacion especifica "
-            "('muestrame VENTA120704', 'que tiene esa cotizacion'). Para listar las cotizaciones "
-            "recientes usa list_quotations en su lugar (mas barato en tokens)."
+            "Leer el detalle COMPLETO (cabecera + todas las líneas) de UNA cotización por order_id. "
+            "Usa SOLO cuando el cliente pida ver el detalle de una cotización específica "
+            "('muéstrame VENTA120704', 'qué tiene esa cotización'). Para listar las cotizaciones "
+            "recientes usa list_quotations. Para obtener 'la última proforma' usa "
+            "get_latest_quotation, NO get_quotation con order_id adivinado."
         ),
         "inputSchema": {
             "type": "object",
@@ -680,10 +685,11 @@ MCP_TOOLS = [
     {
         "name": "get_latest_quotation",
         "description": (
-            "Obtiene la cotización/proforma más reciente del cliente identificado. "
-            "Úsala cuando el usuario pida 'mi última proforma', 'la más reciente', "
-            "'la nueva', 'la última cotización', 'mi pedido más reciente', etc. "
-            "Devuelve el detalle completo igual que get_quotation."
+            "PREFIÉRELA sobre get_active_quotation y list_quotations cuando el usuario use cualquier "
+            "ordinal: 'mi última proforma', 'la más reciente', 'la nueva', 'la última cotización', "
+            "'agrégalo a la última', 'mi pedido más reciente'. Internamente lista (limit=1) y devuelve "
+            "detalle completo. Combinable con add_to_quotation: get_latest_quotation → tomas el order_id "
+            "→ add_to_quotation(order_id, lines)."
         ),
         "inputSchema": {
             "type": "object",
