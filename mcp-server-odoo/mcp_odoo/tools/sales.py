@@ -882,7 +882,11 @@ def odoo_confirm_sale_order(
             "sale.order", "action_confirm", [order_id],
         )
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        msg = str(e)
+        # Odoo 13 action_confirm returns None; XML-RPC raises marshal error
+        # but the order IS confirmed in the DB — treat as success and verify.
+        if "cannot marshal None" not in msg and "allow_none" not in msg:
+            return {"success": False, "error": msg}
 
     orders = odoo_read(
         tenant_id, url, db, user, password,
