@@ -127,6 +127,17 @@ def odoo_create_quotation(
     # this at the ORM level. So at THIS boundary (and only here) we resolve
     # template_id → first active variant. We also capture uom_id because
     # TecnoSmart's flex_erp override KeyError's on missing 'product_uom'.
+    # Normalize: accept "product_id" or "template_id" interchangeably.
+    normalized_lines = []
+    for line in lines:
+        pid = line.get("product_id") or line.get("template_id")
+        if pid:
+            normalized_lines.append({**line, "product_id": pid})
+    if not normalized_lines:
+        err = "Ninguna línea tiene product_id válido. Pasa product_id (template_id numérico) por línea."
+        _log_call("create_quotation", tenant_id, log_args, None, err, int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "no_valid_product_ids", "error_detail": err}
+    lines = normalized_lines
     template_ids = list({line["product_id"] for line in lines})
     try:
         variants = odoo_search(
@@ -398,6 +409,11 @@ def odoo_add_to_quotation(
         return result
 
     # Resolve template_ids → variant + uom (same logic as create_quotation)
+    # Normalize: accept "product_id" or "template_id" interchangeably.
+    add_normalized = [{**ln, "product_id": ln.get("product_id") or ln.get("template_id")}
+                      for ln in lines if ln.get("product_id") or ln.get("template_id")]
+    if add_normalized:
+        lines = add_normalized
     template_ids = list({line["product_id"] for line in lines})
     try:
         variants = odoo_search(
