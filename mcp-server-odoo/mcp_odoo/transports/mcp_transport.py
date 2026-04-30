@@ -1077,6 +1077,14 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
     tc = tenant_config  # shorthand
     creds = (tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"])
 
+    # Extract the session-active quotation header forwarded by the orchestrator.
+    # When present, write tools must validate that the LLM is acting on the
+    # quotation the user explicitly selected — not one it inferred autonomously.
+    _aqid_str = request.headers.get("x-active-quotation-id", "")
+    session_active_quotation_id: int | None = (
+        int(_aqid_str) if _aqid_str.isdigit() else None
+    )
+
     if tool_name == "search_products":
         return await _rag_search(
             args["query"],
@@ -1237,6 +1245,7 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             args["order_id"],
             args["lines"],
             confirmed=bool(args.get("confirmed", False)),
+            session_active_quotation_id=session_active_quotation_id,
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
@@ -1280,6 +1289,7 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             *creds,
             args["order_id"],
             confirmed=bool(args.get("confirmed", False)),
+            session_active_quotation_id=session_active_quotation_id,
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
@@ -1289,6 +1299,7 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             *creds,
             args["order_id"],
             confirmed=bool(args.get("confirmed", False)),
+            session_active_quotation_id=session_active_quotation_id,
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 

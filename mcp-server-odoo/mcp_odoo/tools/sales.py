@@ -286,6 +286,7 @@ def odoo_add_to_quotation(
     order_id: int,
     lines: list[dict],
     confirmed: bool = False,
+    session_active_quotation_id: int | None = None,
 ) -> dict:
     """Append product lines to an existing sale.order in draft state.
 
@@ -316,6 +317,30 @@ def odoo_add_to_quotation(
         err = "lines vacio"
         _log_call("add_to_quotation", tenant_id, log_args, None, err, 0)
         return {"success": False, "error_code": "no_lines", "error_detail": err}
+
+    # Validate that the order_id matches the quotation the user explicitly
+    # selected in this session (forwarded via X-Active-Quotation-Id header).
+    # This prevents the LLM from autonomously acting on a quotation it inferred
+    # via get_latest_quotation without the user having confirmed the selection.
+    if session_active_quotation_id is None:
+        return {
+            "success": False,
+            "error_code": "no_active_quotation",
+            "error_detail": (
+                "No hay cotización activa en la sesión del usuario. "
+                "Pregunta al usuario qué cotización quiere modificar, o si desea crear una nueva."
+            ),
+        }
+    if order_id != session_active_quotation_id:
+        return {
+            "success": False,
+            "error_code": "quotation_not_in_session",
+            "error_detail": (
+                f"La cotización {order_id} no fue seleccionada por el usuario en esta sesión. "
+                f"La cotización activa en sesión es {session_active_quotation_id}. "
+                "Pregunta al usuario cuál cotización quiere modificar antes de proceder."
+            ),
+        }
 
     # Verify order exists and is editable (draft/sent)
     try:
@@ -866,6 +891,7 @@ def odoo_send_quotation(
     tenant_id: str, url: str, db: str, user: str, password: str,
     order_id: int,
     confirmed: bool = False,
+    session_active_quotation_id: int | None = None,
 ) -> dict:
     """Send quotation by email to the customer (action_quotation_send).
 
@@ -879,7 +905,30 @@ def odoo_send_quotation(
     Args:
         order_id: sale.order ID to send
         confirmed: False = dry-run preview only; True = execute the send
+        session_active_quotation_id: active quotation ID from the user's session
     """
+    # Validate that the order_id matches the quotation the user explicitly
+    # selected in this session.
+    if session_active_quotation_id is None:
+        return {
+            "success": False,
+            "error_code": "no_active_quotation",
+            "error_detail": (
+                "No hay cotización activa en la sesión del usuario. "
+                "Pregunta al usuario qué cotización quiere enviar."
+            ),
+        }
+    if order_id != session_active_quotation_id:
+        return {
+            "success": False,
+            "error_code": "quotation_not_in_session",
+            "error_detail": (
+                f"La cotización {order_id} no fue seleccionada por el usuario en esta sesión. "
+                f"La cotización activa en sesión es {session_active_quotation_id}. "
+                "Pregunta al usuario cuál cotización quiere enviar antes de proceder."
+            ),
+        }
+
     # Read order info for preview or send
     orders = odoo_read(
         tenant_id, url, db, user, password,
@@ -947,6 +996,7 @@ def odoo_confirm_sale_order(
     tenant_id: str, url: str, db: str, user: str, password: str,
     order_id: int,
     confirmed: bool = False,
+    session_active_quotation_id: int | None = None,
 ) -> dict:
     """Confirm a draft sale order (quotation → sale order). IRREVERSIBLE.
 
@@ -959,7 +1009,30 @@ def odoo_confirm_sale_order(
     Args:
         order_id: sale.order ID to confirm
         confirmed: False = dry-run preview only; True = execute the confirmation
+        session_active_quotation_id: active quotation ID from the user's session
     """
+    # Validate that the order_id matches the quotation the user explicitly
+    # selected in this session.
+    if session_active_quotation_id is None:
+        return {
+            "success": False,
+            "error_code": "no_active_quotation",
+            "error_detail": (
+                "No hay cotización activa en la sesión del usuario. "
+                "Pregunta al usuario qué cotización quiere confirmar."
+            ),
+        }
+    if order_id != session_active_quotation_id:
+        return {
+            "success": False,
+            "error_code": "quotation_not_in_session",
+            "error_detail": (
+                f"La cotización {order_id} no fue seleccionada por el usuario en esta sesión. "
+                f"La cotización activa en sesión es {session_active_quotation_id}. "
+                "Pregunta al usuario cuál cotización quiere confirmar antes de proceder."
+            ),
+        }
+
     # Read order info needed for preview or post-confirm verification
     orders = odoo_read(
         tenant_id, url, db, user, password,
