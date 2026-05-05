@@ -330,19 +330,24 @@ def odoo_add_to_quotation(
         return {"success": False, "error_code": "no_lines", "error_detail": err}
 
     # Dry-runs (confirmed=False) pass through so the LLM can show a preview
-    # and the user can decide. Actual writes (confirmed=True) require that the
-    # user explicitly selected this quotation in the current session (set via
-    # X-Active-Quotation-Id header after OrderCard selection or get_latest_quotation).
-    if confirmed:
-        if session_active_quotation_id is None:
-            return {
-                "success": False,
-                "error_code": "no_active_quotation",
-                "error_detail": (
-                    "No hay cotización activa en la sesión del usuario. "
-                    "Pregunta al usuario qué cotización quiere modificar, o si desea crear una nueva."
-                ),
-            }
+    # and the user can decide.
+    #
+    # Actual writes (confirmed=True) gate:
+    # - If the orchestrator already promoted a quotation to active in the
+    #   user's session (X-Active-Quotation-Id header), the order_id MUST
+    #   match — that is the strict path that prevents the LLM from
+    #   hopping between quotations the user did not pick.
+    # - If the session has NO active quotation (header missing — happens
+    #   on the first turn after /new when get_latest_quotation and
+    #   add_to_quotation run in the same batch and the orchestrator
+    #   couldn't reload the MCP client mid-turn), we still allow the
+    #   write because the editability check below already rejects any
+    #   order that isn't in draft/sent state and tenant scoping is
+    #   enforced at the connection level by tenant_id. The risk surface
+    #   is "modify another customer's draft order in the same tenant",
+    #   which is bounded by the LLM only seeing orders it pulled via
+    #   tenant-scoped tools.
+    if confirmed and session_active_quotation_id is not None:
         if order_id != session_active_quotation_id:
             return {
                 "success": False,
