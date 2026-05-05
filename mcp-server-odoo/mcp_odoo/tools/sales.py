@@ -4,7 +4,7 @@ import logging
 import time
 import traceback
 
-from mcp_odoo.tools.generic import odoo_search, odoo_read, odoo_create, odoo_call_method
+from mcp_odoo.tools.generic import odoo_search, odoo_read, odoo_create, odoo_write, odoo_call_method
 
 logger = logging.getLogger("mcp_odoo.sales")
 
@@ -447,15 +447,50 @@ def odoo_add_to_quotation(
         _log_call("add_to_quotation", tenant_id, log_args, None, err, int((time.time() - started) * 1000))
         return {"success": False, "error_code": "template_no_variant", "error_detail": err, "unresolved_ids": unresolved}
 
-    # Build new sale.order.line records and write to existing order via (0,0,vals) commands
+    # Read existing lines so we can MERGE quantities into the matching
+    # variant rather than create duplicate lines for the same product.
+    # User intent "agregar 2 unidades más al mouse" must increment the
+    # existing line, not append a second line with qty=2 of the same SKU.
+    # We only merge when price_unit and discount are not overridden — if
+    # the caller passed a custom price/discount the safest choice is a new
+    # line so the original record stays untouched.
+    try:
+        existing_lines = odoo_search(
+            tenant_id, url, db, user, password,
+            "sale.order.line",
+            [["order_id", "=", order_id]],
+            ["id", "product_id", "product_uom_qty", "price_unit", "discount"],
+        )
+    except Exception as e:
+        # Non-fatal: fall back to the original "always create" behaviour.
+        logger.warning("add_to_quotation: could not read existing lines, will create new: %s", e)
+        existing_lines = []
+
+    qty_by_variant: dict[int, dict] = {}
+    for el in existing_lines or []:
+        pid = el.get("product_id")
+        if isinstance(pid, list) and pid:
+            pid = pid[0]
+        if isinstance(pid, int):
+            qty_by_variant[pid] = el  # last write wins; merging into the most recent
+
+    increments: list[tuple[int, float]] = []  # (line_id, new_qty)
     new_line_cmds = []
     for line in lines:
         tmpl_id = line["product_id"]
         variant_pid = variant_by_template[tmpl_id]
+        qty_to_add = float(line.get("quantity", 1) or 1)
+        has_overrides = "price_unit" in line or "discount" in line
+        existing = qty_by_variant.get(variant_pid)
+        if existing and not has_overrides:
+            # Merge: same product already on the order — bump its qty.
+            new_qty = float(existing.get("product_uom_qty") or 0) + qty_to_add
+            increments.append((int(existing["id"]), new_qty))
+            continue
         line_vals = {
             "order_id": order_id,
             "product_id": variant_pid,
-            "product_uom_qty": line.get("quantity", 1),
+            "product_uom_qty": qty_to_add,
             "product_uom": uom_by_variant.get(variant_pid, 1),
         }
         if "price_unit" in line:
@@ -464,8 +499,13 @@ def odoo_add_to_quotation(
             line_vals["discount"] = line["discount"]
         new_line_cmds.append(line_vals)
 
-    # Create lines directly attached to order_id (more reliable than write+(0,0))
+    # Apply increments first, then create the genuinely new lines.
     try:
+        for line_id, new_qty in increments:
+            odoo_write(
+                tenant_id, url, db, user, password,
+                "sale.order.line", [line_id], {"product_uom_qty": new_qty},
+            )
         for vals in new_line_cmds:
             odoo_create(
                 tenant_id, url, db, user, password,
