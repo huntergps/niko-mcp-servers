@@ -1231,6 +1231,15 @@ async def _handle_mcp_request(request: Request, body: dict) -> dict | None:
                 "isError": True,
             })
 
+        # Pre-execution: resolve `order_id` when the LLM passed the
+        # human-readable name ("VENTA122172") or its numeric suffix
+        # ("122172") instead of the real Odoo order_id (113603).
+        # Without this, every "elimina VENTA122172" / "modifica el 122172"
+        # flow fails because Odoo lookups expect the integer primary key.
+        # We do ONE search by name and rewrite args["order_id"] before
+        # validation runs.
+        await _resolve_order_id_alias(request, tool_name, args)
+
         # Pre-execution arg validation against the tool's inputSchema.
         # Without this, malformed LLM args (e.g. fields placed at the
         # top level instead of inside a required nested array) reach the
@@ -2326,6 +2335,95 @@ _QUOTATION_TOOLS_NEEDING_CARD = {
     "recalculate_quotation",
     "transition_quotation",
 }
+
+
+# Tools that take an `order_id` and may receive a name-like string
+# from the LLM ("VENTA122172", "122172"). For each call we attempt to
+# coerce the value to an int — if that fails we look the order up by
+# name in Odoo and rewrite args["order_id"] in-place.
+_TOOLS_WITH_ORDER_ID = {
+    "get_quotation",
+    "render_quotation_pdf",
+    "send_quotation",
+    "confirm_quotation",
+    "add_to_quotation",
+    "update_quotation_line",
+    "remove_quotation_line",
+    "add_quotation_line",
+    "set_quotation_header",
+    "apply_global_discount",
+    "change_quotation_customer",
+    "recalculate_quotation",
+    "get_quotation_state_summary",
+    "transition_quotation",
+}
+
+
+async def _resolve_order_id_alias(request: Request, tool_name: str, args: dict) -> None:
+    """Coerce ``args["order_id"]`` to a real Odoo order_id (int).
+
+    Accepts these LLM-friendly aliases:
+      * int: passes through (already correct).
+      * str digits ("113603"): cast to int.
+      * str like "VENTA122172" or "122172": searched in sale.order by
+        name; if found, replaces with the real order_id.
+      * "line_id" tools (update/remove_line) are skipped — those use
+        a different primary key.
+
+    Failures (alias not found) are left untouched so the downstream
+    schema validator surfaces a clean error to the LLM.
+    """
+    if tool_name not in _TOOLS_WITH_ORDER_ID:
+        return
+    raw = args.get("order_id")
+    if raw is None:
+        return
+    if isinstance(raw, int) and raw > 0:
+        return  # already valid
+    # Allow numeric strings.
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.isdigit():
+            args["order_id"] = int(s)
+            # If digits but it might also be a name-suffix collision,
+            # we accept the int and let the tool fail clean if missing.
+            return
+        # Try to read it as a name. Common Odoo conventions use a
+        # prefix ("VENTA", "S0", "SO") followed by digits.
+        name_candidate = s.upper()
+        try:
+            tc = await _get_tenant_config(request)
+            from mcp_odoo.tools.generic import odoo_search
+            rows = odoo_search(
+                tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
+                "sale.order", [["name", "=", name_candidate]],
+                fields=["id", "name"], limit=1,
+            )
+            if rows:
+                args["order_id"] = int(rows[0]["id"])
+                logger.info(
+                    "order_id alias resolved: %r -> %s (%s)",
+                    raw, rows[0]["id"], rows[0].get("name"),
+                )
+                return
+            # Fallback: maybe the LLM passed only the suffix digits
+            # of a name ("122172" → "VENTA122172").
+            digits = "".join(ch for ch in s if ch.isdigit())
+            if digits:
+                rows = odoo_search(
+                    tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
+                    "sale.order", [["name", "ilike", digits]],
+                    fields=["id", "name"], limit=2,
+                )
+                if len(rows) == 1:
+                    args["order_id"] = int(rows[0]["id"])
+                    logger.info(
+                        "order_id digit-suffix resolved: %r -> %s (%s)",
+                        raw, rows[0]["id"], rows[0].get("name"),
+                    )
+                    return
+        except Exception as e:
+            logger.debug("order_id alias resolve skipped: %s", e)
 
 
 def _validate_args_against_schema(tool_name: str, args: dict) -> dict | None:
