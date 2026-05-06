@@ -691,6 +691,25 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "odoo_lookup_user_by_email",
+        "description": (
+            "Verificar si un usuario existe en Odoo buscando por login (username) "
+            "O por correo del partner. Uso EXCLUSIVO del flujo /login — NO usar "
+            "para buscar clientes. Devuelve {success, user:{user_id,name,login,email}} "
+            "o {success:false, error_code:'user_not_found'}."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string",
+                    "description": "Username de Odoo (ej. elmer.salazar) o correo (ej. user@empresa.com)",
+                },
+            },
+            "required": ["email"],
+        },
+    },
+    {
         "name": "find_quotation_by_name",
         "description": (
             "Resolver una cotizacion por su name humano (ej. 'VENTA122172', "
@@ -1519,6 +1538,11 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
     if tool_name == "get_quotation":
         from mcp_odoo.tools.sales import odoo_get_quotation
         result = odoo_get_quotation(*creds, args["order_id"])
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "odoo_lookup_user_by_email":
+        from mcp_odoo.tools.sales import odoo_lookup_user_by_email
+        result = odoo_lookup_user_by_email(*creds, email=args["email"])
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "find_quotation_by_name":
