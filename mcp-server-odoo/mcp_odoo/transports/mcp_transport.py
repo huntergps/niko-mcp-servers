@@ -2363,67 +2363,117 @@ async def _resolve_order_id_alias(request: Request, tool_name: str, args: dict) 
     """Coerce ``args["order_id"]`` to a real Odoo order_id (int).
 
     Accepts these LLM-friendly aliases:
-      * int: passes through (already correct).
-      * str digits ("113603"): cast to int.
+      * int that exists in sale.order: passes through.
+      * int that does NOT exist (= LLM extracted the digit-suffix from
+        a name): try to resolve as ``VENTA{int}`` / ``ilike %{int}%``.
+      * str digits ("113603"): cast to int (and validate existence).
       * str like "VENTA122172" or "122172": searched in sale.order by
         name; if found, replaces with the real order_id.
-      * "line_id" tools (update/remove_line) are skipped — those use
-        a different primary key.
 
-    Failures (alias not found) are left untouched so the downstream
-    schema validator surfaces a clean error to the LLM.
+    Failures (alias not found anywhere) leave args untouched so the
+    downstream tool surfaces a clean error to the LLM.
     """
     if tool_name not in _TOOLS_WITH_ORDER_ID:
         return
     raw = args.get("order_id")
     if raw is None:
         return
-    if isinstance(raw, int) and raw > 0:
-        return  # already valid
-    # Allow numeric strings.
-    if isinstance(raw, str):
-        s = raw.strip()
-        if s.isdigit():
-            args["order_id"] = int(s)
-            # If digits but it might also be a name-suffix collision,
-            # we accept the int and let the tool fail clean if missing.
-            return
-        # Try to read it as a name. Common Odoo conventions use a
-        # prefix ("VENTA", "S0", "SO") followed by digits.
-        name_candidate = s.upper()
+
+    try:
+        tc = await _get_tenant_config(request)
+        from mcp_odoo.tools.generic import odoo_search
+    except Exception as e:
+        logger.debug("order_id alias resolve skipped (tc): %s", e)
+        return
+
+    creds = (tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"])
+
+    def _exists_as_id(candidate: int) -> bool:
         try:
-            tc = await _get_tenant_config(request)
-            from mcp_odoo.tools.generic import odoo_search
             rows = odoo_search(
-                tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
-                "sale.order", [["name", "=", name_candidate]],
+                *creds, "sale.order", [["id", "=", candidate]],
+                fields=["id"], limit=1,
+            )
+            return bool(rows)
+        except Exception:
+            return False
+
+    def _lookup_by_name_exact(name_str: str) -> int | None:
+        try:
+            rows = odoo_search(
+                *creds, "sale.order", [["name", "=", name_str]],
                 fields=["id", "name"], limit=1,
             )
             if rows:
-                args["order_id"] = int(rows[0]["id"])
                 logger.info(
-                    "order_id alias resolved: %r -> %s (%s)",
-                    raw, rows[0]["id"], rows[0].get("name"),
+                    "order_id resolved by name=%r -> %s",
+                    name_str, rows[0]["id"],
                 )
+                return int(rows[0]["id"])
+        except Exception:
+            pass
+        return None
+
+    def _lookup_by_name_ilike(digits: str) -> int | None:
+        if not digits:
+            return None
+        try:
+            rows = odoo_search(
+                *creds, "sale.order", [["name", "ilike", digits]],
+                fields=["id", "name"], limit=2,
+            )
+            if len(rows) == 1:
+                logger.info(
+                    "order_id resolved by name ilike %r -> %s (%s)",
+                    digits, rows[0]["id"], rows[0].get("name"),
+                )
+                return int(rows[0]["id"])
+        except Exception:
+            pass
+        return None
+
+    if isinstance(raw, int) and raw > 0:
+        # Validate the int exists. If not, treat it as the digit suffix
+        # of a name (e.g. LLM passed 122172 from "VENTA122172").
+        if _exists_as_id(raw):
+            return
+        # Try common Odoo prefixes.
+        for prefix in ("VENTA", "S0", "SO", ""):
+            cand = _lookup_by_name_exact(f"{prefix}{raw}")
+            if cand is not None:
+                args["order_id"] = cand
                 return
-            # Fallback: maybe the LLM passed only the suffix digits
-            # of a name ("122172" → "VENTA122172").
-            digits = "".join(ch for ch in s if ch.isdigit())
-            if digits:
-                rows = odoo_search(
-                    tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
-                    "sale.order", [["name", "ilike", digits]],
-                    fields=["id", "name"], limit=2,
-                )
-                if len(rows) == 1:
-                    args["order_id"] = int(rows[0]["id"])
-                    logger.info(
-                        "order_id digit-suffix resolved: %r -> %s (%s)",
-                        raw, rows[0]["id"], rows[0].get("name"),
-                    )
+        cand = _lookup_by_name_ilike(str(raw))
+        if cand is not None:
+            args["order_id"] = cand
+        return
+
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.isdigit():
+            n = int(s)
+            if _exists_as_id(n):
+                args["order_id"] = n
+                return
+            for prefix in ("VENTA", "S0", "SO", ""):
+                cand = _lookup_by_name_exact(f"{prefix}{n}")
+                if cand is not None:
+                    args["order_id"] = cand
                     return
-        except Exception as e:
-            logger.debug("order_id alias resolve skipped: %s", e)
+            cand = _lookup_by_name_ilike(s)
+            if cand is not None:
+                args["order_id"] = cand
+            return
+        # Non-numeric string: try as name.
+        name_candidate = s.upper()
+        cand = _lookup_by_name_exact(name_candidate)
+        if cand is not None:
+            args["order_id"] = cand
+            return
+        digits = "".join(ch for ch in s if ch.isdigit())
+        cand = _lookup_by_name_ilike(digits)
+        if cand is not None:
+            args["order_id"] = cand
 
 
 def _validate_args_against_schema(tool_name: str, args: dict) -> dict | None:
