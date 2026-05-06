@@ -1153,6 +1153,117 @@ def odoo_confirm_sale_order(
     }
 
 
+def odoo_lookup_user_by_email(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    email: str,
+) -> dict:
+    """Locate a res.users record by login username OR partner email.
+
+    Used by seller_otp.py to validate /login requests before sending OTP.
+
+    Returns
+    -------
+    {success: True, user: {user_id, name, login, email, partner_id, partner_name}}
+    {success: False, error_code, error_detail}
+    """
+    started = time.time()
+    log_args = {"email": email}
+
+    if not email or not isinstance(email, str) or not email.strip():
+        err = "email requerido y debe ser un texto no vacio"
+        _log_call("lookup_user_by_email", tenant_id, log_args, None, err, 0)
+        return {"success": False, "error_code": "invalid_email", "error_detail": err}
+
+    needle = email.strip()
+    fields = ["id", "name", "login", "partner_id", "active"]
+
+    try:
+        rows = odoo_search(
+            tenant_id, url, db, user, password,
+            "res.users",
+            [["login", "=ilike", needle]],
+            fields,
+            limit=10,
+        )
+    except Exception as e:
+        err = f"Error consultando res.users por login={needle!r}: {e}"
+        _log_call("lookup_user_by_email", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "lookup_failed", "error_detail": err}
+
+    if not rows:
+        try:
+            rows = odoo_search(
+                tenant_id, url, db, user, password,
+                "res.users",
+                [["partner_id.email", "=ilike", needle]],
+                fields,
+                limit=10,
+            )
+        except Exception as e:
+            err = f"Error consultando res.users por partner.email={needle!r}: {e}"
+            _log_call("lookup_user_by_email", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "lookup_failed", "error_detail": err}
+
+    active_rows = [r for r in (rows or []) if r.get("active")]
+    if not active_rows:
+        err = "No hay un vendedor con ese usuario/email en Odoo"
+        _log_call("lookup_user_by_email", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "user_not_found", "error_detail": err}
+
+    if len(active_rows) > 1:
+        logger.warning(
+            "ODOO_CALL lookup_user_by_email tenant=%s email=%r returned %d active users; "
+            "picking lowest id",
+            tenant_id, needle, len(active_rows),
+        )
+
+    chosen = min(active_rows, key=lambda r: r["id"])
+    partner_field = chosen.get("partner_id")
+    partner_id: int | None = None
+    partner_name: str | None = None
+    if isinstance(partner_field, list) and len(partner_field) >= 2:
+        partner_id = partner_field[0]
+        partner_name = partner_field[1]
+    elif isinstance(partner_field, int):
+        partner_id = partner_field
+
+    partner_email: str | None = None
+    if partner_id:
+        try:
+            partner_rows = odoo_read(
+                tenant_id, url, db, user, password,
+                "res.partner", [partner_id], ["email", "name"],
+            )
+            if partner_rows:
+                partner_email = partner_rows[0].get("email") or None
+                partner_name = partner_rows[0].get("name") or partner_name
+        except Exception as e:
+            logger.warning(
+                "ODOO_CALL lookup_user_by_email tenant=%s could not read partner_id=%s: %s",
+                tenant_id, partner_id, e,
+            )
+
+    final_email = partner_email or chosen.get("login") or None
+    result = {
+        "success": True,
+        "user": {
+            "user_id": chosen["id"],
+            "name": chosen.get("name") or "",
+            "login": chosen.get("login") or "",
+            "email": final_email,
+            "partner_id": partner_id,
+            "partner_name": partner_name,
+        },
+    }
+    _log_call("lookup_user_by_email", tenant_id, log_args,
+              {"user_id": chosen["id"]}, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
 def odoo_search_partner(
     tenant_id: str, url: str, db: str, user: str, password: str,
     vat: str | None = None,
