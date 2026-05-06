@@ -282,6 +282,7 @@ def odoo_create_quotation(
         "name": order["name"],
         "state": order["state"],
         "partner": partner_name,
+        "partner_id": partner_id,  # int — used by orchestrator security validator
         "lines": order_lines_detail,
         "subtotal": order["amount_untaxed"],
         "tax": order["amount_tax"],
