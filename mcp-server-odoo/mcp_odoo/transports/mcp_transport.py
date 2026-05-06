@@ -691,6 +691,28 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "find_quotation_by_name",
+        "description": (
+            "Resolver una cotizacion por su name humano (ej. 'VENTA122172', "
+            "'S0001234') al order_id numerico real (ej. 113603). USAR ESTA "
+            "TOOL siempre que tengas el name pero NO el order_id, antes de "
+            "llamar tools de mutacion (update_quotation_line, "
+            "remove_quotation_line, transition_quotation, etc). Acepta el "
+            "name con o sin mayusculas. Devuelve {order_id, name, state, "
+            "partner, amount_total} o error_code='not_found'/'ambiguous'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Name del sale.order (ej. 'VENTA122172').",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    {
         "name": "get_latest_quotation",
         "description": (
             "PREFIÉRELA sobre get_active_quotation y list_quotations cuando el usuario use cualquier "
@@ -1231,14 +1253,20 @@ async def _handle_mcp_request(request: Request, body: dict) -> dict | None:
                 "isError": True,
             })
 
-        # Pre-execution: resolve `order_id` when the LLM passed the
-        # human-readable name ("VENTA122172") or its numeric suffix
-        # ("122172") instead of the real Odoo order_id (113603).
-        # Without this, every "elimina VENTA122172" / "modifica el 122172"
-        # flow fails because Odoo lookups expect the integer primary key.
-        # We do ONE search by name and rewrite args["order_id"] before
-        # validation runs.
-        await _resolve_order_id_alias(request, tool_name, args)
+        # Pre-execution: validate that ``args["order_id"]`` is a real
+        # Odoo order_id. If the LLM passed the name ("VENTA122172") or
+        # the digit suffix ("122172"), we REJECT the call with a hint
+        # to use ``find_quotation_by_name`` first. We never silently
+        # mutate using a guessed id (e.g. via ilike) because that could
+        # touch the wrong sale.order on collisions.
+        reject_envelope = await _resolve_order_id_alias(request, tool_name, args)
+        if reject_envelope is not None:
+            return _make_response(req_id, {
+                "content": [{"type": "text", "text": json.dumps(
+                    reject_envelope, indent=2, ensure_ascii=False,
+                )}],
+                "isError": True,
+            })
 
         # Pre-execution arg validation against the tool's inputSchema.
         # Without this, malformed LLM args (e.g. fields placed at the
@@ -1491,6 +1519,11 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
     if tool_name == "get_quotation":
         from mcp_odoo.tools.sales import odoo_get_quotation
         result = odoo_get_quotation(*creds, args["order_id"])
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "find_quotation_by_name":
+        from mcp_odoo.tools.sales import odoo_find_quotation_by_name
+        result = odoo_find_quotation_by_name(*creds, args["name"])
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "get_latest_quotation":
@@ -2359,32 +2392,39 @@ _TOOLS_WITH_ORDER_ID = {
 }
 
 
-async def _resolve_order_id_alias(request: Request, tool_name: str, args: dict) -> None:
-    """Coerce ``args["order_id"]`` to a real Odoo order_id (int).
+async def _resolve_order_id_alias(request: Request, tool_name: str, args: dict) -> dict | None:
+    """Validate ``args["order_id"]`` is a REAL Odoo order_id.
 
-    Accepts these LLM-friendly aliases:
-      * int that exists in sale.order: passes through.
-      * int that does NOT exist (= LLM extracted the digit-suffix from
-        a name): try to resolve as ``VENTA{int}`` / ``ilike %{int}%``.
-      * str digits ("113603"): cast to int (and validate existence).
-      * str like "VENTA122172" or "122172": searched in sale.order by
-        name; if found, replaces with the real order_id.
+    Strict policy (operator decision, May 2026): the LLM MUST pass the
+    numeric primary key of sale.order (e.g. 113603), never the human
+    name (\"VENTA122172\") nor its digit suffix (\"122172\").
 
-    Failures (alias not found anywhere) leave args untouched so the
-    downstream tool surfaces a clean error to the LLM.
+    Why strict: the orchestrator already injects ``order_id=N`` for the
+    active quotation in the system prompt's "IDs identificados" block,
+    so the LLM has the real id every turn. Allowing fallbacks like
+    \"VENTA{n}\" or fuzzy ilike was unsafe — collisions between
+    VENTA122172 and VENTA1221720 could mutate the wrong order. Better
+    to reject than to risk wrong-record mutation on a destructive tool.
+
+    Returns:
+      * ``None`` when args are valid (passthrough).
+      * ``dict`` error envelope when the id is not a real existing
+        sale.order — the dispatcher serializes it as ``isError=true``
+        so the LLM has to fetch the real id (via get_latest_quotation
+        / get_quotation_state_summary) before retrying.
     """
     if tool_name not in _TOOLS_WITH_ORDER_ID:
-        return
+        return None
     raw = args.get("order_id")
     if raw is None:
-        return
+        return None
 
     try:
         tc = await _get_tenant_config(request)
         from mcp_odoo.tools.generic import odoo_search
     except Exception as e:
-        logger.debug("order_id alias resolve skipped (tc): %s", e)
-        return
+        logger.debug("order_id resolver skipped (tc): %s", e)
+        return None
 
     creds = (tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"])
 
@@ -2398,41 +2438,31 @@ async def _resolve_order_id_alias(request: Request, tool_name: str, args: dict) 
         except Exception:
             return False
 
-    def _lookup_by_name_exact(name_str: str) -> int | None:
-        try:
-            rows = odoo_search(
-                *creds, "sale.order", [["name", "=", name_str]],
-                fields=["id", "name"], limit=1,
-            )
-            if rows:
-                logger.info(
-                    "order_id resolved by name=%r -> %s",
-                    name_str, rows[0]["id"],
-                )
-                return int(rows[0]["id"])
-        except Exception:
-            pass
-        return None
+    def _reject(detail: str) -> dict:
+        return {
+            "success": False,
+            "error_code": "order_id_must_be_real_int",
+            "error_detail": detail,
+            "hint": (
+                "order_id debe ser el id NUMERICO real de sale.order "
+                "(ej. 113603), NO el name humano (VENTA122172) ni su "
+                "sufijo (122172). Si solo conoces el name, llama "
+                "find_quotation_by_name(name='VENTA...') que devuelve "
+                "el order_id correcto. Tambien aparece en el bloque "
+                "'IDs identificados' del system prompt cuando hay "
+                "cotizacion activa."
+            ),
+            "received": raw,
+        }
 
-
-    # IMPORTANT: only resolve via EXACT name matches with known
-    # prefixes. Fuzzy `ilike` matching was removed because a digit
-    # suffix like "122172" can collide with VENTA1221720 / VENTA0122172
-    # / etc, leading to operations on a DIFFERENT order than the user
-    # intended. Better to fail clean than to mutate the wrong record.
+    # Accept only ints / numeric strings that map to an existing record.
     if isinstance(raw, int) and raw > 0:
         if _exists_as_id(raw):
-            return
-        # Treat as digit-suffix of a name. Try common Odoo prefixes
-        # with EXACT match only.
-        for prefix in ("VENTA", "S0", "SO"):
-            cand = _lookup_by_name_exact(f"{prefix}{raw}")
-            if cand is not None:
-                args["order_id"] = cand
-                return
-        # No exact match: leave as-is so the tool returns
-        # order_not_found and the LLM has to ask the user explicitly.
-        return
+            return None
+        return _reject(
+            f"order_id={raw} no existe en sale.order. Quizas confundiste "
+            f"el name (VENTA{raw}) con el order_id real."
+        )
 
     if isinstance(raw, str):
         s = raw.strip()
@@ -2440,17 +2470,20 @@ async def _resolve_order_id_alias(request: Request, tool_name: str, args: dict) 
             n = int(s)
             if _exists_as_id(n):
                 args["order_id"] = n
-                return
-            for prefix in ("VENTA", "S0", "SO"):
-                cand = _lookup_by_name_exact(f"{prefix}{n}")
-                if cand is not None:
-                    args["order_id"] = cand
-                    return
-            return
-        # Non-numeric string: only EXACT name match.
-        cand = _lookup_by_name_exact(s.upper())
-        if cand is not None:
-            args["order_id"] = cand
+                return None
+            return _reject(
+                f"order_id={s!r} no existe en sale.order. Quizas confundiste "
+                f"el name (VENTA{s}) con el order_id real."
+            )
+        return _reject(
+            f"order_id={raw!r} no es entero. Pasa el id numerico real, "
+            f"NO el name."
+        )
+
+    return _reject(
+        f"order_id tiene tipo {type(raw).__name__}, esperaba un entero "
+        f"positivo."
+    )
 
 
 def _validate_args_against_schema(tool_name: str, args: dict) -> dict | None:

@@ -1230,6 +1230,119 @@ def odoo_check_balance(
     }
 
 
+def odoo_find_quotation_by_name(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    name: str,
+) -> dict:
+    """Resolve an Odoo sale.order by its human-readable ``name``.
+
+    The LLM gets the ``name`` (e.g. "VENTA122172", "S0001234") from the
+    user, but every mutation tool (update/remove_line, transition, etc.)
+    requires the numeric primary key (``order_id``). This tool does the
+    one-shot translation so the LLM never has to guess.
+
+    Returns
+    -------
+    {
+      "success": True,
+      "order_id": <int>,
+      "name": <str>,
+      "state": <str>,
+      "partner": <str>,
+      "amount_total": <float>,
+      "lines_count": <int>,
+    }
+    or
+    {"success": False, "error_code": "not_found"|"ambiguous", ...}
+    """
+    started = time.time()
+    log_args = {"name": name}
+    if not name or not isinstance(name, str):
+        return {"success": False, "error_code": "invalid_name",
+                "error_detail": "name requerido y debe ser texto"}
+    name_clean = name.strip()
+    if not name_clean:
+        return {"success": False, "error_code": "invalid_name",
+                "error_detail": "name no puede estar vacio"}
+    try:
+        rows = odoo_search(
+            tenant_id, url, db, user, password,
+            "sale.order", [["name", "=", name_clean]],
+            ["id", "name", "state", "partner_id", "amount_total", "order_line"],
+            limit=2,
+        )
+    except Exception as e:
+        err = f"Error buscando sale.order por name={name_clean!r}: {e}"
+        _log_call("find_quotation_by_name", tenant_id, log_args, None, err, 0)
+        return {"success": False, "error_code": "search_failed",
+                "error_detail": err}
+
+    if not rows:
+        # Fallback: case-insensitive exact match (handles 'venta122172'
+        # vs 'VENTA122172'). Plain Odoo `=` is case-sensitive on PG.
+        try:
+            rows = odoo_search(
+                tenant_id, url, db, user, password,
+                "sale.order", [["name", "=ilike", name_clean]],
+                ["id", "name", "state", "partner_id", "amount_total", "order_line"],
+                limit=2,
+            )
+        except Exception:
+            rows = []
+    if not rows:
+        result = {
+            "success": False,
+            "error_code": "not_found",
+            "error_detail": f"No existe sale.order con name={name_clean!r}.",
+            "name": name_clean,
+        }
+        _log_call(
+            "find_quotation_by_name", tenant_id, log_args, result, None,
+            int((time.time() - started) * 1000),
+        )
+        return result
+    if len(rows) > 1:
+        result = {
+            "success": False,
+            "error_code": "ambiguous",
+            "error_detail": (
+                f"Hay {len(rows)} cotizaciones con name parecido a "
+                f"{name_clean!r}. Pregunta al usuario por el name exacto "
+                f"(con mayusculas y prefijo VENTA/S0/SO)."
+            ),
+            "candidates": [
+                {"order_id": r["id"], "name": r.get("name")}
+                for r in rows
+            ],
+        }
+        _log_call(
+            "find_quotation_by_name", tenant_id, log_args, result, None,
+            int((time.time() - started) * 1000),
+        )
+        return result
+
+    row = rows[0]
+    partner = row.get("partner_id")
+    partner_name = (
+        partner[1] if isinstance(partner, list) and len(partner) >= 2 else ""
+    )
+    lines = row.get("order_line") or []
+    result = {
+        "success": True,
+        "order_id": int(row["id"]),
+        "name": row.get("name"),
+        "state": row.get("state"),
+        "partner": partner_name,
+        "amount_total": float(row.get("amount_total", 0) or 0),
+        "lines_count": len(lines) if isinstance(lines, list) else 0,
+    }
+    _log_call(
+        "find_quotation_by_name", tenant_id, log_args, result, None,
+        int((time.time() - started) * 1000),
+    )
+    return result
+
+
 def get_latest_quotation(
     tenant_id: str, url: str, db: str, user: str, password: str,
     partner_id: int,
