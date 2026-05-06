@@ -167,6 +167,44 @@ def odoo_create_quotation(
         variant_by_template[tmpl_id] = v["id"]
         uom_by_variant[v["id"]] = v["uom_id"][0] if isinstance(v.get("uom_id"), list) and v["uom_id"] else 1
 
+    # SECURITY: validate declared code matches Odoo default_code to catch
+    # LLM hallucinations where it uses a wrong template_id (e.g. webcam
+    # instead of laptop). Fetch actual default_codes from Odoo and compare
+    # against the 'code' field optionally declared per line.
+    lines_with_code = [l for l in lines if l.get("code")]
+    if lines_with_code:
+        try:
+            real_templates = odoo_read(
+                tenant_id, url, db, user, password,
+                "product.template", template_ids, ["id", "default_code"],
+            )
+            real_code_by_id = {
+                t["id"]: (t.get("default_code") or "").upper()
+                for t in (real_templates or [])
+            }
+            for ln in lines_with_code:
+                declared = (ln.get("code") or "").upper()
+                real = real_code_by_id.get(ln["product_id"], "")
+                if declared and real and declared != real:
+                    err = (
+                        f"Inconsistencia: el LLM declaro code={declared!r} para "
+                        f"template_id={ln['product_id']}, pero en Odoo ese template "
+                        f"es {real!r}. Vuelve a buscar con search_products y usa "
+                        "EXACTAMENTE el template_id que devuelve el JSON."
+                    )
+                    _log_call("create_quotation", tenant_id, log_args, None, err,
+                              int((time.time() - started) * 1000))
+                    return {
+                        "success": False,
+                        "error_code": "product_code_mismatch",
+                        "error_detail": err,
+                        "declared_code": declared,
+                        "actual_code": real,
+                        "template_id": ln["product_id"],
+                    }
+        except Exception as _val_exc:
+            logger.warning("create_quotation: code validation skipped: %s", _val_exc)
+
     unresolved = [tid for tid in template_ids if tid not in variant_by_template]
     if unresolved:
         err = f"product.template ids sin variante activa: {unresolved}"
@@ -2636,4 +2674,411 @@ def odoo_transition_quotation(
     }
     _log_call("transition_quotation", tenant_id, log_args, result, None,
               int((time.time() - started) * 1000))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_customer_credit_status
+# ---------------------------------------------------------------------------
+
+def odoo_get_customer_credit_status(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    partner_id: int,
+) -> dict:
+    """Consultar el estado financiero de un cliente — saldo pendiente, facturas
+    vencidas y credito disponible.
+
+    Usa account.move (Odoo 13) con type=out_invoice para facturas de cliente.
+    Calcula:
+      - credit_used: suma de amount_residual de facturas no pagadas / parcialmente pagadas
+      - overdue_amount: idem pero solo para facturas con fecha vencida < hoy
+      - credit_limit: campo credit_limit de res.partner (si el modulo de credito esta activo)
+
+    Args:
+        partner_id: ID del cliente en res.partner (Odoo)
+
+    Returns {success, partner_id, partner_name, credit_used, overdue_amount,
+    invoices_pending, invoices_overdue, invoices: [{name, due_date,
+    amount_total, amount_residual, payment_state, overdue}]}
+    """
+    from datetime import date as _date
+
+    started = time.time()
+    log_args = {"partner_id": partner_id}
+
+    if not isinstance(partner_id, int) or partner_id <= 0:
+        return {"success": False, "error_code": "invalid_partner_id",
+                "error_detail": "partner_id debe ser entero positivo"}
+
+    # 1. Leer datos del partner (nombre + campos de credito)
+    try:
+        partners = odoo_read(
+            tenant_id, url, db, user, password,
+            "res.partner", [partner_id],
+            ["id", "name", "credit", "credit_limit"],
+        )
+    except Exception as e:
+        err = f"Error leyendo partner {partner_id}: {e}"
+        _log_call("get_customer_credit_status", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "partner_read_failed", "error_detail": err}
+
+    if not partners:
+        err = f"Partner id={partner_id} no encontrado"
+        _log_call("get_customer_credit_status", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "partner_not_found", "error_detail": err,
+                "partner_id": partner_id}
+
+    partner = partners[0]
+    partner_name = partner.get("name", "")
+    # credit_limit puede ser False (campo no instalado) o un float
+    credit_limit_raw = partner.get("credit_limit")
+    credit_limit = float(credit_limit_raw) if credit_limit_raw else None
+
+    # 2. Buscar facturas pendientes (account.move, Odoo 13)
+    try:
+        invoices = odoo_search(
+            tenant_id, url, db, user, password,
+            "account.move",
+            [
+                ["partner_id", "child_of", partner_id],
+                ["type", "=", "out_invoice"],
+                ["state", "=", "posted"],
+                ["payment_state", "in", ["not_paid", "partial"]],
+            ],
+            ["name", "invoice_date_due", "amount_total", "amount_residual", "payment_state"],
+            limit=100,
+            order="invoice_date_due asc",
+        )
+    except Exception as e:
+        err = f"Error buscando facturas pendientes: {e}"
+        _log_call("get_customer_credit_status", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "invoices_search_failed", "error_detail": err,
+                "partner_id": partner_id}
+
+    today_str = _date.today().isoformat()
+    invoices_list = []
+    credit_used = 0.0
+    overdue_amount = 0.0
+    invoices_overdue = 0
+
+    for inv in (invoices or []):
+        due_date = inv.get("invoice_date_due") or ""
+        residual = float(inv.get("amount_residual", 0))
+        is_overdue = bool(due_date and due_date < today_str)
+        credit_used += residual
+        if is_overdue:
+            overdue_amount += residual
+            invoices_overdue += 1
+        invoices_list.append({
+            "name": inv.get("name", ""),
+            "due_date": due_date,
+            "amount_total": float(inv.get("amount_total", 0)),
+            "amount_residual": residual,
+            "payment_state": inv.get("payment_state", ""),
+            "overdue": is_overdue,
+        })
+
+    result: dict = {
+        "success": True,
+        "partner_id": partner_id,
+        "partner_name": partner_name,
+        "credit_used": round(credit_used, 2),
+        "overdue_amount": round(overdue_amount, 2),
+        "invoices_pending": len(invoices_list),
+        "invoices_overdue": invoices_overdue,
+        "invoices": invoices_list,
+    }
+    if credit_limit is not None:
+        result["credit_limit"] = credit_limit
+        result["credit_available"] = round(max(credit_limit - credit_used, 0), 2)
+
+    _log_call("get_customer_credit_status", tenant_id, log_args, result, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_order_delivery_status
+# ---------------------------------------------------------------------------
+
+def odoo_get_order_delivery_status(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int | None = None,
+    order_name: str | None = None,
+) -> dict:
+    """Consultar el estado de entrega de un pedido confirmado (sale.order).
+
+    Devuelve que se ha enviado, que falta por enviar, y el estado de cada
+    picking (transferencia de almacen) vinculado al pedido.
+
+    Acepta order_id (entero) O order_name (ej: 'VENTA122196'). Si se pasan
+    ambos, order_id tiene precedencia.
+
+    Args:
+        order_id: ID numerico del sale.order
+        order_name: Nombre del pedido (ej: 'VENTA122196')
+
+    Returns {success, order_id, order_name, state, delivery_status,
+    invoice_status, amount_total, partner, deliveries: [{name, state,
+    state_label, scheduled_date, date_done, picking_type_code, done}]}
+    """
+    started = time.time()
+    log_args = {"order_id": order_id, "order_name": order_name}
+
+    _PICKING_STATE_LABEL = {
+        "draft": "borrador",
+        "waiting": "esperando",
+        "confirmed": "confirmado",
+        "assigned": "listo para enviar",
+        "done": "enviado",
+        "cancel": "cancelado",
+    }
+
+    # Resolver order_id desde order_name si hace falta
+    if order_id is None and order_name:
+        try:
+            rows = odoo_search(
+                tenant_id, url, db, user, password,
+                "sale.order",
+                [["name", "=ilike", order_name.strip()]],
+                ["id", "name"],
+                limit=1,
+            )
+        except Exception as e:
+            err = f"Error buscando pedido '{order_name}': {e}"
+            _log_call("get_order_delivery_status", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "search_failed", "error_detail": err}
+
+        if not rows:
+            err = f"Pedido '{order_name}' no encontrado"
+            _log_call("get_order_delivery_status", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "order_not_found",
+                    "error_detail": err, "order_name": order_name}
+        order_id = rows[0]["id"] if isinstance(rows[0], dict) else rows[0]
+
+    if not isinstance(order_id, int) or order_id <= 0:
+        return {"success": False, "error_code": "invalid_order_id",
+                "error_detail": "Se requiere order_id (entero) o order_name valido"}
+
+    # Leer cabecera del pedido
+    try:
+        orders = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id],
+            ["name", "state", "delivery_status", "invoice_status",
+             "picking_ids", "amount_total", "partner_id"],
+        )
+    except Exception as e:
+        err = f"Error leyendo pedido {order_id}: {e}"
+        _log_call("get_order_delivery_status", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "order_read_failed", "error_detail": err}
+
+    if not orders:
+        return {"success": False, "error_code": "order_not_found",
+                "error_detail": f"Pedido id={order_id} no encontrado", "order_id": order_id}
+
+    order = orders[0]
+    picking_ids = order.get("picking_ids") or []
+    partner_name = (
+        order["partner_id"][1]
+        if isinstance(order.get("partner_id"), list)
+        else str(order.get("partner_id", ""))
+    )
+
+    # Leer pickings vinculados
+    deliveries = []
+    if picking_ids:
+        try:
+            pickings = odoo_read(
+                tenant_id, url, db, user, password,
+                "stock.picking", picking_ids,
+                ["name", "state", "scheduled_date", "date_done", "picking_type_code"],
+            )
+            for p in (pickings or []):
+                state = p.get("state", "")
+                deliveries.append({
+                    "name": p.get("name", ""),
+                    "state": state,
+                    "state_label": _PICKING_STATE_LABEL.get(state, state),
+                    "scheduled_date": p.get("scheduled_date") or "",
+                    "date_done": p.get("date_done") or "",
+                    "picking_type_code": p.get("picking_type_code") or "",
+                    "done": state == "done",
+                })
+        except Exception as e:
+            err = f"Error leyendo pickings {picking_ids}: {e}"
+            _log_call("get_order_delivery_status", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "pickings_read_failed", "error_detail": err,
+                    "order_id": order_id}
+
+    result = {
+        "success": True,
+        "order_id": order_id,
+        "order_name": order.get("name", ""),
+        "state": order.get("state", ""),
+        "state_label": _STATE_LABEL.get(order.get("state", ""), order.get("state", "")),
+        "delivery_status": order.get("delivery_status") or "",
+        "invoice_status": order.get("invoice_status") or "",
+        "amount_total": float(order.get("amount_total", 0)),
+        "partner": partner_name,
+        "deliveries_count": len(deliveries),
+        "deliveries": deliveries,
+    }
+    _log_call("get_order_delivery_status", tenant_id, log_args,
+              {"order_name": result["order_name"], "deliveries": len(deliveries)},
+              None, int((time.time() - started) * 1000))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_my_sales_summary
+# ---------------------------------------------------------------------------
+
+def odoo_get_my_sales_summary(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    period: str = "month",
+) -> dict:
+    """Resumen de ventas del vendedor logueado para el periodo indicado.
+
+    Consulta las sale.order confirmadas/hechas del usuario autenticado
+    en las credenciales (user/password). Periodos soportados:
+      - 'month'  (default): desde el primer dia del mes en curso
+      - 'week':  desde el lunes de la semana en curso
+      - 'today': solo el dia de hoy
+
+    Usa read_group para los totales agregados y odoo_search para el
+    listado de ordenes (max 50, mas recientes primero).
+
+    Args:
+        period: 'month' | 'week' | 'today' (default: 'month')
+
+    Returns {success, period, from_date, total_amount, orders_count,
+    unique_customers, orders: [{name, date, partner, amount}]}
+    """
+    from datetime import date as _date, timedelta as _td
+
+    started = time.time()
+    log_args = {"period": period}
+
+    # Calcular fecha de inicio del periodo
+    today = _date.today()
+    if period == "today":
+        from_date = today.isoformat()
+    elif period == "week":
+        # Retroceder al lunes de la semana actual
+        from_date = (today - _td(days=today.weekday())).isoformat()
+    else:
+        # month (default)
+        period = "month"
+        from_date = today.replace(day=1).isoformat()
+
+    # Autenticar para obtener uid del vendedor logueado
+    try:
+        import xmlrpc.client as _xrc
+        common = _xrc.ServerProxy(f"{url.rstrip('/')}/xmlrpc/2/common")
+        uid = common.authenticate(db, user, password, {})
+        if not uid:
+            err = "Autenticacion fallida: no se pudo obtener uid del vendedor"
+            _log_call("get_my_sales_summary", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "auth_failed", "error_detail": err}
+    except Exception as e:
+        err = f"Error autenticando para obtener uid: {e}"
+        _log_call("get_my_sales_summary", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "auth_error", "error_detail": err}
+
+    base_domain = [
+        ["user_id", "=", uid],
+        ["state", "in", ["sale", "done"]],
+        ["date_order", ">=", from_date],
+    ]
+
+    # Totales via read_group
+    total_amount = 0.0
+    orders_count = 0
+    unique_customers = 0
+    try:
+        rg_result = odoo_call_method(
+            tenant_id, url, db, user, password,
+            "sale.order", "read_group",
+            [],  # ids ignorado en read_group — se pasa via args
+            args=[base_domain, ["amount_total:sum", "partner_id:count_distinct"], []],
+        )
+        if rg_result and isinstance(rg_result, list) and rg_result[0]:
+            g = rg_result[0]
+            total_amount = float(g.get("amount_total", 0) or 0)
+            orders_count = int(g.get("sale_order_count", g.get("__count", 0)) or 0)
+            unique_customers = int(g.get("partner_id_count_distinct",
+                                         g.get("partner_id", 0)) or 0)
+    except Exception as e:
+        # read_group puede fallar en algunas versiones de Odoo — continuar con ordenes
+        logger.warning("get_my_sales_summary read_group failed, falling back: %s", e)
+
+    # Listado de ordenes
+    try:
+        rows = odoo_search(
+            tenant_id, url, db, user, password,
+            "sale.order",
+            base_domain,
+            ["name", "date_order", "partner_id", "amount_total"],
+            limit=50,
+            order="date_order desc",
+        )
+    except Exception as e:
+        err = f"Error listando ordenes del vendedor: {e}"
+        _log_call("get_my_sales_summary", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "orders_search_failed", "error_detail": err}
+
+    orders_list = []
+    fallback_total = 0.0
+    partners_seen: set = set()
+    for r in (rows or []):
+        partner_name = (
+            r["partner_id"][1]
+            if isinstance(r.get("partner_id"), list)
+            else str(r.get("partner_id", ""))
+        )
+        partner_id_val = (
+            r["partner_id"][0]
+            if isinstance(r.get("partner_id"), list)
+            else r.get("partner_id")
+        )
+        amount = float(r.get("amount_total", 0))
+        fallback_total += amount
+        if partner_id_val:
+            partners_seen.add(partner_id_val)
+        orders_list.append({
+            "name": r.get("name", ""),
+            "date": (r.get("date_order") or "")[:10],  # solo YYYY-MM-DD
+            "partner": partner_name,
+            "amount": amount,
+        })
+
+    # Si read_group no entrego totales, calcular desde las ordenes
+    if orders_count == 0 and orders_list:
+        orders_count = len(orders_list)
+        total_amount = round(fallback_total, 2)
+        unique_customers = len(partners_seen)
+
+    result = {
+        "success": True,
+        "period": period,
+        "from_date": from_date,
+        "total_amount": round(total_amount, 2),
+        "orders_count": orders_count,
+        "unique_customers": unique_customers,
+        "orders": orders_list,
+    }
+    _log_call("get_my_sales_summary", tenant_id, log_args,
+              {"period": period, "orders_count": orders_count, "total": total_amount},
+              None, int((time.time() - started) * 1000))
     return result

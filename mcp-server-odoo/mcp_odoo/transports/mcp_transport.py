@@ -583,7 +583,10 @@ MCP_TOOLS = [
                         "type": "object",
                         "properties": {
                             "product_id": {"type": "integer"},
+                            "code": {"type": "string", "description": "default_code del producto (ej. LAP0176). Declararlo permite validar que el template_id sea el correcto y evitar mezclar productos."},
                             "quantity": {"type": "number", "default": 1},
+                            "price_unit": {"type": "number", "description": "Precio unitario manual. Si se omite, usa el precio de lista."},
+                            "discount": {"type": "number", "description": "Descuento en porcentaje (0-100)."},
                         },
                         "required": ["product_id"],
                     },
@@ -1147,6 +1150,77 @@ MCP_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {},
+            "required": [],
+        },
+    },
+    # ----- B2B priority tools ------------------------------------------
+    {
+        "name": "get_customer_credit_status",
+        "description": (
+            "Consultar el estado financiero de un cliente: saldo pendiente, "
+            "facturas vencidas y credito disponible. "
+            "Devuelve credit_used (deuda total), overdue_amount (vencida), "
+            "credit_limit y credit_available (si el modulo de credito esta activo), "
+            "y la lista completa de facturas pendientes con su estado de pago. "
+            "Usar cuando el vendedor pregunte por el estado de cuenta, cuanto debe "
+            "el cliente, si tiene facturas vencidas, o si puede comprar mas."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {
+                    "type": "integer",
+                    "description": "ID del cliente en Odoo (res.partner)",
+                },
+            },
+            "required": ["partner_id"],
+        },
+    },
+    {
+        "name": "get_order_delivery_status",
+        "description": (
+            "Consultar el estado de entrega de un pedido confirmado (sale.order): "
+            "que se ha enviado, que falta por enviar, y el estado de cada "
+            "transferencia (picking) vinculada. "
+            "Acepta order_id (entero) O order_name (ej: 'VENTA122196'). "
+            "Usar cuando el cliente o vendedor pregunte por el despacho, "
+            "'cuando llega mi pedido', 'ya salio el pedido', 'estado de entrega'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {
+                    "type": "integer",
+                    "description": "ID numerico del sale.order",
+                },
+                "order_name": {
+                    "type": "string",
+                    "description": "Nombre del pedido (ej: 'VENTA122196'). Usar si no se tiene order_id.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_my_sales_summary",
+        "description": (
+            "Resumen de ventas del vendedor logueado para el periodo indicado: "
+            "total vendido, numero de pedidos, clientes unicos y listado de ordenes. "
+            "Periodos: 'month' (mes en curso, default), 'week' (semana en curso), "
+            "'today' (solo hoy). "
+            "Usar cuando el vendedor pregunte por sus ventas, 'cuanto llevo este mes', "
+            "'mis ventas de hoy', 'resumen de mi semana', 'cuantos pedidos tengo'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "period": {
+                    "type": "string",
+                    "description": "Periodo: 'month' (default), 'week' o 'today'",
+                    "enum": ["month", "week", "today"],
+                    "default": "month",
+                },
+            },
             "required": [],
         },
     },
@@ -1763,6 +1837,28 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
 
     if tool_name == "update_partner":
         return await _update_partner(creds, args)
+
+    if tool_name == "get_customer_credit_status":
+        from mcp_odoo.tools.sales import odoo_get_customer_credit_status
+        result = odoo_get_customer_credit_status(*creds, args["partner_id"])
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "get_order_delivery_status":
+        from mcp_odoo.tools.sales import odoo_get_order_delivery_status
+        result = odoo_get_order_delivery_status(
+            *creds,
+            order_id=args.get("order_id"),
+            order_name=args.get("order_name"),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "get_my_sales_summary":
+        from mcp_odoo.tools.sales import odoo_get_my_sales_summary
+        result = odoo_get_my_sales_summary(
+            *creds,
+            period=args.get("period", "month"),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     raise ValueError(f"Unknown tool: {tool_name}")
 
@@ -3172,6 +3268,7 @@ def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
         rows.append({
             "template_id": tmpl_id,
             "code": code or "",
+            "name": name or "",
             "price": round(float(price), 2) if price else 0,
             "cost": round(float(cost), 2) if cost else 0,
             "line_text": line_text,
