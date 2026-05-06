@@ -2414,38 +2414,24 @@ async def _resolve_order_id_alias(request: Request, tool_name: str, args: dict) 
             pass
         return None
 
-    def _lookup_by_name_ilike(digits: str) -> int | None:
-        if not digits:
-            return None
-        try:
-            rows = odoo_search(
-                *creds, "sale.order", [["name", "ilike", digits]],
-                fields=["id", "name"], limit=2,
-            )
-            if len(rows) == 1:
-                logger.info(
-                    "order_id resolved by name ilike %r -> %s (%s)",
-                    digits, rows[0]["id"], rows[0].get("name"),
-                )
-                return int(rows[0]["id"])
-        except Exception:
-            pass
-        return None
 
+    # IMPORTANT: only resolve via EXACT name matches with known
+    # prefixes. Fuzzy `ilike` matching was removed because a digit
+    # suffix like "122172" can collide with VENTA1221720 / VENTA0122172
+    # / etc, leading to operations on a DIFFERENT order than the user
+    # intended. Better to fail clean than to mutate the wrong record.
     if isinstance(raw, int) and raw > 0:
-        # Validate the int exists. If not, treat it as the digit suffix
-        # of a name (e.g. LLM passed 122172 from "VENTA122172").
         if _exists_as_id(raw):
             return
-        # Try common Odoo prefixes.
-        for prefix in ("VENTA", "S0", "SO", ""):
+        # Treat as digit-suffix of a name. Try common Odoo prefixes
+        # with EXACT match only.
+        for prefix in ("VENTA", "S0", "SO"):
             cand = _lookup_by_name_exact(f"{prefix}{raw}")
             if cand is not None:
                 args["order_id"] = cand
                 return
-        cand = _lookup_by_name_ilike(str(raw))
-        if cand is not None:
-            args["order_id"] = cand
+        # No exact match: leave as-is so the tool returns
+        # order_not_found and the LLM has to ask the user explicitly.
         return
 
     if isinstance(raw, str):
@@ -2455,23 +2441,14 @@ async def _resolve_order_id_alias(request: Request, tool_name: str, args: dict) 
             if _exists_as_id(n):
                 args["order_id"] = n
                 return
-            for prefix in ("VENTA", "S0", "SO", ""):
+            for prefix in ("VENTA", "S0", "SO"):
                 cand = _lookup_by_name_exact(f"{prefix}{n}")
                 if cand is not None:
                     args["order_id"] = cand
                     return
-            cand = _lookup_by_name_ilike(s)
-            if cand is not None:
-                args["order_id"] = cand
             return
-        # Non-numeric string: try as name.
-        name_candidate = s.upper()
-        cand = _lookup_by_name_exact(name_candidate)
-        if cand is not None:
-            args["order_id"] = cand
-            return
-        digits = "".join(ch for ch in s if ch.isdigit())
-        cand = _lookup_by_name_ilike(digits)
+        # Non-numeric string: only EXACT name match.
+        cand = _lookup_by_name_exact(s.upper())
         if cand is not None:
             args["order_id"] = cand
 
