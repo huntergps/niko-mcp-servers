@@ -3166,9 +3166,14 @@ def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
 
         line_text = f"{title}\n      {price_part}{stock_part}"
 
+        cost = live_data.get("cost") if live_data else (
+            (r.get("metadata") or {}).get("cost") or 0
+        )
         rows.append({
             "template_id": tmpl_id,
             "code": code or "",
+            "price": round(float(price), 2) if price else 0,
+            "cost": round(float(cost), 2) if cost else 0,
             "line_text": line_text,
         })
 
@@ -3214,7 +3219,10 @@ def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
             "linea en blanco, luego footer. NUNCA muestres template_id al usuario. "
             "Memoriza la posicion (1,2,3...) -> template_id para usar despues en "
             "create_quotation. NUNCA inventes template_id; usa exactamente el numero "
-            "que aparece en este JSON."
+            "que aparece en este JSON. "
+            "Cada row incluye 'price' (precio de venta) y 'cost' (costo de adquisicion). "
+            "Cuando el vendedor pida precio 'sobre el costo' o 'margen sobre costo', "
+            "usa el campo 'cost' de este JSON como base — NO el 'price'."
         ),
     }
     return _json.dumps(payload, ensure_ascii=False)
