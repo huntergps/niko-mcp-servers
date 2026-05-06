@@ -1231,6 +1231,23 @@ async def _handle_mcp_request(request: Request, body: dict) -> dict | None:
                 "isError": True,
             })
 
+        # Pre-execution arg validation against the tool's inputSchema.
+        # Without this, malformed LLM args (e.g. fields placed at the
+        # top level instead of inside a required nested array) reach the
+        # tool function which then fails with a generic message that
+        # gives the LLM no signal on what to fix. We catch the missing/
+        # mistyped fields here and return a structured error containing
+        # the expected schema so the LLM can self-correct on the next
+        # AIMessage.
+        validation_error = _validate_args_against_schema(tool_name, args)
+        if validation_error is not None:
+            return _make_response(req_id, {
+                "content": [{"type": "text", "text": json.dumps(
+                    validation_error, indent=2, ensure_ascii=False,
+                )}],
+                "isError": True,
+            })
+
         try:
             text = await _execute_tool(request, tool_name, args)
             # Auto-attach _card to quotation tool results that returned
@@ -2309,6 +2326,100 @@ _QUOTATION_TOOLS_NEEDING_CARD = {
     "recalculate_quotation",
     "transition_quotation",
 }
+
+
+def _validate_args_against_schema(tool_name: str, args: dict) -> dict | None:
+    """Validate ``args`` against the inputSchema declared in MCP_TOOLS.
+
+    Catches the most common LLM mistakes BEFORE invoking the tool:
+      * missing required field
+      * required field has wrong primitive type (object vs array, etc.)
+
+    Returns ``None`` when args are OK. Returns a dict ``{success: False,
+    error_code, error_detail, missing, expected_schema}`` when invalid.
+    The dict is serialised to the LLM as the tool result so it can
+    self-correct on the next AIMessage with the exact structure the
+    tool expects.
+    """
+    if not isinstance(args, dict):
+        return {
+            "success": False,
+            "error_code": "invalid_args_type",
+            "error_detail": (
+                f"`arguments` must be a JSON object, got {type(args).__name__}."
+            ),
+        }
+
+    spec = next((t for t in MCP_TOOLS if t.get("name") == tool_name), None)
+    if not spec:
+        return None  # unknown tool — let the dispatcher handle it
+    schema = (spec.get("inputSchema") or {})
+    properties = schema.get("properties") or {}
+    required = schema.get("required") or []
+
+    missing: list[str] = []
+    type_errors: list[dict] = []
+
+    for field_name in required:
+        if field_name not in args:
+            missing.append(field_name)
+            continue
+        # Light type check on common primitives (object/array). Allow None
+        # for optional fields; here we are checking required ones so they
+        # must be present and the right shape.
+        prop = properties.get(field_name) or {}
+        expected_type = prop.get("type")
+        value = args[field_name]
+        if expected_type == "array" and not isinstance(value, list):
+            type_errors.append({
+                "field": field_name,
+                "expected": "array",
+                "got": type(value).__name__,
+            })
+        elif expected_type == "object" and not isinstance(value, dict):
+            type_errors.append({
+                "field": field_name,
+                "expected": "object",
+                "got": type(value).__name__,
+            })
+        elif expected_type == "integer" and not isinstance(value, int):
+            type_errors.append({
+                "field": field_name,
+                "expected": "integer",
+                "got": type(value).__name__,
+            })
+
+    if not missing and not type_errors:
+        return None  # all good
+
+    detail_lines: list[str] = []
+    if missing:
+        detail_lines.append(
+            "Missing required field(s): " + ", ".join(repr(m) for m in missing)
+            + "."
+        )
+    if type_errors:
+        for te in type_errors:
+            detail_lines.append(
+                f"Field {te['field']!r} expected type {te['expected']!r}, "
+                f"got {te['got']!r}."
+            )
+    detail_lines.append(
+        "Re-call the tool with the EXACT structure shown in `expected_schema`."
+    )
+
+    return {
+        "success": False,
+        "error_code": "invalid_arguments",
+        "error_detail": " ".join(detail_lines),
+        "missing": missing,
+        "type_errors": type_errors,
+        "expected_schema": {
+            "type": schema.get("type", "object"),
+            "properties": properties,
+            "required": required,
+        },
+    }
 
 
 def _maybe_attach_card(tc: dict, tool_name: str, text: str) -> str:
