@@ -1233,6 +1233,18 @@ async def _handle_mcp_request(request: Request, body: dict) -> dict | None:
 
         try:
             text = await _execute_tool(request, tool_name, args)
+            # Auto-attach _card to quotation tool results that returned
+            # order_id without a _card envelope, so the orchestrator can
+            # render an OrderCard (Editar/PDF/Confirmar buttons) on
+            # Telegram/WhatsApp. Without this, mutation tools fall back
+            # to the LLM rendering markdown tables that Telegram does NOT
+            # display — the customer sees raw `|---|---|` pipes.
+            if tool_name in _QUOTATION_TOOLS_NEEDING_CARD:
+                try:
+                    tc_for_card = await _get_tenant_config(request)
+                    text = _maybe_attach_card(tc_for_card, tool_name, text)
+                except Exception as exc_card:
+                    logger.debug("card auto-attach failed: %s", exc_card)
             return _make_response(req_id, {
                 "content": [{"type": "text", "text": text}],
             })
@@ -2269,6 +2281,64 @@ async def _get_tenant_config(request: Request) -> dict:
 # Cache key: (tenant_id, product_id) → {qty_available, list_price, ...}
 # ---------------------------------------------------------------------------
 import time as _t
+
+# --- _card auto-attach ----------------------------------------------------
+#
+# Sale-order tools that mutate or read state should return a `_card`
+# envelope so the orchestrator (niko/orchestrator.py:_extract_order_card_from_messages)
+# can render an inline OrderCard with Editar/PDF/Confirmar buttons.
+# Only `create_quotation`, `add_to_quotation` and `get_quotation` build it
+# themselves; the rest of the quotation tools (Sprint C) just return
+# {success, order_id, ...} and the LLM ends up rendering a markdown
+# table that Telegram does NOT render correctly.
+#
+# Solution: after every successful quotation-tool call, if the response
+# JSON has `order_id` but no `_card`, do ONE read of sale.order and
+# inject `_card` so the OrderCard always shows.
+_QUOTATION_TOOLS_NEEDING_CARD = {
+    "get_latest_quotation",
+    "get_active_quotation",
+    "get_quotation",
+    "get_quotation_state_summary",
+    "update_quotation_line",
+    "remove_quotation_line",
+    "add_quotation_line",
+    "change_quotation_customer",
+    "apply_global_discount",
+    "set_quotation_header",
+    "recalculate_quotation",
+    "transition_quotation",
+}
+
+
+def _maybe_attach_card(tc: dict, tool_name: str, text: str) -> str:
+    """Inject a `_card` envelope when a quotation tool returned `order_id`
+    but didn't build one. Idempotent — leaves text untouched on any failure.
+    """
+    if tool_name not in _QUOTATION_TOOLS_NEEDING_CARD:
+        return text
+    try:
+        data = json.loads(text)
+    except Exception:
+        return text
+    if not isinstance(data, dict):
+        return text
+    if not data.get("success"):
+        return text
+    order_id = data.get("order_id")
+    if not order_id or data.get("_card"):
+        return text
+    try:
+        creds = (tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"])
+        from mcp_odoo.tools.sales import _card_for_order  # local import: avoid circular
+        card = _card_for_order(*creds, int(order_id))
+        if card:
+            data["_card"] = card
+            return json.dumps(data, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        logger.debug("attach_card skipped for %s: %s", tool_name, e)
+    return text
+
 
 _PRODUCT_CACHE_TTL_SECONDS = 30
 _product_cache: dict[tuple[str, int], tuple[float, dict]] = {}

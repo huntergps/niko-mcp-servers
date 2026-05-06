@@ -1363,6 +1363,39 @@ def _recompute_summary(
     }
 
 
+def _card_for_order(
+    tenant_id: str, url: str, db: str, user: str, password: str, order_id: int,
+) -> dict | None:
+    """Build a `_card` envelope for an existing order_id.
+
+    Used by mutation tools so Telegram/WhatsApp render the OrderCard
+    automatically after every modification. Single read of sale.order
+    with the fields _build_card consumes.
+    """
+    fields = [
+        "name", "state", "partner_id", "amount_total", "order_line",
+    ]
+    o = _read_sale_order(tenant_id, url, db, user, password, order_id, fields)
+    if not o:
+        return None
+    partner = o.get("partner_id")
+    if isinstance(partner, list) and len(partner) >= 2:
+        partner_name = partner[1]
+    else:
+        partner_name = ""
+    lines = o.get("order_line") or []
+    state = o.get("state") or ""
+    state_label = _STATE_LABEL.get(state, state) if "_STATE_LABEL" in globals() else state
+    return {
+        "order_id": order_id,
+        "order_name": o.get("name", ""),
+        "partner_name": partner_name,
+        "state_label": state_label,
+        "total": float(o.get("amount_total", 0) or 0),
+        "lines_count": len(lines) if isinstance(lines, list) else 0,
+    }
+
+
 # ---- 1) update_quotation_line ---------------------------------------------
 
 def odoo_update_quotation_line(
