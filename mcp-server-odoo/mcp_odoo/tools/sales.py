@@ -3,6 +3,7 @@
 import logging
 import time
 import traceback
+from typing import Any
 
 from mcp_odoo.tools.generic import odoo_search, odoo_read, odoo_create, odoo_write, odoo_call_method
 
@@ -1255,3 +1256,1126 @@ def get_latest_quotation(
         tenant_id, url, db, user, password, order_id=order_id,
     )
     return detail  # already has _card from odoo_get_quotation
+
+
+# ---------------------------------------------------------------------------
+# Order edition tools — sprint "C" (full coverage, agosto 2026)
+# ---------------------------------------------------------------------------
+#
+# Diseño común:
+#   * Toda función valida el estado de la sale.order ANTES de escribir y
+#     devuelve {success: False, error_code: 'order_not_editable', state: ...}
+#     cuando la operación no aplica para el estado actual.
+#   * confirmed=False emite un preview (read-only); confirmed=True ejecuta.
+#   * Devuelven un diff explícito con old/new y los totales recomputados.
+#   * No tocan partner_id, payment_term_id ni pricelist_id sin propagar
+#     el resto de campos derivados — vide odoo_change_quotation_customer.
+#
+# Restricciones de estado por defecto:
+#   - Cabecera mutable:   draft, sent, waiting_approval, approved
+#   - Cabecera light:     sale (algunos campos)
+#   - Líneas mutables:    draft, sent, approved, sale (Odoo lo permite con
+#                         registro automático en chatter)
+#   - Líneas eliminables: solo draft/sent (en sale el override Tecnosmart
+#                         bloquea unlink — caemos a qty=0).
+#   - NUNCA en done/cancel/collection/rejected.
+
+_STATES_HEADER_FULL = {"draft", "sent", "waiting_approval", "approved"}
+_STATES_HEADER_LIGHT = {"draft", "sent", "waiting_approval", "approved", "sale"}
+_STATES_LINE_EDITABLE = {"draft", "sent", "approved", "sale"}
+_STATES_LINE_HARD_DELETE = {"draft", "sent"}
+
+
+def _read_sale_order(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int,
+    fields: list[str],
+) -> dict | None:
+    """Helper: read a single sale.order row or return None when absent."""
+    try:
+        rows = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id], fields,
+        )
+    except Exception as e:
+        logger.warning("sale.order read failed for %s: %s", order_id, e)
+        return None
+    return rows[0] if rows else None
+
+
+def _read_sale_order_line(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    line_id: int,
+    fields: list[str],
+) -> dict | None:
+    try:
+        rows = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order.line", [line_id], fields,
+        )
+    except Exception as e:
+        logger.warning("sale.order.line read failed for %s: %s", line_id, e)
+        return None
+    return rows[0] if rows else None
+
+
+def _state_error(order: dict, allowed: set[str], action: str) -> dict:
+    return {
+        "success": False,
+        "error_code": "order_not_editable",
+        "error_detail": (
+            f"La cotización {order.get('name', '?')} está en estado "
+            f"'{order.get('state', '?')}' y no acepta '{action}'. "
+            f"Estados permitidos: {sorted(allowed)}."
+        ),
+        "order_id": order.get("id"),
+        "name": order.get("name"),
+        "state": order.get("state"),
+    }
+
+
+def _ok_diff(
+    order_id: int, name: str, old: dict, new: dict, recomputed: dict,
+) -> dict:
+    return {
+        "success": True,
+        "order_id": order_id,
+        "name": name,
+        "old": old,
+        "new": new,
+        "recomputed": recomputed,
+    }
+
+
+def _recompute_summary(
+    tenant_id: str, url: str, db: str, user: str, password: str, order_id: int,
+) -> dict:
+    """Read amount fields after a write to surface them in the response."""
+    fields = [
+        "name", "state", "amount_untaxed", "amount_tax", "amount_total",
+    ]
+    o = _read_sale_order(tenant_id, url, db, user, password, order_id, fields) or {}
+    return {
+        "amount_untaxed": o.get("amount_untaxed", 0),
+        "amount_tax": o.get("amount_tax", 0),
+        "amount_total": o.get("amount_total", 0),
+        "state": o.get("state"),
+    }
+
+
+# ---- 1) update_quotation_line ---------------------------------------------
+
+def odoo_update_quotation_line(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    line_id: int,
+    *,
+    quantity: float | None = None,
+    price_unit: float | None = None,
+    discount: float | None = None,
+    name: str | None = None,
+    product_id: int | None = None,
+    confirmed: bool = False,
+) -> dict:
+    """Modify an existing sale.order.line.
+
+    Cambia ``product_uom_qty``, ``price_unit``, ``discount``, ``name`` o
+    ``product_id`` de una línea ya existente. Para eliminar una línea
+    úsa ``odoo_remove_quotation_line`` en lugar de ``quantity=0`` aquí
+    (esa lógica vive en remove para mantener separados los contratos).
+
+    El descuento queda topado por ``partner_max_sale_discount`` cuando
+    Tecnosmart tiene ese flag activo. ``product_id`` requiere reenviar
+    también ``name`` y ``price_unit`` ideal — Odoo no dispara el onchange
+    desde la API, así que el caller asume responsabilidad si los omite.
+    """
+    started = time.time()
+    log_args = {
+        "line_id": line_id, "quantity": quantity, "price_unit": price_unit,
+        "discount": discount, "product_id": product_id, "confirmed": confirmed,
+    }
+
+    if not isinstance(line_id, int) or line_id <= 0:
+        err = "line_id requerido y debe ser entero positivo"
+        _log_call("update_quotation_line", tenant_id, log_args, None, err, 0)
+        return {"success": False, "error_code": "invalid_line_id", "error_detail": err}
+
+    if quantity is None and price_unit is None and discount is None and name is None and product_id is None:
+        err = "Debes especificar al menos un campo a actualizar"
+        _log_call("update_quotation_line", tenant_id, log_args, None, err, 0)
+        return {"success": False, "error_code": "no_changes", "error_detail": err}
+
+    line = _read_sale_order_line(
+        tenant_id, url, db, user, password, line_id,
+        ["id", "order_id", "product_id", "product_uom_qty", "price_unit",
+         "discount", "name"],
+    )
+    if not line:
+        err = f"sale.order.line {line_id} no existe"
+        _log_call("update_quotation_line", tenant_id, log_args, None, err, 0)
+        return {"success": False, "error_code": "line_not_found", "error_detail": err}
+
+    order_id = line["order_id"][0] if isinstance(line.get("order_id"), list) else line.get("order_id")
+    order = _read_sale_order(
+        tenant_id, url, db, user, password, order_id,
+        ["id", "name", "state", "partner_id"],
+    )
+    if not order:
+        err = f"sale.order de la línea no existe"
+        _log_call("update_quotation_line", tenant_id, log_args, None, err, 0)
+        return {"success": False, "error_code": "order_not_found", "error_detail": err}
+
+    if order["state"] not in _STATES_LINE_EDITABLE:
+        result = _state_error(order, _STATES_LINE_EDITABLE, "update_line")
+        _log_call("update_quotation_line", tenant_id, log_args, result, None,
+                  int((time.time() - started) * 1000))
+        return result
+
+    # Validate discount against partner max if available.
+    if discount is not None:
+        if discount < 0 or discount > 100:
+            return {
+                "success": False,
+                "error_code": "discount_out_of_range",
+                "error_detail": f"discount debe estar entre 0 y 100, recibido {discount}",
+            }
+        try:
+            partner_id = order["partner_id"][0] if isinstance(order.get("partner_id"), list) else order.get("partner_id")
+            if partner_id:
+                p = odoo_read(
+                    tenant_id, url, db, user, password,
+                    "res.partner", [partner_id], ["partner_max_sale_discount"],
+                )
+                if p:
+                    cap = p[0].get("partner_max_sale_discount") or 0
+                    if cap and discount > cap:
+                        return {
+                            "success": False,
+                            "error_code": "discount_exceeds_partner_cap",
+                            "error_detail": (
+                                f"El descuento solicitado ({discount}%) supera el "
+                                f"máximo permitido para este cliente ({cap}%)."
+                            ),
+                            "partner_max": cap,
+                        }
+        except Exception as e:
+            # Field may not exist on this tenant — log and proceed.
+            logger.debug("partner_max_sale_discount lookup skipped: %s", e)
+
+    # Build write dict.
+    vals: dict = {}
+    if quantity is not None:
+        vals["product_uom_qty"] = float(quantity)
+    if price_unit is not None:
+        vals["price_unit"] = float(price_unit)
+    if discount is not None:
+        vals["discount"] = float(discount)
+    if name is not None:
+        vals["name"] = name
+    if product_id is not None:
+        # Resolve product.template -> product.product variant.
+        try:
+            variants = odoo_search(
+                tenant_id, url, db, user, password,
+                "product.product",
+                [["product_tmpl_id", "=", int(product_id)], ["active", "=", True]],
+                ["id", "uom_id"], limit=1,
+            )
+            if not variants:
+                return {
+                    "success": False,
+                    "error_code": "template_no_variant",
+                    "error_detail": f"product.template {product_id} sin variante activa",
+                }
+            vals["product_id"] = variants[0]["id"]
+            vals["product_uom"] = (
+                variants[0]["uom_id"][0] if isinstance(variants[0].get("uom_id"), list)
+                else variants[0].get("uom_id") or 1
+            )
+        except Exception as e:
+            return {
+                "success": False,
+                "error_code": "variant_lookup_failed",
+                "error_detail": str(e),
+            }
+
+    old = {
+        "product_uom_qty": line.get("product_uom_qty"),
+        "price_unit": line.get("price_unit"),
+        "discount": line.get("discount"),
+        "name": line.get("name"),
+    }
+
+    if not confirmed:
+        result = {
+            "success": False,
+            "requires_confirmation": True,
+            "preview": {
+                "line_id": line_id,
+                "order_name": order["name"],
+                "old": old,
+                "proposed": vals,
+            },
+            "action": "update_quotation_line",
+        }
+        _log_call("update_quotation_line", tenant_id, log_args, result, None,
+                  int((time.time() - started) * 1000))
+        return result
+
+    try:
+        odoo_write(tenant_id, url, db, user, password,
+                   "sale.order.line", [line_id], vals)
+    except Exception as e:
+        elapsed = int((time.time() - started) * 1000)
+        tb = traceback.format_exc()
+        logger.error("update_quotation_line write failed line=%s err=%s\n%s", line_id, e, tb)
+        _log_call("update_quotation_line", tenant_id, log_args, None, str(e), elapsed)
+        return {"success": False, "error_code": "write_failed", "error_detail": str(e)}
+
+    # Re-read to capture computed price_subtotal.
+    new_line = _read_sale_order_line(
+        tenant_id, url, db, user, password, line_id,
+        ["product_uom_qty", "price_unit", "discount", "name", "price_subtotal", "price_total"],
+    ) or {}
+
+    summary = _recompute_summary(tenant_id, url, db, user, password, order_id)
+    result = _ok_diff(order_id, order["name"], old, new_line, summary)
+    _log_call("update_quotation_line", tenant_id, log_args, result, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
+# ---- 2) remove_quotation_line ---------------------------------------------
+
+def odoo_remove_quotation_line(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    line_id: int,
+    *,
+    mode: str = "auto",
+    confirmed: bool = False,
+) -> dict:
+    """Remove a line from an existing sale.order.
+
+    ``mode='auto'`` (default): unlink físico cuando el estado es
+    draft/sent; en sale/approved cae a ``write({'product_uom_qty': 0})``
+    para no chocar con el override `_check_line_unlink` del módulo
+    `l10n_ec_sri` que bloquea unlink si la orden ya tiene factura.
+
+    ``mode='unlink'`` fuerza unlink y deja que Odoo decida (lanza
+    UserError si está bloqueado). ``mode='qty_zero'`` solo setea qty=0.
+    """
+    started = time.time()
+    log_args = {"line_id": line_id, "mode": mode, "confirmed": confirmed}
+
+    if not isinstance(line_id, int) or line_id <= 0:
+        err = "line_id requerido y debe ser entero positivo"
+        _log_call("remove_quotation_line", tenant_id, log_args, None, err, 0)
+        return {"success": False, "error_code": "invalid_line_id", "error_detail": err}
+
+    if mode not in ("auto", "unlink", "qty_zero"):
+        err = f"mode debe ser auto/unlink/qty_zero (recibido: {mode!r})"
+        return {"success": False, "error_code": "invalid_mode", "error_detail": err}
+
+    line = _read_sale_order_line(
+        tenant_id, url, db, user, password, line_id,
+        ["id", "order_id", "product_id", "product_uom_qty", "name"],
+    )
+    if not line:
+        err = f"sale.order.line {line_id} no existe"
+        return {"success": False, "error_code": "line_not_found", "error_detail": err}
+
+    order_id = line["order_id"][0] if isinstance(line.get("order_id"), list) else line.get("order_id")
+    order = _read_sale_order(
+        tenant_id, url, db, user, password, order_id,
+        ["id", "name", "state"],
+    )
+    if not order:
+        return {"success": False, "error_code": "order_not_found",
+                "error_detail": "sale.order de la línea no existe"}
+
+    if order["state"] not in _STATES_LINE_EDITABLE:
+        return _state_error(order, _STATES_LINE_EDITABLE, "remove_line")
+
+    use_unlink = (
+        mode == "unlink"
+        or (mode == "auto" and order["state"] in _STATES_LINE_HARD_DELETE)
+    )
+
+    if not confirmed:
+        return {
+            "success": False,
+            "requires_confirmation": True,
+            "preview": {
+                "line_id": line_id,
+                "order_name": order["name"],
+                "approach": "unlink" if use_unlink else "qty_zero",
+                "current_qty": line.get("product_uom_qty"),
+            },
+            "action": "remove_quotation_line",
+        }
+
+    try:
+        if use_unlink:
+            odoo_call_method(
+                tenant_id, url, db, user, password,
+                "sale.order.line", "unlink", [line_id],
+            )
+        else:
+            odoo_write(tenant_id, url, db, user, password,
+                       "sale.order.line", [line_id], {"product_uom_qty": 0})
+    except Exception as e:
+        elapsed = int((time.time() - started) * 1000)
+        tb = traceback.format_exc()
+        logger.error("remove_quotation_line failed line=%s mode=%s err=%s\n%s",
+                     line_id, mode, e, tb)
+        _log_call("remove_quotation_line", tenant_id, log_args, None, str(e), elapsed)
+        return {"success": False, "error_code": "remove_failed", "error_detail": str(e)}
+
+    summary = _recompute_summary(tenant_id, url, db, user, password, order_id)
+    result = {
+        "success": True,
+        "order_id": order_id,
+        "name": order["name"],
+        "approach": "unlink" if use_unlink else "qty_zero",
+        "removed_line_id": line_id,
+        "recomputed": summary,
+    }
+    _log_call("remove_quotation_line", tenant_id, log_args, result, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
+# ---- 3) change_quotation_customer -----------------------------------------
+
+def odoo_change_quotation_customer(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int,
+    partner_id: int,
+    *,
+    propagate_pricelist: bool = True,
+    propagate_payment_term: bool = True,
+    propagate_addresses: bool = True,
+    reprice_lines: bool = False,
+    confirmed: bool = False,
+) -> dict:
+    """Reasignar el cliente de una cotización.
+
+    Odoo no dispara `_onchange_partner_id` cuando se llama a `write`
+    desde la API, así que `pricelist_id`, `payment_term_id`,
+    `partner_invoice_id`, `partner_shipping_id` y `fiscal_position_id`
+    quedan stale. Este helper LEE los `property_*` del nuevo partner
+    y los propaga en un solo `write`.
+
+    ``reprice_lines=True`` recalcula `price_unit` de cada línea usando
+    `product.template._get_partner_pricelist` — útil cuando se cambia
+    de cliente con tarifa diferente.
+    """
+    started = time.time()
+    log_args = {
+        "order_id": order_id, "partner_id": partner_id,
+        "propagate_pricelist": propagate_pricelist,
+        "propagate_payment_term": propagate_payment_term,
+        "propagate_addresses": propagate_addresses,
+        "reprice_lines": reprice_lines, "confirmed": confirmed,
+    }
+
+    order = _read_sale_order(
+        tenant_id, url, db, user, password, order_id,
+        ["id", "name", "state", "partner_id", "pricelist_id",
+         "payment_term_id", "partner_invoice_id", "partner_shipping_id"],
+    )
+    if not order:
+        return {"success": False, "error_code": "order_not_found",
+                "error_detail": f"sale.order {order_id} no existe"}
+
+    # Allow customer change in draft/sent only — once confirmed (sale)
+    # or post-confirmation (collection/done/cancel) it has accounting
+    # impact (facturas linked) and must NOT be silently rewritten.
+    allowed = {"draft", "sent"}
+    if order["state"] not in allowed:
+        return _state_error(order, allowed, "change_partner")
+
+    # Read the new partner's defaults.
+    p = odoo_read(
+        tenant_id, url, db, user, password,
+        "res.partner", [partner_id],
+        ["id", "name", "property_product_pricelist",
+         "property_payment_term_id"],
+    )
+    if not p:
+        return {"success": False, "error_code": "partner_not_found",
+                "error_detail": f"res.partner {partner_id} no existe"}
+    new_partner = p[0]
+
+    # Resolve invoice + shipping addresses via address_get.
+    addr_ids: dict = {}
+    if propagate_addresses:
+        try:
+            addr_ids = odoo_call_method(
+                tenant_id, url, db, user, password,
+                "res.partner", "address_get", [partner_id], [["delivery", "invoice"]],
+            ) or {}
+        except Exception as e:
+            logger.debug("address_get skipped: %s", e)
+            addr_ids = {}
+
+    vals: dict = {"partner_id": partner_id}
+    if propagate_pricelist:
+        pl = new_partner.get("property_product_pricelist")
+        if isinstance(pl, list) and pl:
+            vals["pricelist_id"] = pl[0]
+    if propagate_payment_term:
+        pt = new_partner.get("property_payment_term_id")
+        if isinstance(pt, list) and pt:
+            vals["payment_term_id"] = pt[0]
+    if propagate_addresses:
+        if addr_ids.get("invoice"):
+            vals["partner_invoice_id"] = addr_ids["invoice"]
+        if addr_ids.get("delivery"):
+            vals["partner_shipping_id"] = addr_ids["delivery"]
+
+    old = {
+        "partner_id": order.get("partner_id"),
+        "pricelist_id": order.get("pricelist_id"),
+        "payment_term_id": order.get("payment_term_id"),
+        "partner_invoice_id": order.get("partner_invoice_id"),
+        "partner_shipping_id": order.get("partner_shipping_id"),
+    }
+
+    if not confirmed:
+        return {
+            "success": False,
+            "requires_confirmation": True,
+            "preview": {
+                "order_name": order["name"],
+                "old": old,
+                "proposed": vals,
+                "reprice_lines": reprice_lines,
+            },
+            "action": "change_quotation_customer",
+        }
+
+    try:
+        odoo_write(tenant_id, url, db, user, password,
+                   "sale.order", [order_id], vals)
+    except Exception as e:
+        elapsed = int((time.time() - started) * 1000)
+        tb = traceback.format_exc()
+        logger.error("change_customer write failed order=%s err=%s\n%s",
+                     order_id, e, tb)
+        _log_call("change_quotation_customer", tenant_id, log_args, None, str(e), elapsed)
+        return {"success": False, "error_code": "write_failed", "error_detail": str(e)}
+
+    # Optional: reprice lines via pricelist.get_product_price.
+    repriced_lines: list = []
+    if reprice_lines and propagate_pricelist and "pricelist_id" in vals:
+        try:
+            line_rows = odoo_search(
+                tenant_id, url, db, user, password,
+                "sale.order.line",
+                [["order_id", "=", order_id]],
+                ["id", "product_id", "product_uom_qty", "price_unit"],
+            )
+            for ln in line_rows or []:
+                pid = ln["product_id"][0] if isinstance(ln.get("product_id"), list) else ln.get("product_id")
+                if not pid:
+                    continue
+                try:
+                    new_price = odoo_call_method(
+                        tenant_id, url, db, user, password,
+                        "product.pricelist", "get_product_price",
+                        [vals["pricelist_id"]],
+                        [pid, ln.get("product_uom_qty") or 1, partner_id],
+                    )
+                    if new_price and abs(float(new_price) - float(ln.get("price_unit") or 0)) > 0.001:
+                        odoo_write(tenant_id, url, db, user, password,
+                                   "sale.order.line", [ln["id"]],
+                                   {"price_unit": float(new_price)})
+                        repriced_lines.append({
+                            "line_id": ln["id"], "old": ln.get("price_unit"),
+                            "new": float(new_price),
+                        })
+                except Exception as e:
+                    logger.debug("reprice line %s skipped: %s", ln.get("id"), e)
+        except Exception as e:
+            logger.warning("reprice_lines failed for order %s: %s", order_id, e)
+
+    summary = _recompute_summary(tenant_id, url, db, user, password, order_id)
+    result = {
+        "success": True,
+        "order_id": order_id,
+        "name": order["name"],
+        "old": old,
+        "new": vals,
+        "repriced_lines": repriced_lines,
+        "recomputed": summary,
+    }
+    _log_call("change_quotation_customer", tenant_id, log_args, result, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
+# ---- 4) apply_global_discount ---------------------------------------------
+
+def odoo_apply_global_discount(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int,
+    discount_type: str,
+    discount_rate: float,
+    *,
+    confirmed: bool = False,
+) -> dict:
+    """Aplicar un descuento a TODA la cotización.
+
+    Tecnosmart implementa esto via `discount_type` + `discount_rate` y
+    luego `calculate_discount()` que propaga a las líneas. ``percent``
+    aplica un % parejo, ``amount`` un monto fijo distribuido y ``cost``
+    pone un margen sobre costo.
+    """
+    started = time.time()
+    log_args = {"order_id": order_id, "discount_type": discount_type,
+                "discount_rate": discount_rate, "confirmed": confirmed}
+
+    if discount_type not in ("percent", "amount", "cost"):
+        return {"success": False, "error_code": "invalid_discount_type",
+                "error_detail": f"discount_type debe ser percent/amount/cost (recibido: {discount_type!r})"}
+    if discount_type == "percent" and (discount_rate < 0 or discount_rate > 100):
+        return {"success": False, "error_code": "discount_out_of_range",
+                "error_detail": f"discount_rate debe estar entre 0 y 100 para type=percent"}
+
+    order = _read_sale_order(
+        tenant_id, url, db, user, password, order_id,
+        ["id", "name", "state", "partner_id", "amount_untaxed"],
+    )
+    if not order:
+        return {"success": False, "error_code": "order_not_found",
+                "error_detail": f"sale.order {order_id} no existe"}
+
+    allowed = _STATES_HEADER_FULL
+    if order["state"] not in allowed:
+        return _state_error(order, allowed, "apply_global_discount")
+
+    # Validate against partner cap when type=percent.
+    if discount_type == "percent":
+        try:
+            partner_id = order["partner_id"][0] if isinstance(order.get("partner_id"), list) else order.get("partner_id")
+            if partner_id:
+                p = odoo_read(
+                    tenant_id, url, db, user, password,
+                    "res.partner", [partner_id], ["partner_max_sale_discount"],
+                )
+                if p:
+                    cap = p[0].get("partner_max_sale_discount") or 0
+                    if cap and discount_rate > cap:
+                        return {"success": False,
+                                "error_code": "discount_exceeds_partner_cap",
+                                "error_detail": (
+                                    f"Descuento {discount_rate}% supera el "
+                                    f"máximo del cliente ({cap}%)."
+                                ),
+                                "partner_max": cap}
+        except Exception as e:
+            logger.debug("partner cap lookup skipped: %s", e)
+
+    if not confirmed:
+        return {
+            "success": False,
+            "requires_confirmation": True,
+            "preview": {
+                "order_name": order["name"],
+                "current_subtotal": order.get("amount_untaxed"),
+                "discount_type": discount_type,
+                "discount_rate": discount_rate,
+            },
+            "action": "apply_global_discount",
+        }
+
+    try:
+        odoo_write(tenant_id, url, db, user, password,
+                   "sale.order", [order_id],
+                   {"discount_type": discount_type, "discount_rate": float(discount_rate)})
+        odoo_call_method(tenant_id, url, db, user, password,
+                         "sale.order", "calculate_discount", [order_id])
+    except Exception as e:
+        elapsed = int((time.time() - started) * 1000)
+        tb = traceback.format_exc()
+        logger.error("apply_global_discount failed order=%s err=%s\n%s", order_id, e, tb)
+        _log_call("apply_global_discount", tenant_id, log_args, None, str(e), elapsed)
+        return {"success": False, "error_code": "discount_failed", "error_detail": str(e)}
+
+    summary = _recompute_summary(tenant_id, url, db, user, password, order_id)
+    # Read the discount-related fields after the call.
+    after = _read_sale_order(
+        tenant_id, url, db, user, password, order_id,
+        ["amount_discount"],
+    ) or {}
+    result = {
+        "success": True,
+        "order_id": order_id,
+        "name": order["name"],
+        "discount_type": discount_type,
+        "discount_rate": discount_rate,
+        "amount_discount": after.get("amount_discount", 0),
+        "recomputed": summary,
+    }
+    _log_call("apply_global_discount", tenant_id, log_args, result, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
+# ---- 5) set_quotation_header ----------------------------------------------
+
+_HEADER_FIELDS = {
+    "date_order": str,
+    "validity_date": str,
+    "payment_term_id": int,
+    "pricelist_id": int,
+    "user_id": int,
+    "note": str,
+    "client_order_ref": str,
+    "invoice_date": str,
+}
+
+
+def odoo_set_quotation_header(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int,
+    *,
+    confirmed: bool = False,
+    **fields: Any,
+) -> dict:
+    """Update header fields on a sale.order.
+
+    Acepta kwargs con cualquiera de: date_order, validity_date,
+    payment_term_id, pricelist_id, user_id, note, client_order_ref,
+    invoice_date. Valida estado y devuelve diff + recompute.
+
+    NOTE: cambiar `pricelist_id` aquí NO recalcula precios de líneas
+    existentes — usá `change_quotation_customer(reprice_lines=True)`
+    si necesitas re-precificar al cambiar tarifa.
+    """
+    started = time.time()
+
+    # Filter known fields and drop any unrelated kwargs.
+    write_vals = {k: v for k, v in fields.items() if k in _HEADER_FIELDS and v is not None}
+    log_args = {"order_id": order_id, "fields": list(write_vals.keys()),
+                "confirmed": confirmed}
+
+    if not write_vals:
+        return {"success": False, "error_code": "no_changes",
+                "error_detail": (
+                    "No se especificaron campos válidos. Acepta: "
+                    + ", ".join(_HEADER_FIELDS.keys())
+                )}
+
+    order = _read_sale_order(
+        tenant_id, url, db, user, password, order_id,
+        ["id", "name", "state"] + list(_HEADER_FIELDS.keys()),
+    )
+    if not order:
+        return {"success": False, "error_code": "order_not_found",
+                "error_detail": f"sale.order {order_id} no existe"}
+
+    allowed = _STATES_HEADER_FULL
+    if order["state"] not in allowed:
+        return _state_error(order, allowed, "set_header")
+
+    old = {k: order.get(k) for k in write_vals.keys()}
+
+    if not confirmed:
+        return {
+            "success": False,
+            "requires_confirmation": True,
+            "preview": {
+                "order_name": order["name"],
+                "old": old,
+                "proposed": write_vals,
+            },
+            "action": "set_quotation_header",
+        }
+
+    try:
+        odoo_write(tenant_id, url, db, user, password,
+                   "sale.order", [order_id], write_vals)
+    except Exception as e:
+        elapsed = int((time.time() - started) * 1000)
+        tb = traceback.format_exc()
+        logger.error("set_quotation_header failed order=%s err=%s\n%s",
+                     order_id, e, tb)
+        _log_call("set_quotation_header", tenant_id, log_args, None, str(e), elapsed)
+        return {"success": False, "error_code": "write_failed",
+                "error_detail": str(e)}
+
+    summary = _recompute_summary(tenant_id, url, db, user, password, order_id)
+    result = {
+        "success": True,
+        "order_id": order_id,
+        "name": order["name"],
+        "old": old,
+        "new": write_vals,
+        "recomputed": summary,
+    }
+    _log_call("set_quotation_header", tenant_id, log_args, result, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
+# ---- 6) add_quotation_line (mejorado: una sola línea, sin batching) ------
+
+def odoo_add_quotation_line(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int,
+    product_id: int,
+    quantity: float = 1.0,
+    *,
+    price_unit: float | None = None,
+    discount: float | None = None,
+    name: str | None = None,
+    confirmed: bool = False,
+) -> dict:
+    """Agregar UNA sola línea a una cotización existente.
+
+    Mejor que ``add_to_quotation`` cuando solo es 1 producto — no hace
+    merge con líneas existentes (eso es un side-effect de batching que
+    confunde al LLM). Si quieres mergear, llama esta tool con qty
+    delta y luego `update_quotation_line` para consolidar; o usa
+    add_to_quotation con explicit merge.
+    """
+    started = time.time()
+    log_args = {"order_id": order_id, "product_id": product_id,
+                "quantity": quantity, "confirmed": confirmed}
+
+    order = _read_sale_order(
+        tenant_id, url, db, user, password, order_id,
+        ["id", "name", "state"],
+    )
+    if not order:
+        return {"success": False, "error_code": "order_not_found",
+                "error_detail": f"sale.order {order_id} no existe"}
+
+    if order["state"] not in _STATES_LINE_EDITABLE:
+        return _state_error(order, _STATES_LINE_EDITABLE, "add_line")
+
+    # Resolve template -> variant.
+    try:
+        variants = odoo_search(
+            tenant_id, url, db, user, password,
+            "product.product",
+            [["product_tmpl_id", "=", int(product_id)], ["active", "=", True]],
+            ["id", "uom_id", "name", "lst_price"], limit=1,
+        )
+    except Exception as e:
+        return {"success": False, "error_code": "variant_lookup_failed",
+                "error_detail": str(e)}
+    if not variants:
+        return {"success": False, "error_code": "template_no_variant",
+                "error_detail": f"product.template {product_id} sin variante activa"}
+
+    v = variants[0]
+    line_vals = {
+        "order_id": order_id,
+        "product_id": v["id"],
+        "product_uom_qty": float(quantity),
+        "product_uom": v["uom_id"][0] if isinstance(v.get("uom_id"), list) else v.get("uom_id") or 1,
+    }
+    if price_unit is not None:
+        line_vals["price_unit"] = float(price_unit)
+    if discount is not None:
+        line_vals["discount"] = float(discount)
+    if name is not None:
+        line_vals["name"] = name
+
+    if not confirmed:
+        return {
+            "success": False,
+            "requires_confirmation": True,
+            "preview": {
+                "order_name": order["name"],
+                "product_id": product_id,
+                "product_name": v.get("name"),
+                "default_price": v.get("lst_price"),
+                "proposed": line_vals,
+            },
+            "action": "add_quotation_line",
+        }
+
+    try:
+        new_line_id = odoo_create(
+            tenant_id, url, db, user, password,
+            "sale.order.line", line_vals,
+        )
+    except Exception as e:
+        elapsed = int((time.time() - started) * 1000)
+        tb = traceback.format_exc()
+        logger.error("add_quotation_line failed order=%s err=%s\n%s",
+                     order_id, e, tb)
+        _log_call("add_quotation_line", tenant_id, log_args, None, str(e), elapsed)
+        return {"success": False, "error_code": "create_failed",
+                "error_detail": str(e)}
+
+    summary = _recompute_summary(tenant_id, url, db, user, password, order_id)
+    result = {
+        "success": True,
+        "order_id": order_id,
+        "name": order["name"],
+        "new_line_id": new_line_id,
+        "recomputed": summary,
+    }
+    _log_call("add_quotation_line", tenant_id, log_args, result, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
+# ---- 7) recalculate_quotation ---------------------------------------------
+
+def odoo_recalculate_quotation(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int,
+) -> dict:
+    """Forzar recalcular totales (`action_recalculate`) — útil tras
+    cambios masivos cuando se sospecha que ``amount_total`` quedó
+    desincronizado del subtotal de líneas."""
+    started = time.time()
+    order = _read_sale_order(
+        tenant_id, url, db, user, password, order_id,
+        ["id", "name", "state"],
+    )
+    if not order:
+        return {"success": False, "error_code": "order_not_found",
+                "error_detail": f"sale.order {order_id} no existe"}
+
+    try:
+        odoo_call_method(
+            tenant_id, url, db, user, password,
+            "sale.order", "action_recalculate", [order_id],
+        )
+    except Exception as e:
+        elapsed = int((time.time() - started) * 1000)
+        logger.error("recalculate_quotation failed order=%s err=%s", order_id, e)
+        _log_call("recalculate_quotation", tenant_id, {"order_id": order_id},
+                  None, str(e), elapsed)
+        # Fallback: read+write triggers _amount_all if action_recalculate
+        # is not exposed on this Odoo build.
+        try:
+            odoo_write(tenant_id, url, db, user, password,
+                       "sale.order", [order_id], {})
+        except Exception as e2:
+            return {"success": False, "error_code": "recalc_failed",
+                    "error_detail": f"{e}; fallback: {e2}"}
+
+    summary = _recompute_summary(tenant_id, url, db, user, password, order_id)
+    return {"success": True, "order_id": order_id,
+            "name": order["name"], "recomputed": summary}
+
+
+# ---- 8) get_quotation_state_summary ---------------------------------------
+
+def odoo_get_quotation_state_summary(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int,
+) -> dict:
+    """Devolver un resumen del estado para que el LLM razone antes de
+    modificar: estado, totales, lineas con flags de editabilidad,
+    facturas vinculadas, pickings."""
+    started = time.time()
+    fields = [
+        "id", "name", "state", "amount_untaxed", "amount_tax", "amount_total",
+        "partner_id", "user_id", "date_order", "validity_date",
+        "invoice_ids", "picking_ids",
+    ]
+    # Tecnosmart custom — read defensively (some fields may not exist).
+    custom = ["state_ec", "collection_state", "estado_despacho", "amount_discount",
+              "discount_type", "discount_rate", "is_cash_sale"]
+    try:
+        order = (odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id], fields + custom,
+        ) or [None])[0]
+    except Exception:
+        order = (odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id], fields,
+        ) or [None])[0]
+    if not order:
+        return {"success": False, "error_code": "order_not_found",
+                "error_detail": f"sale.order {order_id} no existe"}
+
+    # Lines.
+    line_rows: list = []
+    try:
+        line_rows = odoo_search(
+            tenant_id, url, db, user, password,
+            "sale.order.line",
+            [["order_id", "=", order_id]],
+            ["id", "product_id", "name", "product_uom_qty", "price_unit",
+             "discount", "price_subtotal", "price_total", "qty_invoiced",
+             "qty_delivered", "product_updatable"],
+        ) or []
+    except Exception as e:
+        logger.warning("state_summary lines read failed: %s", e)
+
+    state = order.get("state") or ""
+    is_locked = state in ("done", "cancel")
+    can_edit_header = state in _STATES_HEADER_FULL
+    can_edit_lines = state in _STATES_LINE_EDITABLE
+    can_hard_delete_lines = state in _STATES_LINE_HARD_DELETE
+
+    invoices = order.get("invoice_ids") or []
+    pickings = order.get("picking_ids") or []
+
+    result = {
+        "success": True,
+        "order_id": order["id"],
+        "name": order.get("name"),
+        "state": state,
+        "state_ec": order.get("state_ec"),
+        "collection_state": order.get("collection_state"),
+        "estado_despacho": order.get("estado_despacho"),
+        "is_cash_sale": order.get("is_cash_sale"),
+        "amount_untaxed": order.get("amount_untaxed"),
+        "amount_tax": order.get("amount_tax"),
+        "amount_total": order.get("amount_total"),
+        "amount_discount": order.get("amount_discount"),
+        "discount_type": order.get("discount_type"),
+        "discount_rate": order.get("discount_rate"),
+        "partner_id": order.get("partner_id"),
+        "user_id": order.get("user_id"),
+        "date_order": order.get("date_order"),
+        "validity_date": order.get("validity_date"),
+        "lines_count": len(line_rows),
+        "lines": [
+            {
+                "line_id": ln["id"],
+                "product_id": ln.get("product_id"),
+                "name": ln.get("name"),
+                "qty": ln.get("product_uom_qty"),
+                "qty_invoiced": ln.get("qty_invoiced", 0),
+                "qty_delivered": ln.get("qty_delivered", 0),
+                "price_unit": ln.get("price_unit"),
+                "discount": ln.get("discount"),
+                "subtotal": ln.get("price_subtotal"),
+                "total": ln.get("price_total"),
+                "product_updatable": ln.get("product_updatable", True),
+            } for ln in line_rows
+        ],
+        "invoices_count": len(invoices),
+        "invoice_ids": list(invoices),
+        "pickings_count": len(pickings),
+        "picking_ids": list(pickings),
+        "permissions": {
+            "can_edit_header": can_edit_header,
+            "can_edit_lines": can_edit_lines,
+            "can_hard_delete_lines": can_hard_delete_lines,
+            "is_locked": is_locked,
+        },
+    }
+    _log_call("get_quotation_state_summary", tenant_id, {"order_id": order_id},
+              {"lines": len(line_rows)}, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
+# ---- 9) transition_quotation ----------------------------------------------
+
+# Mapping de acción → (método Odoo, estados de origen permitidos).
+# Algunos métodos son custom de Tecnosmart (l10n_ec_sri).
+_TRANSITIONS = {
+    "confirm": ("action_confirm", {"draft", "sent", "approved"}),
+    "cancel": ("action_cancel", {"draft", "sent", "sale", "approved", "waiting_approval"}),
+    "draft": ("action_draft", {"sent", "cancel", "approved"}),
+    "approve": ("approve_transfer", {"waiting_approval"}),
+    "reject": ("reject_transfer", {"waiting_approval"}),
+    "done": ("action_done", {"sale"}),
+    "unlock": ("action_unlock", {"done"}),
+    "generar_despacho": ("action_generar_despacho", {"sale", "approved"}),
+    "generar_factura": ("action_generar_factura", {"sale", "approved"}),
+    "procesar_venta": ("action_procesar_venta_vendedor", {"approved"}),
+    "aprobar": ("action_aprobar", {"draft", "sent", "approved"}),
+}
+
+
+def odoo_transition_quotation(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int,
+    action: str,
+    *,
+    confirmed: bool = False,
+) -> dict:
+    """Disparar una transición de estado en la sale.order.
+
+    ``action`` ∈ confirm/cancel/draft/approve/reject/done/unlock/
+    generar_despacho/generar_factura/procesar_venta/aprobar.
+    Operaciones IRREVERSIBLES requieren confirmed=True explícito;
+    las consultas (es decir, ninguna aquí) no aplican.
+    """
+    started = time.time()
+    log_args = {"order_id": order_id, "action": action, "confirmed": confirmed}
+
+    if action not in _TRANSITIONS:
+        return {"success": False, "error_code": "invalid_action",
+                "error_detail": (
+                    f"action debe estar en {sorted(_TRANSITIONS.keys())}, "
+                    f"recibido: {action!r}"
+                )}
+
+    method, allowed = _TRANSITIONS[action]
+
+    order = _read_sale_order(
+        tenant_id, url, db, user, password, order_id,
+        ["id", "name", "state"],
+    )
+    if not order:
+        return {"success": False, "error_code": "order_not_found",
+                "error_detail": f"sale.order {order_id} no existe"}
+
+    if order["state"] not in allowed:
+        return _state_error(order, allowed, action)
+
+    if not confirmed:
+        return {
+            "success": False,
+            "requires_confirmation": True,
+            "preview": {
+                "order_name": order["name"],
+                "action": action,
+                "method": method,
+                "current_state": order["state"],
+                "allowed_origin_states": sorted(allowed),
+                "warning": (
+                    "Esta operación es IRREVERSIBLE en algunos casos "
+                    "(confirm/done/cancel). Confirma con el usuario antes."
+                ),
+            },
+            "action": "transition_quotation",
+        }
+
+    try:
+        odoo_call_method(
+            tenant_id, url, db, user, password,
+            "sale.order", method, [order_id],
+        )
+    except Exception as e:
+        elapsed = int((time.time() - started) * 1000)
+        tb = traceback.format_exc()
+        logger.error("transition_quotation failed order=%s action=%s err=%s\n%s",
+                     order_id, action, e, tb)
+        _log_call("transition_quotation", tenant_id, log_args, None, str(e), elapsed)
+        return {"success": False, "error_code": "transition_failed",
+                "error_detail": str(e), "action": action}
+
+    after = _read_sale_order(
+        tenant_id, url, db, user, password, order_id,
+        ["id", "name", "state"],
+    ) or {}
+    summary = _recompute_summary(tenant_id, url, db, user, password, order_id)
+    result = {
+        "success": True,
+        "order_id": order_id,
+        "name": order["name"],
+        "action": action,
+        "from_state": order["state"],
+        "to_state": after.get("state"),
+        "recomputed": summary,
+    }
+    _log_call("transition_quotation", tenant_id, log_args, result, None,
+              int((time.time() - started) * 1000))
+    return result

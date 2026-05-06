@@ -780,6 +780,192 @@ MCP_TOOLS = [
             "required": ["order_id"],
         },
     },
+    # ----- Sprint C: edition tools -------------------------------------
+    {
+        "name": "update_quotation_line",
+        "description": (
+            "Modificar UNA linea existente de la cotizacion: cambiar cantidad, precio unitario, "
+            "descuento, descripcion o producto. Usa esto cuando el cliente diga 'cambia la cantidad', "
+            "'pon X unidades', 'cambia el precio', 'aplica X% descuento a la linea'. "
+            "Para 'agrega 2 mas' (delta) usa add_to_quotation/add_quotation_line; esta tool REEMPLAZA. "
+            "FLUJO OBLIGATORIO: confirmed=false primero (preview), confirmed=true tras confirmacion."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "line_id": {"type": "integer", "description": "ID de la sale.order.line — sale en get_quotation/get_quotation_state_summary"},
+                "quantity": {"type": "number", "description": "Nueva cantidad TOTAL (no delta). Si quieres eliminar la linea, usa remove_quotation_line."},
+                "price_unit": {"type": "number", "description": "Nuevo precio unitario (sobreescribe el del producto)."},
+                "discount": {"type": "number", "description": "Descuento porcentual de la linea (0-100). Limitado por partner_max_sale_discount."},
+                "name": {"type": "string", "description": "Nueva descripcion de la linea."},
+                "product_id": {"type": "integer", "description": "Cambiar el producto (template_id). Operacion intrusiva."},
+                "confirmed": {"type": "boolean", "default": False},
+            },
+            "required": ["line_id"],
+        },
+    },
+    {
+        "name": "remove_quotation_line",
+        "description": (
+            "Eliminar una linea de la cotizacion. En estado draft/sent hace unlink real; en sale "
+            "cae automaticamente a qty=0 (porque l10n_ec_sri bloquea unlink si la orden tiene "
+            "factura). Para 'cambiar a 0 unidades' que conserve la linea, usa update_quotation_line "
+            "con quantity=0. FLUJO OBLIGATORIO: confirmed=false (preview), confirmed=true (ejecuta)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "line_id": {"type": "integer", "description": "ID de la linea a eliminar"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "unlink", "qty_zero"],
+                    "default": "auto",
+                    "description": "auto: unlink en draft/sent, qty=0 en sale. unlink: forzar unlink (puede fallar). qty_zero: solo setear qty=0 sin borrar.",
+                },
+                "confirmed": {"type": "boolean", "default": False},
+            },
+            "required": ["line_id"],
+        },
+    },
+    {
+        "name": "change_quotation_customer",
+        "description": (
+            "Reasignar el cliente (partner_id) de una cotizacion en borrador. Propaga "
+            "automaticamente pricelist_id, payment_term_id y direcciones del nuevo partner. "
+            "Solo en estados draft/sent (NO en sale/done — ahi rompe la contabilidad). "
+            "FLUJO OBLIGATORIO: confirmed=false primero, confirmed=true despues."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "integer"},
+                "partner_id": {"type": "integer", "description": "ID del nuevo cliente"},
+                "propagate_pricelist": {"type": "boolean", "default": True, "description": "Aplicar la tarifa default del nuevo partner."},
+                "propagate_payment_term": {"type": "boolean", "default": True},
+                "propagate_addresses": {"type": "boolean", "default": True, "description": "Recalcular partner_invoice_id y partner_shipping_id."},
+                "reprice_lines": {"type": "boolean", "default": False, "description": "Recalcular price_unit de cada linea con la nueva tarifa."},
+                "confirmed": {"type": "boolean", "default": False},
+            },
+            "required": ["order_id", "partner_id"],
+        },
+    },
+    {
+        "name": "apply_global_discount",
+        "description": (
+            "Aplicar un descuento a TODA la cotizacion (no a una linea individual). El descuento "
+            "se propaga a cada linea via sale.order.calculate_discount(). Tipos: 'percent' (porcentaje "
+            "parejo), 'amount' (monto fijo distribuido), 'cost' (margen sobre costo). Limitado por "
+            "partner_max_sale_discount. Estados validos: draft/sent/waiting_approval/approved."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "integer"},
+                "discount_type": {"type": "string", "enum": ["percent", "amount", "cost"]},
+                "discount_rate": {"type": "number", "description": "Para percent: 0-100. Para amount: USD a descontar. Para cost: % de margen sobre costo."},
+                "confirmed": {"type": "boolean", "default": False},
+            },
+            "required": ["order_id", "discount_type", "discount_rate"],
+        },
+    },
+    {
+        "name": "set_quotation_header",
+        "description": (
+            "Actualizar campos de cabecera de la cotizacion: fecha, validez, vendedor, tarifa, "
+            "termino de pago, nota, referencia del cliente. NO toca lineas; cambiar pricelist aqui "
+            "no recalcula precios existentes (usa change_quotation_customer con reprice_lines=true)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "integer"},
+                "date_order": {"type": "string", "description": "Formato 'YYYY-MM-DD HH:MM:SS'"},
+                "validity_date": {"type": "string", "description": "Formato 'YYYY-MM-DD'"},
+                "payment_term_id": {"type": "integer"},
+                "pricelist_id": {"type": "integer"},
+                "user_id": {"type": "integer", "description": "ID del vendedor"},
+                "note": {"type": "string"},
+                "client_order_ref": {"type": "string", "description": "Referencia del cliente"},
+                "invoice_date": {"type": "string"},
+                "confirmed": {"type": "boolean", "default": False},
+            },
+            "required": ["order_id"],
+        },
+    },
+    {
+        "name": "add_quotation_line",
+        "description": (
+            "Agregar UNA sola linea a la cotizacion. Mas simple que add_to_quotation cuando es 1 "
+            "producto — no hace merge automatico con lineas existentes. Si quieres SUMAR a una linea "
+            "existente, usa update_quotation_line con la nueva qty TOTAL."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "integer"},
+                "product_id": {"type": "integer", "description": "template_id del producto"},
+                "quantity": {"type": "number", "default": 1},
+                "price_unit": {"type": "number", "description": "Override del precio default"},
+                "discount": {"type": "number", "description": "Descuento porcentual de la linea"},
+                "name": {"type": "string"},
+                "confirmed": {"type": "boolean", "default": False},
+            },
+            "required": ["order_id", "product_id"],
+        },
+    },
+    {
+        "name": "recalculate_quotation",
+        "description": (
+            "Forzar el recalculo de totales (action_recalculate). Util cuando se sospecha que el "
+            "amount_total quedo desincronizado tras cambios masivos."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "integer"},
+            },
+            "required": ["order_id"],
+        },
+    },
+    {
+        "name": "get_quotation_state_summary",
+        "description": (
+            "Devolver un resumen completo del estado de la cotizacion para razonar antes de "
+            "modificarla: state, totales, lineas con line_id + qty + qty_invoiced + qty_delivered + "
+            "product_updatable, facturas vinculadas, pickings. Usalo SIEMPRE antes de "
+            "update_quotation_line / remove_quotation_line — necesitas los line_id."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "integer"},
+            },
+            "required": ["order_id"],
+        },
+    },
+    {
+        "name": "transition_quotation",
+        "description": (
+            "Disparar una transicion de estado en la cotizacion. Acciones validas: confirm, cancel, "
+            "draft, approve, reject, done, unlock, generar_despacho, generar_factura, "
+            "procesar_venta, aprobar. ACCIONES POTENCIALMENTE IRREVERSIBLES — confirma con el "
+            "usuario antes."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "integer"},
+                "action": {
+                    "type": "string",
+                    "enum": ["confirm", "cancel", "draft", "approve", "reject",
+                             "done", "unlock", "generar_despacho",
+                             "generar_factura", "procesar_venta", "aprobar"],
+                },
+                "confirmed": {"type": "boolean", "default": False},
+            },
+            "required": ["order_id", "action"],
+        },
+    },
     {
         "name": "sri_import",
         "description": "Importar factura de compra del SRI usando la clave de acceso de 49 digitos. Usa esto cuando alguien envie un numero de 49 digitos.",
@@ -1300,6 +1486,108 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             args["order_id"],
             confirmed=bool(args.get("confirmed", False)),
             session_active_quotation_id=session_active_quotation_id,
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    # --- Sprint C: edition tools (full sale.order coverage) ---
+
+    if tool_name == "update_quotation_line":
+        from mcp_odoo.tools.sales import odoo_update_quotation_line
+        result = odoo_update_quotation_line(
+            *creds,
+            args["line_id"],
+            quantity=args.get("quantity"),
+            price_unit=args.get("price_unit"),
+            discount=args.get("discount"),
+            name=args.get("name"),
+            product_id=args.get("product_id"),
+            confirmed=bool(args.get("confirmed", False)),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "remove_quotation_line":
+        from mcp_odoo.tools.sales import odoo_remove_quotation_line
+        result = odoo_remove_quotation_line(
+            *creds,
+            args["line_id"],
+            mode=args.get("mode", "auto"),
+            confirmed=bool(args.get("confirmed", False)),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "change_quotation_customer":
+        from mcp_odoo.tools.sales import odoo_change_quotation_customer
+        result = odoo_change_quotation_customer(
+            *creds,
+            args["order_id"],
+            args["partner_id"],
+            propagate_pricelist=bool(args.get("propagate_pricelist", True)),
+            propagate_payment_term=bool(args.get("propagate_payment_term", True)),
+            propagate_addresses=bool(args.get("propagate_addresses", True)),
+            reprice_lines=bool(args.get("reprice_lines", False)),
+            confirmed=bool(args.get("confirmed", False)),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "apply_global_discount":
+        from mcp_odoo.tools.sales import odoo_apply_global_discount
+        result = odoo_apply_global_discount(
+            *creds,
+            args["order_id"],
+            args["discount_type"],
+            float(args["discount_rate"]),
+            confirmed=bool(args.get("confirmed", False)),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "set_quotation_header":
+        from mcp_odoo.tools.sales import odoo_set_quotation_header
+        # Forward only known header fields, drop everything else.
+        header_fields = (
+            "date_order", "validity_date", "payment_term_id",
+            "pricelist_id", "user_id", "note", "client_order_ref",
+            "invoice_date",
+        )
+        kw = {k: args[k] for k in header_fields if k in args and args[k] is not None}
+        result = odoo_set_quotation_header(
+            *creds,
+            args["order_id"],
+            confirmed=bool(args.get("confirmed", False)),
+            **kw,
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "add_quotation_line":
+        from mcp_odoo.tools.sales import odoo_add_quotation_line
+        result = odoo_add_quotation_line(
+            *creds,
+            args["order_id"],
+            args["product_id"],
+            float(args.get("quantity", 1)),
+            price_unit=args.get("price_unit"),
+            discount=args.get("discount"),
+            name=args.get("name"),
+            confirmed=bool(args.get("confirmed", False)),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "recalculate_quotation":
+        from mcp_odoo.tools.sales import odoo_recalculate_quotation
+        result = odoo_recalculate_quotation(*creds, args["order_id"])
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "get_quotation_state_summary":
+        from mcp_odoo.tools.sales import odoo_get_quotation_state_summary
+        result = odoo_get_quotation_state_summary(*creds, args["order_id"])
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "transition_quotation":
+        from mcp_odoo.tools.sales import odoo_transition_quotation
+        result = odoo_transition_quotation(
+            *creds,
+            args["order_id"],
+            args["action"],
+            confirmed=bool(args.get("confirmed", False)),
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
