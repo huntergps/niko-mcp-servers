@@ -3095,17 +3095,43 @@ async def _rag_search_partners(query: str, top_k: int = 5, tenant_id: str = "") 
         )
 
     lines = []
+    partners_struct: list[dict] = []
     for r in results:
-        meta = r.get("metadata", {})
+        meta = r.get("metadata", {}) if isinstance(r.get("metadata"), dict) else {}
         partner_type = meta.get("type", "contacto")
         score = r.get("score", 0)
+        # `odoo_id` is the res.partner.id in Odoo — REQUIRED by the
+        # mutation tools (create_quotation, etc.) as `partner_id`. Surface
+        # it both inline (in the human-readable line) and structured
+        # (in the partners array) so the LLM doesn't need a second tool
+        # call (identify_customer) just to translate VAT → partner_id.
+        odoo_id = r.get("odoo_id") or meta.get("odoo_id")
+        name = meta.get("name") or r.get("name") or "?"
+        vat = meta.get("vat") or r.get("vat", "")
+        city = meta.get("city", "")
+        email = meta.get("email", "")
+        phone = meta.get("phone", "")
+        prefix = f"[partner_id={odoo_id}] " if odoo_id else ""
         lines.append(
-            f"- {meta.get('name', r.get('name', '?'))} | {meta.get('vat', r.get('vat', ''))} | "
-            f"{meta.get('city', '')} | {meta.get('email', '')} | "
-            f"Tel: {meta.get('phone', '')} | Tipo: {partner_type} (score: {score:.2f})"
+            f"- {prefix}{name} | {vat} | {city} | {email} | "
+            f"Tel: {phone} | Tipo: {partner_type} (score: {score:.2f})"
         )
+        partners_struct.append({
+            "partner_id": odoo_id,
+            "name": name,
+            "vat": vat,
+            "city": city,
+            "email": email,
+            "phone": phone,
+            "type": partner_type,
+            "score": score,
+        })
     summary = f"Encontre {len(results)} contactos:\n" + "\n".join(lines)
     return _json_partners.dumps(
-        {"display_type": "list_data", "results": summary},
+        {
+            "display_type": "list_data",
+            "results": summary,
+            "partners": partners_struct,
+        },
         ensure_ascii=False,
     )
