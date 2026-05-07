@@ -3088,6 +3088,612 @@ def odoo_get_my_sales_summary(
 
 
 # ---------------------------------------------------------------------------
+# Tool: get_stock_by_warehouse
+# ---------------------------------------------------------------------------
+
+def odoo_get_stock_by_warehouse(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    template_id: int | None = None,
+    product_code: str | None = None,
+) -> dict:
+    """Stock disponible de un producto agrupado por bodega + entradas esperadas.
+
+    Devuelve cuanto stock libre/reservado hay en cada bodega interna y las
+    entradas esperadas (purchase.order.line con qty_received < product_qty).
+
+    Args:
+        template_id: ID de product.template (preferido).
+        product_code: default_code para resolver template_id (alternativa).
+
+    Returns {success, template_id, product_code, product_name, total_available,
+             total_reserved, total_free, by_warehouse:[...], incoming_expected:[...]}
+    """
+    started = time.time()
+    log_args = {"template_id": template_id, "product_code": product_code}
+
+    # 1. Resolver template_id si solo se paso product_code
+    if not template_id and not product_code:
+        err = "Debes pasar template_id o product_code"
+        _log_call("get_stock_by_warehouse", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "missing_args", "error_detail": err}
+
+    product_name = ""
+    resolved_code = product_code or ""
+    if not template_id:
+        try:
+            tmpls = odoo_search(
+                tenant_id, url, db, user, password,
+                "product.template",
+                [["default_code", "=ilike", product_code.strip()]],
+                ["id", "name", "default_code"],
+                limit=1,
+            )
+            if not tmpls:
+                tmpls = odoo_search(
+                    tenant_id, url, db, user, password,
+                    "product.template",
+                    [["default_code", "ilike", product_code.strip()]],
+                    ["id", "name", "default_code"],
+                    limit=1,
+                )
+        except Exception as e:
+            err = f"Error buscando product.template por code={product_code!r}: {e}"
+            _log_call("get_stock_by_warehouse", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "template_search_failed",
+                    "error_detail": err}
+        if not tmpls:
+            err = f"No existe producto con default_code={product_code!r}"
+            _log_call("get_stock_by_warehouse", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "product_not_found",
+                    "error_detail": err, "product_code": product_code}
+        template_id = tmpls[0]["id"]
+        product_name = tmpls[0].get("name", "")
+        resolved_code = tmpls[0].get("default_code") or product_code or ""
+    else:
+        # Cargar nombre + code para devolverlo en respuesta
+        try:
+            tmpls = odoo_read(
+                tenant_id, url, db, user, password,
+                "product.template", [template_id],
+                ["name", "default_code"],
+            )
+            if tmpls:
+                product_name = tmpls[0].get("name", "")
+                resolved_code = tmpls[0].get("default_code") or ""
+        except Exception:
+            pass
+
+    # 2. Stock por ubicacion interna (stock.quant)
+    try:
+        quants = odoo_search(
+            tenant_id, url, db, user, password,
+            "stock.quant",
+            [["product_id.product_tmpl_id", "=", template_id],
+             ["location_id.usage", "=", "internal"]],
+            ["product_id", "location_id", "quantity", "reserved_quantity"],
+            limit=200,
+        )
+    except Exception as e:
+        err = f"Error leyendo stock.quant template={template_id}: {e}"
+        _log_call("get_stock_by_warehouse", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "quants_search_failed",
+                "error_detail": err, "template_id": template_id}
+
+    # 3. Bodegas para mapear location_id → warehouse name
+    try:
+        warehouses = odoo_search(
+            tenant_id, url, db, user, password,
+            "stock.warehouse", [],
+            ["name", "lot_stock_id", "code", "view_location_id"],
+            limit=50,
+        )
+    except Exception as e:
+        err = f"Error leyendo stock.warehouse: {e}"
+        _log_call("get_stock_by_warehouse", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "warehouse_search_failed",
+                "error_detail": err}
+
+    # Mapa lot_stock_id → warehouse name
+    location_to_wh: dict[int, str] = {}
+    for w in warehouses or []:
+        ls = w.get("lot_stock_id")
+        if isinstance(ls, list) and ls:
+            location_to_wh[ls[0]] = w.get("name", "")
+
+    # Para ubicaciones internas que no son el lot_stock_id directo, leer la
+    # ubicacion para mapear via location.warehouse_id si existe.
+    location_ids = list({
+        q["location_id"][0]
+        for q in (quants or [])
+        if isinstance(q.get("location_id"), list)
+    })
+    location_to_wh_full: dict[int, str] = dict(location_to_wh)
+    if location_ids:
+        try:
+            locations = odoo_read(
+                tenant_id, url, db, user, password,
+                "stock.location", location_ids,
+                ["name", "warehouse_id", "complete_name"],
+            )
+            for loc in locations or []:
+                lid = loc.get("id")
+                if lid in location_to_wh_full:
+                    continue
+                wh = loc.get("warehouse_id")
+                if isinstance(wh, list) and wh:
+                    location_to_wh_full[lid] = wh[1]
+                else:
+                    cname = loc.get("complete_name") or loc.get("name") or ""
+                    location_to_wh_full[lid] = cname.split("/")[0] if cname else "Sin bodega"
+        except Exception as e:
+            logger.warning("get_stock_by_warehouse: error leyendo stock.location: %s", e)
+
+    # 4. Agregar por bodega
+    by_warehouse_map: dict[str, dict[str, float]] = {}
+    total_available = 0.0
+    total_reserved = 0.0
+    for q in quants or []:
+        loc_field = q.get("location_id")
+        loc_id = loc_field[0] if isinstance(loc_field, list) else None
+        wh_name = location_to_wh_full.get(loc_id) or (
+            loc_field[1] if isinstance(loc_field, list) else "Sin bodega"
+        )
+        qty = float(q.get("quantity", 0) or 0)
+        reserved = float(q.get("reserved_quantity", 0) or 0)
+        total_available += qty
+        total_reserved += reserved
+        bucket = by_warehouse_map.setdefault(
+            wh_name, {"available": 0.0, "reserved": 0.0}
+        )
+        bucket["available"] += qty
+        bucket["reserved"] += reserved
+
+    by_warehouse = []
+    for wh_name, vals in sorted(by_warehouse_map.items(), key=lambda x: -x[1]["available"]):
+        avail = round(vals["available"], 2)
+        res = round(vals["reserved"], 2)
+        by_warehouse.append({
+            "warehouse": wh_name,
+            "available": avail,
+            "reserved": res,
+            "free": round(avail - res, 2),
+        })
+
+    # 5. Entradas esperadas (purchase.order.line)
+    incoming = []
+    try:
+        po_lines = odoo_search(
+            tenant_id, url, db, user, password,
+            "purchase.order.line",
+            [["product_id.product_tmpl_id", "=", template_id],
+             ["order_id.state", "in", ["purchase", "done"]],
+             ["qty_received", "<", "product_qty"]],
+            ["product_id", "product_qty", "qty_received", "date_planned",
+             "order_id", "price_unit"],
+            limit=10,
+            order="date_planned asc",
+        )
+        for ln in po_lines or []:
+            order_field = ln.get("order_id")
+            po_name = (
+                order_field[1] if isinstance(order_field, list) else str(order_field or "")
+            )
+            qty_ord = float(ln.get("product_qty", 0) or 0)
+            qty_rec = float(ln.get("qty_received", 0) or 0)
+            incoming.append({
+                "po_name": po_name,
+                "qty_ordered": qty_ord,
+                "qty_received": qty_rec,
+                "qty_pending": round(qty_ord - qty_rec, 2),
+                "expected_date": (ln.get("date_planned") or "")[:10],
+                "unit_cost": float(ln.get("price_unit", 0) or 0),
+            })
+    except Exception as e:
+        # No bloquea — si falla la consulta de PO, devolvemos stock sin entradas
+        logger.warning("get_stock_by_warehouse: purchase.order.line failed: %s", e)
+
+    total_available = round(total_available, 2)
+    total_reserved = round(total_reserved, 2)
+    result = {
+        "success": True,
+        "template_id": template_id,
+        "product_code": resolved_code,
+        "product_name": product_name,
+        "total_available": total_available,
+        "total_reserved": total_reserved,
+        "total_free": round(total_available - total_reserved, 2),
+        "by_warehouse": by_warehouse,
+        "incoming_expected": incoming,
+    }
+    _log_call("get_stock_by_warehouse", tenant_id, log_args,
+              {"template_id": template_id, "warehouses": len(by_warehouse),
+               "incoming": len(incoming)},
+              None, int((time.time() - started) * 1000))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_pending_quotations
+# ---------------------------------------------------------------------------
+
+def odoo_get_pending_quotations(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    days_old: int = 7,
+    include_expired: bool = True,
+) -> dict:
+    """Cotizaciones enviadas (state=sent) sin respuesta del vendedor logueado.
+
+    Util para seguimiento: lista cotizaciones donde el vendedor ya envio la
+    proforma al cliente pero el cliente no la ha confirmado, con categorizacion
+    por estado de validez (expirada / por_vencer / vigente).
+
+    Args:
+        days_old: filtrar cotizaciones enviadas hace mas de N dias (default 7).
+        include_expired: incluir cotizaciones cuya validity_date ya paso.
+
+    Returns {success, total, expired, expiring_soon, active, quotations:[...]}
+    """
+    from datetime import date as _date, timedelta as _td
+
+    started = time.time()
+    log_args = {"days_old": days_old, "include_expired": include_expired}
+
+    today = _date.today()
+    cutoff = (today - _td(days=int(days_old or 0))).isoformat()
+    soon_threshold = (today + _td(days=3)).isoformat()
+    today_iso = today.isoformat()
+
+    # Autenticar para obtener uid del vendedor logueado
+    try:
+        import xmlrpc.client as _xrc
+        common = _xrc.ServerProxy(f"{url.rstrip('/')}/xmlrpc/2/common")
+        uid = common.authenticate(db, user, password, {})
+        if not uid:
+            err = "Autenticacion fallida: no se pudo obtener uid del vendedor"
+            _log_call("get_pending_quotations", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "auth_failed", "error_detail": err}
+    except Exception as e:
+        err = f"Error autenticando para obtener uid: {e}"
+        _log_call("get_pending_quotations", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "auth_error", "error_detail": err}
+
+    domain = [
+        ["user_id", "=", uid],
+        ["state", "=", "sent"],
+        ["date_order", "<=", cutoff + " 23:59:59"],
+    ]
+
+    try:
+        orders = odoo_search(
+            tenant_id, url, db, user, password,
+            "sale.order", domain,
+            ["name", "date_order", "validity_date", "amount_total",
+             "partner_id", "state"],
+            limit=100,
+            order="date_order asc",
+        )
+    except Exception as e:
+        err = f"Error listando cotizaciones pendientes: {e}"
+        _log_call("get_pending_quotations", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "search_failed", "error_detail": err}
+
+    quotations = []
+    expired_count = 0
+    expiring_soon_count = 0
+    active_count = 0
+    for o in orders or []:
+        vdate = (o.get("validity_date") or "")[:10]
+        if vdate and vdate < today_iso:
+            category = "expirada"
+            expired_count += 1
+            if not include_expired:
+                continue
+        elif vdate and vdate < soon_threshold:
+            category = "por_vencer"
+            expiring_soon_count += 1
+        else:
+            category = "vigente"
+            active_count += 1
+
+        date_sent = (o.get("date_order") or "")[:10]
+        try:
+            d_sent = _date.fromisoformat(date_sent) if date_sent else today
+            days_pending = (today - d_sent).days
+        except Exception:
+            days_pending = 0
+
+        partner = o.get("partner_id")
+        partner_name = (
+            partner[1] if isinstance(partner, list) else str(partner or "")
+        )
+        quotations.append({
+            "order_id": o.get("id"),
+            "name": o.get("name", ""),
+            "date_sent": date_sent,
+            "validity_date": vdate,
+            "days_pending": days_pending,
+            "amount_total": float(o.get("amount_total", 0) or 0),
+            "partner": partner_name,
+            "status": category,
+        })
+
+    result = {
+        "success": True,
+        "total": len(quotations),
+        "expired": expired_count,
+        "expiring_soon": expiring_soon_count,
+        "active": active_count,
+        "quotations": quotations,
+    }
+    _log_call("get_pending_quotations", tenant_id, log_args,
+              {"total": len(quotations), "expired": expired_count},
+              None, int((time.time() - started) * 1000))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool: duplicate_quotation
+# ---------------------------------------------------------------------------
+
+def odoo_duplicate_quotation(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int | None = None,
+    order_name: str | None = None,
+) -> dict:
+    """Duplicar una cotizacion existente como nuevo borrador.
+
+    Util cuando el cliente quiere repetir un pedido similar — clona la cabecera
+    y todas las lineas como sale.order en estado draft. La nueva cotizacion
+    puede modificarse antes de enviarse.
+
+    Args:
+        order_id: ID de la cotizacion a duplicar (preferido).
+        order_name: name humano (ej. 'VENTA122196'); se resuelve a order_id.
+
+    Returns {success, source_order_id, source_order_name, new_order_id,
+             new_order_name, partner, amount_total, state, message}
+    """
+    started = time.time()
+    log_args = {"order_id": order_id, "order_name": order_name}
+
+    if not order_id and not order_name:
+        err = "Debes pasar order_id o order_name"
+        _log_call("duplicate_quotation", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "missing_args", "error_detail": err}
+
+    # Resolver order_name → order_id si hace falta
+    if not order_id:
+        resolved = odoo_find_quotation_by_name(
+            tenant_id, url, db, user, password, order_name,
+        )
+        if not resolved.get("success"):
+            _log_call("duplicate_quotation", tenant_id, log_args, None,
+                      resolved.get("error_detail", "name resolution failed"),
+                      int((time.time() - started) * 1000))
+            return resolved
+        order_id = resolved["order_id"]
+
+    # Verificar que la cotizacion existe
+    try:
+        source = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id],
+            ["name", "state", "partner_id", "amount_total", "order_line"],
+        )
+    except Exception as e:
+        err = f"Error leyendo sale.order {order_id}: {e}"
+        _log_call("duplicate_quotation", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "source_read_failed",
+                "error_detail": err, "order_id": order_id}
+
+    if not source:
+        err = f"No existe sale.order id={order_id}"
+        _log_call("duplicate_quotation", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "order_not_found",
+                "error_detail": err, "order_id": order_id}
+
+    src = source[0]
+    source_name = src.get("name", "")
+
+    # Duplicar via copy()
+    try:
+        new_id = odoo_call_method(
+            tenant_id, url, db, user, password,
+            "sale.order", "copy",
+            [order_id], args=[{}],
+        )
+    except Exception as e:
+        err = f"Error duplicando sale.order {order_id}: {e}"
+        _log_call("duplicate_quotation", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "copy_failed",
+                "error_detail": err, "order_id": order_id}
+
+    # Algunas versiones devuelven [new_id], otras int directo
+    if isinstance(new_id, list):
+        new_id = new_id[0] if new_id else None
+    if not new_id:
+        err = f"copy() no devolvio un ID valido (returned={new_id!r})"
+        _log_call("duplicate_quotation", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "copy_no_id",
+                "error_detail": err, "order_id": order_id}
+
+    # Leer la nueva cotizacion
+    try:
+        new_orders = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [new_id],
+            ["name", "state", "partner_id", "amount_total"],
+        )
+    except Exception as e:
+        err = f"Cotizacion duplicada (id={new_id}) pero no pudo releerse: {e}"
+        _log_call("duplicate_quotation", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "new_read_failed",
+                "error_detail": err, "new_order_id": new_id}
+
+    if not new_orders:
+        err = f"Cotizacion duplicada (id={new_id}) pero no pudo releerse"
+        _log_call("duplicate_quotation", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "new_not_found",
+                "error_detail": err, "new_order_id": new_id}
+
+    new = new_orders[0]
+    partner = new.get("partner_id")
+    partner_name = (
+        partner[1] if isinstance(partner, list) else str(partner or "")
+    )
+    result = {
+        "success": True,
+        "source_order_id": order_id,
+        "source_order_name": source_name,
+        "new_order_id": new_id,
+        "new_order_name": new.get("name", ""),
+        "partner": partner_name,
+        "amount_total": float(new.get("amount_total", 0) or 0),
+        "state": new.get("state", ""),
+        "message": (
+            "Cotizacion duplicada exitosamente. Puedes modificarla antes "
+            "de enviarla."
+        ),
+    }
+    _log_call("duplicate_quotation", tenant_id, log_args,
+              {"source": source_name, "new_id": new_id,
+               "new_name": new.get("name")},
+              None, int((time.time() - started) * 1000))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_my_crm_opportunities
+# ---------------------------------------------------------------------------
+
+def odoo_get_my_crm_opportunities(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    stage: str | None = None,
+    limit: int = 10,
+) -> dict:
+    """Oportunidades CRM activas del vendedor logueado — pipeline + seguimiento.
+
+    Lista crm.lead con type='opportunity' del usuario autenticado, ordenadas
+    por fecha limite ascendente. Calcula revenue total (planned) y revenue
+    ponderado por probabilidad (forecast).
+
+    Args:
+        stage: filtrar por nombre de etapa (opcional, ilike).
+        limit: maximo de oportunidades a retornar (default 10).
+
+    Returns {success, total_opportunities, total_planned_revenue,
+             weighted_revenue, opportunities:[...]}
+    """
+    started = time.time()
+    log_args = {"stage": stage, "limit": limit}
+
+    # Autenticar para obtener uid
+    try:
+        import xmlrpc.client as _xrc
+        common = _xrc.ServerProxy(f"{url.rstrip('/')}/xmlrpc/2/common")
+        uid = common.authenticate(db, user, password, {})
+        if not uid:
+            err = "Autenticacion fallida: no se pudo obtener uid del vendedor"
+            _log_call("get_my_crm_opportunities", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "auth_failed", "error_detail": err}
+    except Exception as e:
+        err = f"Error autenticando para obtener uid: {e}"
+        _log_call("get_my_crm_opportunities", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "auth_error", "error_detail": err}
+
+    domain = [
+        ["user_id", "=", uid],
+        ["active", "=", True],
+        ["type", "=", "opportunity"],
+    ]
+    if stage:
+        domain.append(["stage_id.name", "ilike", stage.strip()])
+
+    try:
+        opportunities = odoo_search(
+            tenant_id, url, db, user, password,
+            "crm.lead", domain,
+            ["name", "partner_id", "stage_id", "probability",
+             "planned_revenue", "expected_revenue", "date_deadline",
+             "date_open", "priority"],
+            limit=int(limit or 10),
+            order="date_deadline asc",
+        )
+    except Exception as e:
+        # Si crm no esta instalado o el modelo no existe, devolver error claro
+        err = f"Error listando crm.lead: {e}"
+        _log_call("get_my_crm_opportunities", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "crm_search_failed",
+                "error_detail": err}
+
+    opps_list = []
+    total_planned = 0.0
+    weighted = 0.0
+    for o in opportunities or []:
+        # planned_revenue: en Odoo 13 puede llamarse 'planned_revenue' o
+        # 'expected_revenue'; preferir el primero que tenga valor.
+        revenue = o.get("planned_revenue")
+        if revenue in (None, False, 0):
+            revenue = o.get("expected_revenue", 0)
+        revenue = float(revenue or 0)
+        prob = float(o.get("probability", 0) or 0)
+        total_planned += revenue
+        weighted += revenue * prob / 100.0
+
+        partner = o.get("partner_id")
+        partner_name = (
+            partner[1] if isinstance(partner, list)
+            else (str(partner) if partner else "")
+        )
+        stage_field = o.get("stage_id")
+        stage_name = (
+            stage_field[1] if isinstance(stage_field, list)
+            else (str(stage_field) if stage_field else "")
+        )
+        opps_list.append({
+            "lead_id": o.get("id"),
+            "name": o.get("name", ""),
+            "partner": partner_name,
+            "stage": stage_name,
+            "probability": prob,
+            "planned_revenue": round(revenue, 2),
+            "deadline": (o.get("date_deadline") or "")[:10],
+            "date_open": (o.get("date_open") or "")[:10],
+            "priority": str(o.get("priority") or ""),
+        })
+
+    result = {
+        "success": True,
+        "total_opportunities": len(opps_list),
+        "total_planned_revenue": round(total_planned, 2),
+        "weighted_revenue": round(weighted, 2),
+        "opportunities": opps_list,
+    }
+    _log_call("get_my_crm_opportunities", tenant_id, log_args,
+              {"total": len(opps_list), "planned": total_planned},
+              None, int((time.time() - started) * 1000))
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Tool: get_pricelist_price
 # ---------------------------------------------------------------------------
 

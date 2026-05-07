@@ -1328,6 +1328,112 @@ MCP_TOOLS = [
             "required": ["partner_id"],
         },
     },
+    {
+        "name": "get_stock_by_warehouse",
+        "description": (
+            "Stock disponible de un producto agrupado por bodega + entradas "
+            "esperadas (purchase orders pendientes de recepcion). Devuelve "
+            "totales (available/reserved/free), desglose por bodega y lista "
+            "de PO con qty_received < product_qty. "
+            "Acepta template_id (preferido) o product_code (default_code, ej. "
+            "'LAP0176'). Usar cuando el vendedor pregunte 'donde esta el "
+            "stock', 'cuanto tengo en cada bodega', 'cuando llega mas', "
+            "'esperan reposicion'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "template_id": {
+                    "type": "integer",
+                    "description": "ID de product.template (preferido).",
+                },
+                "product_code": {
+                    "type": "string",
+                    "description": "default_code del producto (ej. 'LAP0176'). Alternativa si no tienes template_id.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_pending_quotations",
+        "description": (
+            "Cotizaciones enviadas (state=sent) sin respuesta del cliente, "
+            "del vendedor logueado. Categoriza por validez: expirada / "
+            "por_vencer (<3 dias) / vigente. Usar cuando el vendedor pida "
+            "'cotizaciones pendientes', 'que quedo sin contestar', 'mis "
+            "proformas sin respuesta', 'que tengo por hacer seguimiento', "
+            "'cotizaciones que se vencen'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days_old": {
+                    "type": "integer",
+                    "description": "Mostrar cotizaciones enviadas hace mas de N dias (default 7).",
+                    "default": 7,
+                },
+                "include_expired": {
+                    "type": "boolean",
+                    "description": "Incluir cotizaciones cuya validity_date ya paso (default true).",
+                    "default": True,
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "duplicate_quotation",
+        "description": (
+            "Duplicar una cotizacion existente como nuevo borrador (sale.order "
+            "en estado draft). Util cuando el cliente quiere repetir un pedido "
+            "similar. Acepta order_id (preferido) o order_name (ej. "
+            "'VENTA122196'). La nueva cotizacion puede modificarse antes de "
+            "enviarse. Usar cuando el vendedor pida 'duplicar', 'clonar', "
+            "'repetir', 'copiar la cotizacion', 'haz otra igual'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {
+                    "type": "integer",
+                    "description": "ID de la cotizacion a duplicar (preferido).",
+                },
+                "order_name": {
+                    "type": "string",
+                    "description": "Nombre humano (ej. 'VENTA122196'). Se resuelve a order_id si no tienes el ID.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_my_crm_opportunities",
+        "description": (
+            "Oportunidades CRM activas del vendedor logueado — pipeline de "
+            "ventas. Devuelve lista de crm.lead con type='opportunity', "
+            "ordenadas por fecha limite ascendente. Incluye revenue total "
+            "(planned) y revenue ponderado por probabilidad (forecast). "
+            "Usar cuando el vendedor pregunte por su 'pipeline', "
+            "'oportunidades', 'que estoy trabajando', 'leads abiertos', "
+            "'forecast', 'pronostico de ventas'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "stage": {
+                    "type": "string",
+                    "description": "Filtrar por nombre de etapa (ej. 'Propuesta', 'Negociacion'). Match parcial (ilike).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximo de oportunidades a retornar (default 10).",
+                    "default": 10,
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -1990,6 +2096,42 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             partner_id=args["partner_id"],
             limit=args.get("limit", 10),
             year=args.get("year"),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "get_stock_by_warehouse":
+        from mcp_odoo.tools.sales import odoo_get_stock_by_warehouse
+        result = odoo_get_stock_by_warehouse(
+            *creds,
+            template_id=args.get("template_id"),
+            product_code=args.get("product_code"),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "get_pending_quotations":
+        from mcp_odoo.tools.sales import odoo_get_pending_quotations
+        result = odoo_get_pending_quotations(
+            *creds,
+            days_old=args.get("days_old", 7),
+            include_expired=args.get("include_expired", True),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "duplicate_quotation":
+        from mcp_odoo.tools.sales import odoo_duplicate_quotation
+        result = odoo_duplicate_quotation(
+            *creds,
+            order_id=args.get("order_id"),
+            order_name=args.get("order_name"),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "get_my_crm_opportunities":
+        from mcp_odoo.tools.sales import odoo_get_my_crm_opportunities
+        result = odoo_get_my_crm_opportunities(
+            *creds,
+            stage=args.get("stage"),
+            limit=args.get("limit", 10),
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
