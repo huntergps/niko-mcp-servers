@@ -4437,34 +4437,59 @@ def odoo_sign_quotation(
     action_taken = "signed"
     final_state = order.get("state")
 
-    # 6) Optionally call action_confirm() to move state -> 'sale'.
+    # 6) Replicate the Odoo portal behaviour: when the customer signs,
+    # Odoo's portal_quote_accept calls either action_aprobar (Tecnosmart
+    # custom from l10n_ec_sri — moves to 'approved') or action_confirm
+    # (Odoo upstream — moves to 'sale'). Try aprobar first because in
+    # tenants with l10n_ec_sri installed action_confirm raises
+    # ("debe aprobar antes"), and fall back to action_confirm so vanilla
+    # Odoo tenants keep working.
     if auto_confirm:
-        try:
-            odoo_call_method(
-                tenant_id, url, db, user, password,
-                "sale.order", "action_confirm", [order_id], {},
-            )
-            action_taken = "signed_and_confirmed"
+        confirm_method_used = None
+        confirm_err: str | None = None
+        for method in ("action_aprobar", "action_confirm"):
+            try:
+                odoo_call_method(
+                    tenant_id, url, db, user, password,
+                    "sale.order", method, [order_id], {},
+                )
+                confirm_method_used = method
+                break
+            except Exception as e:
+                confirm_err = str(e)
+                # If the method just doesn't exist on this Odoo install
+                # (vanilla without l10n_ec_sri), the call returns a
+                # MissingError-like message — try the next one.
+                logger.info(
+                    "sign_quotation: %s on order=%s failed (%s) — trying next",
+                    method, order_id, str(e)[:200],
+                )
+                continue
+
+        if confirm_method_used:
+            action_taken = f"signed_and_{confirm_method_used.replace('action_', '')}"
             after = _read_sale_order(
                 tenant_id, url, db, user, password, order_id,
                 ["state"],
             ) or {}
             final_state = after.get("state", final_state)
-        except Exception as e:
+        else:
+            # Both methods failed. Signature is already persisted, so
+            # surface a partial success.
             elapsed = int((time.time() - started) * 1000)
-            tb = traceback.format_exc()
-            logger.error("sign_quotation: action_confirm failed order=%s err=%s\n%s",
-                         order_id, e, tb)
+            logger.error(
+                "sign_quotation: both action_aprobar and action_confirm "
+                "failed order=%s last_err=%s", order_id, confirm_err,
+            )
             _log_call("sign_quotation", tenant_id, log_args, None,
-                      f"confirm_failed: {e}", elapsed)
-            # Signature was written successfully; report partial success.
+                      f"confirm_failed: {confirm_err}", elapsed)
             return {
                 "success": False,
                 "error_code": "confirm_failed",
                 "error_detail": (
-                    "La firma se guardo correctamente pero falla la "
-                    f"confirmacion automatica: {e}. La cotizacion sigue "
-                    "en estado firmable y puede confirmarse manualmente."
+                    "La firma se guardo correctamente pero la confirmacion "
+                    f"automatica fallo: {confirm_err}. La cotizacion sigue "
+                    "firmable y puede confirmarse manualmente desde Odoo."
                 ),
                 "order_id": order_id,
                 "name": order.get("name"),
