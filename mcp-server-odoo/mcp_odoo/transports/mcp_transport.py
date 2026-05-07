@@ -1050,6 +1050,61 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "niko_send_sign_request",
+        "description": (
+            "Pedir al cliente que firme una cotizacion enviandole un enlace al "
+            "mini-app de firma desde el canal correspondiente (Telegram / WhatsApp). "
+            "Usa esta herramienta cuando el cliente acepta la cotizacion y quiere "
+            "firmarla. NO escribe la firma — solo pide al cliente que la haga. "
+            "Para Telegram el enlace abre dentro del chat (Mini App); para WhatsApp "
+            "abre como boton interactivo (Cloud) o link plano (Evolution). "
+            "Requiere order_id (ya firmable: estado draft o sent), channel y "
+            "channel_user_id (el destinatario). El backend valida que la "
+            "cotizacion exista, no este firmada y este en un estado correcto. "
+            "Tool MCP niko_send_sign_request."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {
+                    "type": "integer",
+                    "description": "ID numerico de la sale.order a firmar.",
+                },
+                "channel": {
+                    "type": "string",
+                    "enum": [
+                        "telegram", "whatsapp_cloud",
+                        "whatsapp_evolution", "whatsapp",
+                    ],
+                    "description": (
+                        "Canal por el que se enviara la solicitud de firma. "
+                        "Usa el mismo canal por el que el cliente esta hablando "
+                        "ahora con el agente. 'whatsapp' es alias de "
+                        "'whatsapp_evolution'."
+                    ),
+                },
+                "channel_user_id": {
+                    "type": "string",
+                    "description": (
+                        "Identificador del cliente en el canal (chat_id "
+                        "numerico para Telegram, JID o telefono E.164 para "
+                        "WhatsApp). Tomalo del contexto de la conversacion."
+                    ),
+                },
+                "message_prefix": {
+                    "type": "string",
+                    "description": (
+                        "(Opcional) Linea introductoria que se prepende al "
+                        "cuerpo del mensaje. Ej: 'Aqui esta tu cotizacion del "
+                        "kit gamer:'."
+                    ),
+                    "default": "",
+                },
+            },
+            "required": ["order_id", "channel", "channel_user_id"],
+        },
+    },
+    {
         "name": "sri_import",
         "description": "Importar factura de compra del SRI usando la clave de acceso de 49 digitos. Usa esto cuando alguien envie un numero de 49 digitos.",
         "inputSchema": {
@@ -2020,6 +2075,103 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
+    if tool_name == "niko_send_sign_request":
+        # Delegate to the niko backend so the channel-specific gateway
+        # handles delivery. The MCP server INTENTIONALLY does not know
+        # how to talk to Telegram / WhatsApp — that's the backend's job.
+        # We just forward the args along with the tenant_id resolved
+        # earlier (via JWT or X-Tenant-ID) so the backend can validate
+        # ownership against Odoo and mint the HMAC sign_token.
+        from mcp_odoo.config import settings as _s
+
+        niko_url = (_s.niko_api_url or "").rstrip("/")
+        if not niko_url:
+            return json.dumps({
+                "success": False,
+                "error_code": "niko_api_url_not_configured",
+                "error_detail": (
+                    "El backend de Niko no esta configurado en el MCP. "
+                    "Pide al operador que configure NIKO_API_URL."
+                ),
+            }, ensure_ascii=False)
+
+        # Service-role JWT — same key the MCP already uses to talk to
+        # Supabase REST. Niko's get_current_user accepts service_role
+        # tokens and reads tenant_id from the body for that path.
+        bearer = _s.supabase_service_key or _s.supabase_jwt_secret
+        if not bearer:
+            return json.dumps({
+                "success": False,
+                "error_code": "service_token_missing",
+                "error_detail": (
+                    "Falta SUPABASE_SERVICE_KEY/SUPABASE_JWT_SECRET en "
+                    "el MCP — no puedo autenticarme contra el backend."
+                ),
+            }, ensure_ascii=False)
+
+        order_id = int(args["order_id"])
+        body = {
+            "channel": str(args["channel"]).strip().lower(),
+            "channel_user_id": str(args["channel_user_id"]).strip(),
+            "message_prefix": str(args.get("message_prefix", "") or ""),
+            "tenant_id": tc["tenant_id"],
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{niko_url}/api/quotations/{order_id}/send-sign-request",
+                    json=body,
+                    headers={
+                        "Authorization": f"Bearer {bearer}",
+                        "Content-Type": "application/json",
+                        # Forward X-Tenant-ID too so the backend's
+                        # downstream MCP loop can resolve credentials
+                        # if it falls back to the header path.
+                        "X-Tenant-ID": tc["tenant_id"],
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "niko_send_sign_request transport error tenant=%s order=%s: %s",
+                tc["tenant_id"], order_id, exc,
+            )
+            return json.dumps({
+                "success": False,
+                "error_code": "niko_unreachable",
+                "error_detail": "No pude contactar al backend de Niko.",
+            }, ensure_ascii=False)
+
+        if resp.status_code in (200, 201):
+            try:
+                data = resp.json()
+            except Exception:  # noqa: BLE001
+                data = {}
+            return json.dumps({
+                "success": bool(data.get("success", True)),
+                "sign_url": data.get("sign_url"),
+                "sent_message_id": data.get("sent_message_id"),
+                "error": data.get("error"),
+            }, ensure_ascii=False)
+
+        # Surface Niko's structured error verbatim so the LLM sees
+        # something actionable ("La cotizacion ya esta firmada") and
+        # the model doesn't retry blindly.
+        try:
+            err_body = resp.json()
+            err_detail = (
+                err_body.get("detail")
+                or err_body.get("error")
+                or f"HTTP {resp.status_code}"
+            )
+        except Exception:  # noqa: BLE001
+            err_detail = f"HTTP {resp.status_code}: {resp.text[:200]}"
+        return json.dumps({
+            "success": False,
+            "error_code": f"niko_http_{resp.status_code}",
+            "error_detail": str(err_detail),
+        }, ensure_ascii=False)
+
     if tool_name == "sri_import":
         from mcp_odoo.tools.sri import sri_import_create
         result = sri_import_create(*creds, args["access_key"])
@@ -2836,6 +2988,7 @@ _TOOLS_WITH_ORDER_ID = {
     "get_quotation_state_summary",
     "transition_quotation",
     "sign_quotation",
+    "niko_send_sign_request",
 }
 
 

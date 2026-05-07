@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     odoo_user: str = ""
     odoo_password: str = ""
 
+    # Niko backend (used by tools that need to dispatch through niko
+    # channels, e.g. ``niko_send_sign_request`` which routes a
+    # signature request to the customer via Telegram / WhatsApp).
+    # In-cluster default points at the docker-compose service name;
+    # override with the public URL for out-of-cluster callers.
+    niko_api_url: str = "http://niko:8080"
+
     model_config = {"env_prefix": "", "case_sensitive": False}
 
 
