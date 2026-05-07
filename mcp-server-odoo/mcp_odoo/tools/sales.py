@@ -2870,7 +2870,10 @@ def odoo_get_order_delivery_status(
         orders = odoo_read(
             tenant_id, url, db, user, password,
             "sale.order", [order_id],
-            ["name", "state", "delivery_status", "invoice_status",
+            # delivery_status no existe en Odoo 13 core; el módulo custom
+            # l10n_ec_sale_delivery agrega state_delivery — leer ambos y
+            # usar el que esté disponible.
+            ["name", "state", "state_delivery", "invoice_status",
              "picking_ids", "amount_total", "partner_id"],
         )
     except Exception as e:
@@ -2924,7 +2927,7 @@ def odoo_get_order_delivery_status(
         "order_name": order.get("name", ""),
         "state": order.get("state", ""),
         "state_label": _STATE_LABEL.get(order.get("state", ""), order.get("state", "")),
-        "delivery_status": order.get("delivery_status") or "",
+        "delivery_status": order.get("state_delivery") or order.get("delivery_status") or "",
         "invoice_status": order.get("invoice_status") or "",
         "amount_total": float(order.get("amount_total", 0)),
         "partner": partner_name,
