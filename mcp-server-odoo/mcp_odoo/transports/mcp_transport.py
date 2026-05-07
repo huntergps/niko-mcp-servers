@@ -1224,6 +1224,110 @@ MCP_TOOLS = [
             "required": [],
         },
     },
+    {
+        "name": "get_pricelist_price",
+        "description": (
+            "Obtener el precio efectivo de venta de un producto para un cliente "
+            "especifico segun la lista de precios (pricelist) configurada en su "
+            "ficha. Devuelve list_price (precio base del producto), "
+            "pricelist_price (precio resuelto por la tarifa del cliente), el "
+            "nombre de la tarifa aplicada y el descuento porcentual implicito. "
+            "Si el cliente no tiene tarifa configurada, devuelve el list_price. "
+            "Usar cuando el vendedor pregunte 'a que precio se lo vendo a este "
+            "cliente', 'que precio tiene MEGA PRIMAVERA para este producto', o "
+            "antes de armar una cotizacion para verificar el precio efectivo. "
+            "El template_id es el devuelto por search_products."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {
+                    "type": "integer",
+                    "description": "ID del cliente en Odoo (res.partner)",
+                },
+                "template_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID del producto (product.template), tal como lo "
+                        "devuelve search_products"
+                    ),
+                },
+                "quantity": {
+                    "type": "number",
+                    "description": "Cantidad a cotizar (default 1)",
+                    "default": 1,
+                },
+            },
+            "required": ["partner_id", "template_id"],
+        },
+    },
+    {
+        "name": "get_quotation_margin",
+        "description": (
+            "Calcular el margen de ganancia de una cotizacion o pedido (sale.order). "
+            "Usa los campos del modulo nativo `sale_margin` de Odoo 13: "
+            "purchase_price (costo unitario), margin (ganancia por linea) y el "
+            "margin del header. Devuelve total_margin, margin_pct y un detalle "
+            "por linea con qty, precio, costo, subtotal, margen y descuento. "
+            "Acepta order_id (entero) O order_name (ej: 'VENTA122196'). "
+            "Usar cuando el vendedor pregunte 'cuanto gano con esta cotizacion', "
+            "'que margen tiene', 'puedo bajar el precio sin perder', o antes de "
+            "aplicar un descuento global."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {
+                    "type": "integer",
+                    "description": "ID numerico del sale.order",
+                },
+                "order_name": {
+                    "type": "string",
+                    "description": (
+                        "Nombre de la cotizacion/pedido (ej: 'VENTA122196'). "
+                        "Usar si no se tiene order_id."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_customer_purchase_history",
+        "description": (
+            "Historial de compras de un cliente: ordenes pasadas, productos mas "
+            "comprados (top 10 por cantidad acumulada) y ticket promedio del "
+            "periodo. Considera solo ordenes confirmadas (state in sale|done) "
+            "en el anio indicado (default: anio actual). Devuelve orders_count, "
+            "total_amount, avg_ticket, top_products y recent_orders (las "
+            "ultimas N ordenes). "
+            "Usar cuando el vendedor pregunte 'que compra este cliente', "
+            "'cuanto ha comprado este anio', 'cual es su ticket promedio', "
+            "'que productos se lleva', o para preparar una visita comercial."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {
+                    "type": "integer",
+                    "description": "ID del cliente en Odoo (res.partner)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Numero de ordenes recientes a devolver en "
+                        "recent_orders (default 10, max 100)"
+                    ),
+                    "default": 10,
+                },
+                "year": {
+                    "type": "integer",
+                    "description": "Anio del periodo a analizar (default: anio actual)",
+                },
+            },
+            "required": ["partner_id"],
+        },
+    },
 ]
 
 
@@ -1857,6 +1961,35 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         result = odoo_get_my_sales_summary(
             *creds,
             period=args.get("period", "month"),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "get_pricelist_price":
+        from mcp_odoo.tools.sales import odoo_get_pricelist_price
+        result = odoo_get_pricelist_price(
+            *creds,
+            partner_id=args["partner_id"],
+            template_id=args["template_id"],
+            quantity=args.get("quantity", 1),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "get_quotation_margin":
+        from mcp_odoo.tools.sales import odoo_get_quotation_margin
+        result = odoo_get_quotation_margin(
+            *creds,
+            order_id=args.get("order_id"),
+            order_name=args.get("order_name"),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "get_customer_purchase_history":
+        from mcp_odoo.tools.sales import odoo_get_customer_purchase_history
+        result = odoo_get_customer_purchase_history(
+            *creds,
+            partner_id=args["partner_id"],
+            limit=args.get("limit", 10),
+            year=args.get("year"),
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 

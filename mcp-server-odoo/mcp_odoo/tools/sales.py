@@ -3085,3 +3085,560 @@ def odoo_get_my_sales_summary(
               {"period": period, "orders_count": orders_count, "total": total_amount},
               None, int((time.time() - started) * 1000))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_pricelist_price
+# ---------------------------------------------------------------------------
+
+def odoo_get_pricelist_price(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    partner_id: int,
+    template_id: int,
+    quantity: float = 1,
+) -> dict:
+    """Obtener el precio efectivo de venta de un producto para un cliente
+    especifico segun su lista de precios configurada en Odoo.
+
+    Lee `property_product_pricelist` del partner (Many2one a product.pricelist)
+    y llama a `pricelist.get_product_price(product, qty, partner)` para
+    obtener el precio resuelto. Si el partner no tiene pricelist configurada,
+    devuelve el `list_price` del template.
+
+    Args:
+        partner_id: ID del cliente (res.partner)
+        template_id: ID del producto (product.template) — el que devuelve search_products
+        quantity: Cantidad a cotizar (default 1)
+
+    Returns {success, partner_id, partner_name, template_id, product_code,
+    product_name, quantity, list_price, pricelist_price, pricelist_name,
+    discount_applied}.
+    """
+    started = time.time()
+    log_args = {
+        "partner_id": partner_id,
+        "template_id": template_id,
+        "quantity": quantity,
+    }
+
+    if not isinstance(partner_id, int) or partner_id <= 0:
+        return {"success": False, "error_code": "invalid_partner_id",
+                "error_detail": "partner_id debe ser entero positivo"}
+    if not isinstance(template_id, int) or template_id <= 0:
+        return {"success": False, "error_code": "invalid_template_id",
+                "error_detail": "template_id debe ser entero positivo"}
+    try:
+        qty = float(quantity) if quantity else 1.0
+    except (TypeError, ValueError):
+        qty = 1.0
+    if qty <= 0:
+        qty = 1.0
+
+    # 1. Leer partner (nombre + pricelist)
+    try:
+        partners = odoo_read(
+            tenant_id, url, db, user, password,
+            "res.partner", [partner_id],
+            ["id", "name", "property_product_pricelist"],
+        )
+    except Exception as e:
+        err = f"Error leyendo partner {partner_id}: {e}"
+        _log_call("get_pricelist_price", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "partner_read_failed",
+                "error_detail": err}
+
+    if not partners:
+        err = f"Partner id={partner_id} no encontrado"
+        _log_call("get_pricelist_price", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "partner_not_found",
+                "error_detail": err, "partner_id": partner_id}
+
+    partner = partners[0]
+    partner_name = partner.get("name", "")
+    pricelist_raw = partner.get("property_product_pricelist")
+    if isinstance(pricelist_raw, list) and pricelist_raw:
+        pricelist_id = pricelist_raw[0]
+        pricelist_name = pricelist_raw[1] if len(pricelist_raw) > 1 else ""
+    else:
+        pricelist_id = pricelist_raw if isinstance(pricelist_raw, int) else None
+        pricelist_name = ""
+
+    # 2. Leer template (precio base + nombre + codigo)
+    try:
+        templates = odoo_read(
+            tenant_id, url, db, user, password,
+            "product.template", [template_id],
+            ["id", "name", "default_code", "list_price"],
+        )
+    except Exception as e:
+        err = f"Error leyendo template {template_id}: {e}"
+        _log_call("get_pricelist_price", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "template_read_failed",
+                "error_detail": err}
+
+    if not templates:
+        err = f"Producto template id={template_id} no encontrado"
+        _log_call("get_pricelist_price", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "template_not_found",
+                "error_detail": err, "template_id": template_id}
+
+    tpl = templates[0]
+    list_price = float(tpl.get("list_price", 0) or 0)
+    product_code = tpl.get("default_code") or ""
+    product_name = tpl.get("name", "")
+
+    # 3. Calcular precio efectivo
+    pricelist_price = list_price
+    if pricelist_id:
+        try:
+            raw_price = odoo_call_method(
+                tenant_id, url, db, user, password,
+                "product.pricelist", "get_product_price",
+                [pricelist_id],
+                [template_id, qty, partner_id],
+            )
+            if raw_price is not None:
+                pricelist_price = float(raw_price)
+        except Exception as e:
+            # No bloquear: dejar el list_price si pricelist falla, pero loguear
+            logger.warning("get_pricelist_price: get_product_price failed "
+                           "pricelist=%s template=%s err=%s",
+                           pricelist_id, template_id, e)
+
+    discount_applied = 0.0
+    if list_price > 0:
+        discount_applied = round((1 - (pricelist_price / list_price)) * 100, 2)
+
+    result = {
+        "success": True,
+        "partner_id": partner_id,
+        "partner_name": partner_name,
+        "template_id": template_id,
+        "product_code": product_code,
+        "product_name": product_name,
+        "quantity": qty,
+        "list_price": round(list_price, 2),
+        "pricelist_price": round(pricelist_price, 2),
+        "pricelist_id": pricelist_id,
+        "pricelist_name": pricelist_name,
+        "discount_applied": discount_applied,
+    }
+    _log_call("get_pricelist_price", tenant_id, log_args,
+              {"template_id": template_id,
+               "pricelist_price": result["pricelist_price"],
+               "discount_applied": discount_applied},
+              None, int((time.time() - started) * 1000))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_quotation_margin
+# ---------------------------------------------------------------------------
+
+def odoo_get_quotation_margin(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int | None = None,
+    order_name: str | None = None,
+) -> dict:
+    """Calcular el margen de ganancia de una cotizacion o pedido.
+
+    Usa los campos del modulo nativo `sale_margin` (Odoo 13):
+      - sale.order.line.purchase_price (Float, costo unitario)
+      - sale.order.line.margin (Float, computed = price_subtotal - cost*qty)
+      - sale.order.margin (Float, computed = sum(line.margin))
+
+    Si `sale_margin` no esta instalado, hace fallback al calculo manual con
+    purchase_price (que en Odoo 13 forma parte del modulo, pero por
+    defensividad se calcula tambien).
+
+    Acepta order_id (entero) O order_name (ej: 'VENTA122196'). Si se pasan
+    ambos, order_id tiene precedencia.
+
+    Args:
+        order_id: ID numerico del sale.order
+        order_name: Nombre del pedido/cotizacion
+
+    Returns {success, order_id, order_name, partner, amount_total,
+    amount_untaxed, total_margin, margin_pct, lines: [{product, qty,
+    price_unit, cost_unit, subtotal, margin, margin_pct, discount}]}.
+    """
+    started = time.time()
+    log_args = {"order_id": order_id, "order_name": order_name}
+
+    # Resolver order_id desde order_name si hace falta
+    if order_id is None and order_name:
+        try:
+            rows = odoo_search(
+                tenant_id, url, db, user, password,
+                "sale.order",
+                [["name", "=ilike", order_name.strip()]],
+                ["id", "name"],
+                limit=1,
+            )
+        except Exception as e:
+            err = f"Error buscando pedido '{order_name}': {e}"
+            _log_call("get_quotation_margin", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "search_failed",
+                    "error_detail": err}
+        if not rows:
+            err = f"Pedido '{order_name}' no encontrado"
+            _log_call("get_quotation_margin", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "order_not_found",
+                    "error_detail": err, "order_name": order_name}
+        order_id = rows[0]["id"] if isinstance(rows[0], dict) else rows[0]
+
+    if not isinstance(order_id, int) or order_id <= 0:
+        return {"success": False, "error_code": "invalid_order_id",
+                "error_detail": "Se requiere order_id (entero) o order_name valido"}
+
+    # Leer cabecera. Pedimos `margin` directamente; si el modulo sale_margin
+    # no esta instalado, Odoo lanza error y caemos al fallback.
+    header_fields_full = [
+        "name", "state", "partner_id", "amount_total", "amount_untaxed",
+        "order_line", "margin",
+    ]
+    header_fields_min = [
+        "name", "state", "partner_id", "amount_total", "amount_untaxed",
+        "order_line",
+    ]
+    has_margin_field = True
+    try:
+        orders = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id], header_fields_full,
+        )
+    except Exception:
+        has_margin_field = False
+        try:
+            orders = odoo_read(
+                tenant_id, url, db, user, password,
+                "sale.order", [order_id], header_fields_min,
+            )
+        except Exception as e:
+            err = f"Error leyendo pedido {order_id}: {e}"
+            _log_call("get_quotation_margin", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "order_read_failed",
+                    "error_detail": err}
+
+    if not orders:
+        return {"success": False, "error_code": "order_not_found",
+                "error_detail": f"Pedido id={order_id} no encontrado",
+                "order_id": order_id}
+
+    order = orders[0]
+    line_ids = order.get("order_line") or []
+    partner_name = (
+        order["partner_id"][1]
+        if isinstance(order.get("partner_id"), list)
+        else str(order.get("partner_id", ""))
+    )
+
+    # Leer lineas con purchase_price + margin (con fallback)
+    line_fields_full = [
+        "product_id", "name", "product_uom_qty", "price_unit",
+        "price_subtotal", "purchase_price", "margin", "discount",
+    ]
+    line_fields_min = [
+        "product_id", "name", "product_uom_qty", "price_unit",
+        "price_subtotal", "discount",
+    ]
+    lines: list[dict] = []
+    if line_ids:
+        try:
+            lines = odoo_read(
+                tenant_id, url, db, user, password,
+                "sale.order.line", line_ids, line_fields_full,
+            ) or []
+        except Exception:
+            # sale_margin no instalado — leer sin purchase_price/margin
+            try:
+                lines = odoo_read(
+                    tenant_id, url, db, user, password,
+                    "sale.order.line", line_ids, line_fields_min,
+                ) or []
+            except Exception as e:
+                err = f"Error leyendo lineas {line_ids}: {e}"
+                _log_call("get_quotation_margin", tenant_id, log_args, None, err,
+                          int((time.time() - started) * 1000))
+                return {"success": False, "error_code": "lines_read_failed",
+                        "error_detail": err, "order_id": order_id}
+
+    lines_out: list[dict] = []
+    total_margin_calc = 0.0
+    total_subtotal = 0.0
+    for ln in lines:
+        product_name = (
+            ln["product_id"][1]
+            if isinstance(ln.get("product_id"), list)
+            else str(ln.get("product_id") or ln.get("name") or "")
+        )
+        qty = float(ln.get("product_uom_qty", 0) or 0)
+        price_unit = float(ln.get("price_unit", 0) or 0)
+        subtotal = float(ln.get("price_subtotal", 0) or 0)
+        cost_unit = float(ln.get("purchase_price", 0) or 0)
+        # Si margin viene del modulo, usarlo; si no, calcular
+        line_margin_raw = ln.get("margin")
+        if line_margin_raw not in (None, False):
+            line_margin = float(line_margin_raw)
+        else:
+            line_margin = subtotal - (cost_unit * qty)
+        line_margin_pct = (
+            round((line_margin / subtotal) * 100, 2) if subtotal > 0 else 0.0
+        )
+        total_margin_calc += line_margin
+        total_subtotal += subtotal
+        lines_out.append({
+            "product": product_name,
+            "qty": qty,
+            "price_unit": round(price_unit, 2),
+            "cost_unit": round(cost_unit, 2),
+            "subtotal": round(subtotal, 2),
+            "margin": round(line_margin, 2),
+            "margin_pct": line_margin_pct,
+            "discount": float(ln.get("discount", 0) or 0),
+        })
+
+    # Margen total: preferir el campo del header si existe
+    header_margin_raw = order.get("margin") if has_margin_field else None
+    if header_margin_raw not in (None, False):
+        try:
+            total_margin = float(header_margin_raw)
+        except (TypeError, ValueError):
+            total_margin = total_margin_calc
+    else:
+        total_margin = total_margin_calc
+
+    margin_pct = (
+        round((total_margin / total_subtotal) * 100, 2)
+        if total_subtotal > 0 else 0.0
+    )
+
+    result = {
+        "success": True,
+        "order_id": order_id,
+        "order_name": order.get("name", ""),
+        "state": order.get("state", ""),
+        "state_label": _STATE_LABEL.get(order.get("state", ""), order.get("state", "")),
+        "partner": partner_name,
+        "amount_total": float(order.get("amount_total", 0) or 0),
+        "amount_untaxed": float(order.get("amount_untaxed", 0) or 0),
+        "total_margin": round(total_margin, 2),
+        "margin_pct": margin_pct,
+        "lines_count": len(lines_out),
+        "lines": lines_out,
+    }
+    _log_call("get_quotation_margin", tenant_id, log_args,
+              {"order_name": result["order_name"],
+               "total_margin": result["total_margin"],
+               "margin_pct": margin_pct},
+              None, int((time.time() - started) * 1000))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_customer_purchase_history
+# ---------------------------------------------------------------------------
+
+def odoo_get_customer_purchase_history(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    partner_id: int,
+    limit: int = 10,
+    year: int | None = None,
+) -> dict:
+    """Historial de compras de un cliente — ordenes pasadas, productos
+    frecuentes y ticket promedio.
+
+    Devuelve las ultimas N ordenes confirmadas/done del cliente (limit) y
+    agrega:
+      - total comprado en el periodo (year)
+      - ticket promedio (total / orders_count)
+      - top productos (mas comprados por cantidad acumulada)
+
+    Args:
+        partner_id: ID del cliente (res.partner)
+        limit: numero de ordenes recientes a devolver (default 10)
+        year: anio del periodo a analizar (default: anio actual)
+
+    Returns {success, partner_id, partner_name, period, orders_count,
+    total_amount, avg_ticket, top_products: [{code, name, total_qty,
+    total_amount}], recent_orders: [{name, date, amount, state}]}.
+    """
+    from datetime import date as _date
+
+    started = time.time()
+    log_args = {"partner_id": partner_id, "limit": limit, "year": year}
+
+    if not isinstance(partner_id, int) or partner_id <= 0:
+        return {"success": False, "error_code": "invalid_partner_id",
+                "error_detail": "partner_id debe ser entero positivo"}
+
+    try:
+        limit_int = int(limit) if limit else 10
+    except (TypeError, ValueError):
+        limit_int = 10
+    if limit_int <= 0:
+        limit_int = 10
+    if limit_int > 100:
+        limit_int = 100
+
+    target_year = year or _date.today().year
+    try:
+        target_year = int(target_year)
+    except (TypeError, ValueError):
+        target_year = _date.today().year
+    period_from = f"{target_year}-01-01"
+    period_to = f"{target_year}-12-31 23:59:59"
+
+    # 1. Verificar que el partner existe
+    try:
+        partners = odoo_read(
+            tenant_id, url, db, user, password,
+            "res.partner", [partner_id], ["id", "name"],
+        )
+    except Exception as e:
+        err = f"Error leyendo partner {partner_id}: {e}"
+        _log_call("get_customer_purchase_history", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "partner_read_failed",
+                "error_detail": err}
+
+    if not partners:
+        err = f"Partner id={partner_id} no encontrado"
+        _log_call("get_customer_purchase_history", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "partner_not_found",
+                "error_detail": err, "partner_id": partner_id}
+    partner_name = partners[0].get("name", "")
+
+    # 2. Listado de ordenes confirmadas/done en el periodo
+    base_domain = [
+        ["partner_id", "child_of", partner_id],
+        ["state", "in", ["sale", "done"]],
+        ["date_order", ">=", period_from],
+        ["date_order", "<=", period_to],
+    ]
+    try:
+        orders = odoo_search(
+            tenant_id, url, db, user, password,
+            "sale.order",
+            base_domain,
+            ["id", "name", "date_order", "amount_total", "order_line", "state"],
+            limit=200,  # leer hasta 200 para agregar; mostrar solo limit_int
+            order="date_order desc",
+        )
+    except Exception as e:
+        err = f"Error buscando ordenes del cliente: {e}"
+        _log_call("get_customer_purchase_history", tenant_id, log_args, None, err,
+                  int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "orders_search_failed",
+                "error_detail": err}
+
+    orders = orders or []
+    orders_count = len(orders)
+    total_amount = 0.0
+    line_ids: list[int] = []
+    for o in orders:
+        total_amount += float(o.get("amount_total", 0) or 0)
+        line_ids.extend(o.get("order_line") or [])
+
+    avg_ticket = round(total_amount / orders_count, 2) if orders_count else 0.0
+
+    # 3. Top productos por cantidad — leer todas las lineas y agrupar
+    top_products: list[dict] = []
+    if line_ids:
+        try:
+            lines = odoo_read(
+                tenant_id, url, db, user, password,
+                "sale.order.line", line_ids,
+                ["product_id", "product_uom_qty", "price_subtotal"],
+            ) or []
+        except Exception as e:
+            # No bloquear: si falla, devolvemos sin top_products
+            logger.warning("get_customer_purchase_history: lines read failed: %s", e)
+            lines = []
+
+        agg: dict[int, dict] = {}
+        for ln in lines:
+            pid_raw = ln.get("product_id")
+            if isinstance(pid_raw, list) and pid_raw:
+                pid = pid_raw[0]
+                pname = pid_raw[1] if len(pid_raw) > 1 else ""
+            elif isinstance(pid_raw, int):
+                pid = pid_raw
+                pname = ""
+            else:
+                continue
+            entry = agg.setdefault(pid, {
+                "product_id": pid, "name": pname,
+                "total_qty": 0.0, "total_amount": 0.0,
+            })
+            entry["total_qty"] += float(ln.get("product_uom_qty", 0) or 0)
+            entry["total_amount"] += float(ln.get("price_subtotal", 0) or 0)
+
+        # Resolver default_code para los top productos (max 10)
+        ranked = sorted(
+            agg.values(), key=lambda x: x["total_qty"], reverse=True,
+        )[:10]
+        if ranked:
+            try:
+                prods = odoo_read(
+                    tenant_id, url, db, user, password,
+                    "product.product",
+                    [r["product_id"] for r in ranked],
+                    ["id", "default_code", "name"],
+                )
+                code_by_id = {
+                    p["id"]: (p.get("default_code") or "") for p in (prods or [])
+                }
+                name_by_id = {
+                    p["id"]: p.get("name", "") for p in (prods or [])
+                }
+            except Exception as e:
+                logger.warning("get_customer_purchase_history: product read failed: %s", e)
+                code_by_id, name_by_id = {}, {}
+        else:
+            code_by_id, name_by_id = {}, {}
+
+        for r in ranked:
+            top_products.append({
+                "product_id": r["product_id"],
+                "code": code_by_id.get(r["product_id"], ""),
+                "name": name_by_id.get(r["product_id"], r["name"]),
+                "total_qty": round(r["total_qty"], 2),
+                "total_amount": round(r["total_amount"], 2),
+            })
+
+    # 4. Recent orders (limit_int mas recientes)
+    recent_orders = []
+    for o in orders[:limit_int]:
+        recent_orders.append({
+            "name": o.get("name", ""),
+            "date": (o.get("date_order") or "")[:10],
+            "amount": float(o.get("amount_total", 0) or 0),
+            "state": o.get("state", ""),
+        })
+
+    result = {
+        "success": True,
+        "partner_id": partner_id,
+        "partner_name": partner_name,
+        "period": str(target_year),
+        "orders_count": orders_count,
+        "total_amount": round(total_amount, 2),
+        "avg_ticket": avg_ticket,
+        "top_products": top_products,
+        "recent_orders": recent_orders,
+    }
+    _log_call("get_customer_purchase_history", tenant_id, log_args,
+              {"period": str(target_year),
+               "orders_count": orders_count,
+               "total_amount": result["total_amount"]},
+              None, int((time.time() - started) * 1000))
+    return result
