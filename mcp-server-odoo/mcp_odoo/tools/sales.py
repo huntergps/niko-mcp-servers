@@ -808,7 +808,7 @@ def odoo_get_quotation(
             "sale.order", [order_id],
             ["id", "name", "state", "partner_id", "amount_total",
              "amount_untaxed", "amount_tax", "date_order", "create_date",
-             "order_line"],
+             "order_line", "share_link_so"],
         )
     except Exception as e:
         err = f"Error leyendo cotizacion {order_id}: {e}"
@@ -860,6 +860,12 @@ def odoo_get_quotation(
         "date_order": order.get("date_order") or order.get("create_date"),
         "lines_count": len(lines_detail),
         "lines": lines_detail,
+        # Public Odoo portal URL with access_token. Customers can use
+        # this to view/sign/pay via the standard Odoo /my/orders/<id>
+        # template. Distinct from Niko's signature mini-app (which is
+        # served at /sign/ on niko.galapagos.tech). The LLM should
+        # share THIS link when the user asks for "el link de la venta".
+        "share_link": order.get("share_link_so") or "",
     }
     result["_card"] = _build_card(result)
     _log_call("get_quotation", tenant_id, log_args, {"name": order["name"], "lines": len(lines_detail)}, None, int((time.time() - started) * 1000))
