@@ -1052,16 +1052,14 @@ MCP_TOOLS = [
     {
         "name": "niko_send_sign_request",
         "description": (
-            "Pedir al cliente que firme una cotizacion enviandole un enlace al "
-            "mini-app de firma desde el canal correspondiente (Telegram / WhatsApp). "
-            "Usa esta herramienta cuando el cliente acepta la cotizacion y quiere "
-            "firmarla. NO escribe la firma — solo pide al cliente que la haga. "
-            "Para Telegram el enlace abre dentro del chat (Mini App); para WhatsApp "
-            "abre como boton interactivo (Cloud) o link plano (Evolution). "
-            "Requiere order_id (ya firmable: estado draft o sent), channel y "
-            "channel_user_id (el destinatario). El backend valida que la "
-            "cotizacion exista, no este firmada y este en un estado correcto. "
-            "Tool MCP niko_send_sign_request."
+            "Envia al cliente del chat ACTUAL un mini-app para firmar la "
+            "cotizacion. Usala cuando el cliente diga 'firmar', 'firma', 'sign', "
+            "'enviar para firmar' sobre una cotizacion (estado draft o sent). "
+            "Solo necesitas pasar `order_id` — el backend resuelve el canal y "
+            "destinatario automaticamente desde el contexto del chat. NO "
+            "preguntes al usuario por su channel_user_id, NO uses search_memories "
+            "para buscarlo: solo llama esta tool con el order_id y listo. El "
+            "cliente firma → Odoo confirma la orden automaticamente."
         ),
         "inputSchema": {
             "type": "object",
@@ -1069,27 +1067,6 @@ MCP_TOOLS = [
                 "order_id": {
                     "type": "integer",
                     "description": "ID numerico de la sale.order a firmar.",
-                },
-                "channel": {
-                    "type": "string",
-                    "enum": [
-                        "telegram", "whatsapp_cloud",
-                        "whatsapp_evolution", "whatsapp",
-                    ],
-                    "description": (
-                        "Canal por el que se enviara la solicitud de firma. "
-                        "Usa el mismo canal por el que el cliente esta hablando "
-                        "ahora con el agente. 'whatsapp' es alias de "
-                        "'whatsapp_evolution'."
-                    ),
-                },
-                "channel_user_id": {
-                    "type": "string",
-                    "description": (
-                        "Identificador del cliente en el canal (chat_id "
-                        "numerico para Telegram, JID o telefono E.164 para "
-                        "WhatsApp). Tomalo del contexto de la conversacion."
-                    ),
                 },
                 "message_prefix": {
                     "type": "string",
@@ -1101,7 +1078,7 @@ MCP_TOOLS = [
                     "default": "",
                 },
             },
-            "required": ["order_id", "channel", "channel_user_id"],
+            "required": ["order_id"],
         },
     },
     {
