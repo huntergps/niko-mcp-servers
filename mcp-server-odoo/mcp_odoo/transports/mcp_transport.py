@@ -1011,6 +1011,45 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "sign_quotation",
+        "description": (
+            "Firmar digitalmente una cotizacion (sale.order) escribiendo la firma "
+            "(PNG base64), el nombre del firmante y la fecha. Replica /my/orders/<id>/accept "
+            "del portal Odoo. Solo aplica a cotizaciones en estado 'draft' o 'sent' que no "
+            "tengan firma previa. Por defecto (auto_confirm=true) tambien llama a "
+            "action_confirm() para mover la orden a estado 'sale'. Tool MCP odoo_sign_quotation."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {
+                    "type": "integer",
+                    "description": "ID numerico de la sale.order a firmar.",
+                },
+                "signature": {
+                    "type": "string",
+                    "description": (
+                        "PNG de la firma codificado en base64 SIN el prefijo "
+                        "'data:image/png;base64,' — solo el base64 puro."
+                    ),
+                },
+                "signed_by_name": {
+                    "type": "string",
+                    "description": "Nombre completo del firmante (minimo 3 caracteres).",
+                },
+                "auto_confirm": {
+                    "type": "boolean",
+                    "description": (
+                        "Si true (default), confirma la cotizacion despues de firmarla "
+                        "(action_confirm -> estado 'sale')."
+                    ),
+                    "default": True,
+                },
+            },
+            "required": ["order_id", "signature", "signed_by_name"],
+        },
+    },
+    {
         "name": "sri_import",
         "description": "Importar factura de compra del SRI usando la clave de acceso de 49 digitos. Usa esto cuando alguien envie un numero de 49 digitos.",
         "inputSchema": {
@@ -1970,6 +2009,17 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
+    if tool_name == "sign_quotation":
+        from mcp_odoo.tools.sales import odoo_sign_quotation
+        result = odoo_sign_quotation(
+            *creds,
+            order_id=int(args["order_id"]),
+            signature=args["signature"],
+            signed_by_name=args["signed_by_name"],
+            auto_confirm=args.get("auto_confirm", True),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
     if tool_name == "sri_import":
         from mcp_odoo.tools.sri import sri_import_create
         result = sri_import_create(*creds, args["access_key"])
@@ -2762,6 +2812,7 @@ _QUOTATION_TOOLS_NEEDING_CARD = {
     "set_quotation_header",
     "recalculate_quotation",
     "transition_quotation",
+    "sign_quotation",
 }
 
 
@@ -2784,6 +2835,7 @@ _TOOLS_WITH_ORDER_ID = {
     "recalculate_quotation",
     "get_quotation_state_summary",
     "transition_quotation",
+    "sign_quotation",
 }
 
 

@@ -4248,3 +4248,235 @@ def odoo_get_customer_purchase_history(
                "total_amount": result["total_amount"]},
               None, int((time.time() - started) * 1000))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Tool: sign_quotation — write digital signature to a sale.order
+# ---------------------------------------------------------------------------
+
+def odoo_sign_quotation(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int,
+    signature: str,
+    signed_by_name: str,
+    auto_confirm: bool = True,
+) -> dict:
+    """Sign a quotation by writing signature/signed_by/signed_on to sale.order.
+
+    Replicates the behavior of /my/orders/<id>/accept (Odoo portal):
+    1. Validates state in (draft, sent) and signature is null.
+    2. Writes signature (base64 PNG, no data:image prefix), signed_by, signed_on=now().
+    3. If auto_confirm=True and the quotation does not require payment,
+       calls action_confirm() to move state to 'sale'.
+
+    Args:
+        order_id: sale.order ID.
+        signature: PNG base64 SIN el prefijo "data:image/png;base64,".
+        signed_by_name: Full name of the signer (>= 3 chars).
+        auto_confirm: If True, confirm the order after signing.
+
+    Returns:
+        On success::
+
+            {
+                "success": True,
+                "order_id": int,
+                "name": str,
+                "state": str,
+                "signed_by": str,
+                "signed_on": str,  # ISO datetime
+                "action": "signed" | "signed_and_confirmed",
+            }
+
+        On failure::
+
+            {"success": False, "error_code": str, "error_detail": str}
+    """
+    import base64
+    from datetime import datetime, timezone
+
+    started = time.time()
+    log_args = {
+        "order_id": order_id,
+        "signed_by_name": signed_by_name,
+        "auto_confirm": auto_confirm,
+        "signature_len": len(signature) if isinstance(signature, str) else 0,
+    }
+
+    # 1) Validate signed_by_name length.
+    if not isinstance(signed_by_name, str) or len(signed_by_name.strip()) < 3:
+        result = {
+            "success": False,
+            "error_code": "invalid_signed_by_name",
+            "error_detail": "signed_by_name debe tener al menos 3 caracteres.",
+        }
+        _log_call("sign_quotation", tenant_id, log_args, None,
+                  result["error_detail"], int((time.time() - started) * 1000))
+        return result
+    signed_by_clean = signed_by_name.strip()
+
+    # 2) Validate signature is non-empty base64 (no data: prefix).
+    if not isinstance(signature, str) or not signature.strip():
+        result = {
+            "success": False,
+            "error_code": "invalid_signature",
+            "error_detail": "signature vacia. Debe ser PNG base64 sin el prefijo 'data:image/...'.",
+        }
+        _log_call("sign_quotation", tenant_id, log_args, None,
+                  result["error_detail"], int((time.time() - started) * 1000))
+        return result
+    if signature.startswith("data:"):
+        result = {
+            "success": False,
+            "error_code": "invalid_signature",
+            "error_detail": (
+                "signature incluye prefijo 'data:image/...'. "
+                "Envia solo el base64 puro (lo que va despues de la coma)."
+            ),
+        }
+        _log_call("sign_quotation", tenant_id, log_args, None,
+                  result["error_detail"], int((time.time() - started) * 1000))
+        return result
+    try:
+        # validate=True rejects non base64 chars; we only need a sanity check.
+        base64.b64decode(signature, validate=True)
+    except Exception as e:
+        result = {
+            "success": False,
+            "error_code": "invalid_signature",
+            "error_detail": f"signature no es base64 valido: {e}",
+        }
+        _log_call("sign_quotation", tenant_id, log_args, None,
+                  result["error_detail"], int((time.time() - started) * 1000))
+        return result
+
+    # 3) Read sale.order — verify it exists and is in a signable state.
+    order = _read_sale_order(
+        tenant_id, url, db, user, password, order_id,
+        ["name", "state", "signature", "amount_total", "partner_id",
+         "require_signature"],
+    )
+    if not order:
+        result = {
+            "success": False,
+            "error_code": "order_not_found",
+            "error_detail": f"sale.order {order_id} no existe",
+        }
+        _log_call("sign_quotation", tenant_id, log_args, None,
+                  result["error_detail"], int((time.time() - started) * 1000))
+        return result
+
+    allowed_states = {"draft", "sent"}
+    if order.get("state") not in allowed_states:
+        result = {
+            "success": False,
+            "error_code": "invalid_state",
+            "error_detail": (
+                f"La cotizacion {order.get('name', '?')} esta en estado "
+                f"'{order.get('state', '?')}' y no acepta firma. "
+                f"Estados permitidos: {sorted(allowed_states)}."
+            ),
+            "order_id": order_id,
+            "name": order.get("name"),
+            "state": order.get("state"),
+        }
+        _log_call("sign_quotation", tenant_id, log_args, None,
+                  result["error_detail"], int((time.time() - started) * 1000))
+        return result
+
+    if order.get("signature"):
+        result = {
+            "success": False,
+            "error_code": "already_signed",
+            "error_detail": (
+                f"La cotizacion {order.get('name', '?')} ya tiene firma. "
+                "No se puede sobrescribir."
+            ),
+            "order_id": order_id,
+            "name": order.get("name"),
+            "state": order.get("state"),
+        }
+        _log_call("sign_quotation", tenant_id, log_args, None,
+                  result["error_detail"], int((time.time() - started) * 1000))
+        return result
+
+    # 4) Build signed_on ISO datetime (UTC, naive — Odoo stores datetimes as
+    #    naive UTC strings 'YYYY-MM-DD HH:MM:SS').
+    now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+    now_iso = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 5) Write signature, signed_by, signed_on.
+    try:
+        odoo_write(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id],
+            {
+                "signature": signature,
+                "signed_by": signed_by_clean,
+                "signed_on": now_iso,
+            },
+        )
+    except Exception as e:
+        elapsed = int((time.time() - started) * 1000)
+        tb = traceback.format_exc()
+        logger.error("sign_quotation failed order=%s err=%s\n%s",
+                     order_id, e, tb)
+        _log_call("sign_quotation", tenant_id, log_args, None, str(e), elapsed)
+        return {
+            "success": False,
+            "error_code": "write_failed",
+            "error_detail": str(e),
+        }
+
+    action_taken = "signed"
+    final_state = order.get("state")
+
+    # 6) Optionally call action_confirm() to move state -> 'sale'.
+    if auto_confirm:
+        try:
+            odoo_call_method(
+                tenant_id, url, db, user, password,
+                "sale.order", "action_confirm", [order_id], {},
+            )
+            action_taken = "signed_and_confirmed"
+            after = _read_sale_order(
+                tenant_id, url, db, user, password, order_id,
+                ["state"],
+            ) or {}
+            final_state = after.get("state", final_state)
+        except Exception as e:
+            elapsed = int((time.time() - started) * 1000)
+            tb = traceback.format_exc()
+            logger.error("sign_quotation: action_confirm failed order=%s err=%s\n%s",
+                         order_id, e, tb)
+            _log_call("sign_quotation", tenant_id, log_args, None,
+                      f"confirm_failed: {e}", elapsed)
+            # Signature was written successfully; report partial success.
+            return {
+                "success": False,
+                "error_code": "confirm_failed",
+                "error_detail": (
+                    "La firma se guardo correctamente pero falla la "
+                    f"confirmacion automatica: {e}. La cotizacion sigue "
+                    "en estado firmable y puede confirmarse manualmente."
+                ),
+                "order_id": order_id,
+                "name": order.get("name"),
+                "state": order.get("state"),
+                "signed_by": signed_by_clean,
+                "signed_on": now_iso,
+                "action": "signed",
+            }
+
+    result = {
+        "success": True,
+        "order_id": order_id,
+        "name": order.get("name"),
+        "state": final_state,
+        "signed_by": signed_by_clean,
+        "signed_on": now_iso,
+        "action": action_taken,
+    }
+    _log_call("sign_quotation", tenant_id, log_args, result, None,
+              int((time.time() - started) * 1000))
+    return result
