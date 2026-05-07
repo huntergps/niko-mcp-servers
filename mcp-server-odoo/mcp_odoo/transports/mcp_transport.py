@@ -2092,6 +2092,9 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             "channel_user_id": str(args["channel_user_id"]).strip(),
             "message_prefix": str(args.get("message_prefix", "") or ""),
             "tenant_id": tc["tenant_id"],
+            # Forward agent_slug so the backend picks the right Telegram
+            # bot when the tenant has multiple (Niko B2C + Yarvis B2B).
+            "agent_slug": str(args.get("agent_slug", "") or "").strip(),
         }
 
         try:
