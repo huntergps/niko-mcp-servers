@@ -4456,13 +4456,21 @@ def odoo_sign_quotation(
                 confirm_method_used = method
                 break
             except Exception as e:
-                confirm_err = str(e)
+                err_msg = str(e)
+                # Odoo 13 action_aprobar/action_confirm return None;
+                # XML-RPC raises a marshal error but the action DID
+                # execute server-side. Same pattern as L1183 for
+                # odoo_confirm_sale_order — treat marshal-None as success.
+                if "cannot marshal None" in err_msg or "allow_none" in err_msg:
+                    confirm_method_used = method
+                    break
                 # If the method just doesn't exist on this Odoo install
                 # (vanilla without l10n_ec_sri), the call returns a
                 # MissingError-like message — try the next one.
+                confirm_err = err_msg
                 logger.info(
                     "sign_quotation: %s on order=%s failed (%s) — trying next",
-                    method, order_id, str(e)[:200],
+                    method, order_id, err_msg[:200],
                 )
                 continue
 
