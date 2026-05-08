@@ -4412,6 +4412,13 @@ def odoo_sign_quotation(
     now_iso = now_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     # 5) Write signature, signed_by, signed_on.
+    #
+    # Tecnosmart-specific gotcha: l10n_ec_sri overrides sale.order.write
+    # and (incorrectly) returns None instead of True. Odoo's XMLRPC layer
+    # then raises "cannot marshal None unless allow_none is enabled" - but
+    # the write DID execute server-side. Same fix-shape as the
+    # action_aprobar/action_confirm block below: treat marshal-None as
+    # success so vanilla Odoo tenants keep working too.
     try:
         odoo_write(
             tenant_id, url, db, user, password,
@@ -4423,16 +4430,24 @@ def odoo_sign_quotation(
             },
         )
     except Exception as e:
-        elapsed = int((time.time() - started) * 1000)
-        tb = traceback.format_exc()
-        logger.error("sign_quotation failed order=%s err=%s\n%s",
-                     order_id, e, tb)
-        _log_call("sign_quotation", tenant_id, log_args, None, str(e), elapsed)
-        return {
-            "success": False,
-            "error_code": "write_failed",
-            "error_detail": str(e),
-        }
+        err_msg = str(e)
+        if "cannot marshal None" in err_msg or "allow_none" in err_msg:
+            logger.info(
+                "sign_quotation: write returned marshal-None on order=%s "
+                "(l10n_ec_sri override returns None) -- treating as success",
+                order_id,
+            )
+        else:
+            elapsed = int((time.time() - started) * 1000)
+            tb = traceback.format_exc()
+            logger.error("sign_quotation failed order=%s err=%s\n%s",
+                         order_id, e, tb)
+            _log_call("sign_quotation", tenant_id, log_args, None, str(e), elapsed)
+            return {
+                "success": False,
+                "error_code": "write_failed",
+                "error_detail": err_msg,
+            }
 
     action_taken = "signed"
     final_state = order.get("state")
