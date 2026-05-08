@@ -655,12 +655,17 @@ MCP_TOOLS = [
     {
         "name": "list_quotations",
         "description": (
-            "Listar cotizaciones recientes — formato COMPACTO (cabecera + totales, SIN líneas). "
-            "USA cuando el usuario pida VER su lista/historial ('muéstrame mis cotizaciones', "
-            "'qué cotizaciones tengo'). NO USES cuando el usuario quiere AGREGAR/MODIFICAR algo: "
-            "para 'agregar a la última' usa get_latest_quotation; para 'agregar a la activa' usa "
-            "el order_id del SystemMessage. NO USES si ya tienes order_id en el contexto. "
-            "Devuelve {orders:[{order_id, name, state, state_label, total, subtotal, date_order, lines_count}]}."
+            "Listar VARIAS cotizaciones recientes (PLURAL) — formato COMPACTO (cabecera + totales, "
+            "SIN líneas). USA cuando el usuario pida VER múltiples ('muéstrame mis cotizaciones', "
+            "'qué cotizaciones tengo', 'los últimos productos que cotizé/proformé', 'mis últimas N "
+            "cotizaciones', 'qué he proformado'). Si el usuario quiere ver LOS PRODUCTOS de varias "
+            "cotizaciones, usa list_quotations con limit=N y luego get_quotation por cada order_id "
+            "para traer las líneas. NO USES cuando el usuario pida UNA SOLA (singular: 'mi última', "
+            "'la más reciente') — para ese caso usa get_latest_quotation. NO USES cuando el usuario "
+            "quiere AGREGAR/MODIFICAR algo: para 'agregar a la última' usa get_latest_quotation; "
+            "para 'agregar a la activa' usa el order_id del SystemMessage. NO USES si ya tienes "
+            "order_id en el contexto. Devuelve {orders:[{order_id, name, state, state_label, total, "
+            "subtotal, date_order, lines_count}]}."
         ),
         "inputSchema": {
             "type": "object",
@@ -737,10 +742,16 @@ MCP_TOOLS = [
     {
         "name": "get_latest_quotation",
         "description": (
+            "Devuelve UNA SOLA cotización (la más reciente) con detalle completo. "
             "PREFIÉRELA sobre get_active_quotation y list_quotations cuando el usuario use cualquier "
-            "ordinal: 'mi última proforma', 'la más reciente', 'la nueva', 'la última cotización', "
-            "'agrégalo a la última', 'mi pedido más reciente'. Internamente lista (limit=1) y devuelve "
-            "detalle completo. Combinable con add_to_quotation: get_latest_quotation → tomas el order_id "
+            "ordinal SINGULAR: 'mi última proforma' (singular), 'la más reciente', 'la nueva', "
+            "'la última cotización', 'agrégalo a la última', 'mi pedido más reciente'. "
+            "**NO LA USES** cuando el usuario pida MÚLTIPLES (plural): 'mis últimas N cotizaciones', "
+            "'los últimos productos que cotizé/proformé', 'qué he proformado en los últimos días', "
+            "'mis cotizaciones recientes' — para esos casos usa **list_quotations** con limit=N y "
+            "agrega las líneas de cada orden con get_quotation si necesitas el detalle. "
+            "Internamente lista (limit=1) y devuelve detalle completo. "
+            "Combinable con add_to_quotation: get_latest_quotation → tomas el order_id "
             "→ add_to_quotation(order_id, lines)."
         ),
         "inputSchema": {

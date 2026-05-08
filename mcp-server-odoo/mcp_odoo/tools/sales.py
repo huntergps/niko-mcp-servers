@@ -1504,10 +1504,16 @@ def get_latest_quotation(
     partner_id: int,
     states: list[str] | None = None,
 ) -> dict:
-    """Fetch the most recent quotation for a partner (limit=1, newest first).
+    """Fetch the SINGLE most recent quotation for a partner (limit=1, newest first).
 
     Returns full order detail (same format as get_quotation) plus _card metadata.
-    Use when the customer asks for 'mi última proforma', 'la más reciente', etc.
+    Use when the customer asks for ONE quotation in SINGULAR: 'mi última
+    proforma', 'la más reciente', 'la última cotización'.
+
+    DO NOT use when the customer asks for MULTIPLE in PLURAL: 'mis últimas N
+    cotizaciones', 'los últimos productos que cotizé/proformé', 'mis
+    cotizaciones recientes' — those need ``odoo_list_quotations(limit=N)`` and
+    optionally ``odoo_get_quotation`` per order to enumerate lines.
     """
     states = states or ["draft", "sent"]
     # Step 1: get the most recent order_id
