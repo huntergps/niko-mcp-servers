@@ -1061,6 +1061,53 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "create_payphone_link",
+        "description": (
+            "Genera un link de pago PayPhone para una cotizacion (sale.order) "
+            "ya existente. El link permite al cliente pagar con tarjeta de "
+            "credito o debito ecuatoriana. Usa esta tool cuando el cliente "
+            "pida 'link de pago', 'pagar con tarjeta', 'pago en linea' o "
+            "similar. Solo aplica a ordenes en estado draft, sent, approved "
+            "o sale. La tool devuelve link_url, client_tx_id, monto y la "
+            "fecha de expiracion (48h)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {
+                    "type": "integer",
+                    "description": "ID numerico de la sale.order en Odoo.",
+                },
+            },
+            "required": ["order_id"],
+        },
+    },
+    {
+        "name": "check_payphone_status",
+        "description": (
+            "Consulta el estado de un link PayPhone por su client_tx_id. "
+            "Usala cuando el cliente pregunte '¿ya pague?', '¿se acredito?' "
+            "o '¿en que esta mi pago?'. Si refresh=true, fuerza una "
+            "consulta a la API de PayPhone para actualizar el estado antes "
+            "de leerlo (recomendado cuando el cliente acaba de pagar)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client_tx_id": {
+                    "type": "string",
+                    "description": "Referencia PayPhone devuelta por create_payphone_link.",
+                },
+                "refresh": {
+                    "type": "boolean",
+                    "description": "true = poll a PayPhone antes de leer; false = lee solo el estado cacheado.",
+                    "default": False,
+                },
+            },
+            "required": ["client_tx_id"],
+        },
+    },
+    {
         "name": "niko_send_sign_request",
         "description": (
             "Envia al cliente del chat ACTUAL un mini-app para firmar la "
@@ -2063,6 +2110,23 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
+    if tool_name == "create_payphone_link":
+        from mcp_odoo.tools.payments import odoo_create_payphone_link
+        result = odoo_create_payphone_link(
+            *creds,
+            order_id=int(args["order_id"]),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "check_payphone_status":
+        from mcp_odoo.tools.payments import odoo_check_payphone_status
+        result = odoo_check_payphone_status(
+            *creds,
+            client_tx_id=str(args["client_tx_id"]),
+            refresh=bool(args.get("refresh", False)),
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
     if tool_name == "niko_send_sign_request":
         # Delegate to the niko backend so the channel-specific gateway
         # handles delivery. The MCP server INTENTIONALLY does not know
@@ -2980,6 +3044,7 @@ _TOOLS_WITH_ORDER_ID = {
     "transition_quotation",
     "sign_quotation",
     "niko_send_sign_request",
+    "create_payphone_link",
 }
 
 
