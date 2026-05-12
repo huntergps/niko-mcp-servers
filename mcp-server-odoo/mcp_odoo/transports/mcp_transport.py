@@ -576,7 +576,9 @@ MCP_TOOLS = [
             "IMPORTANTE: Antes de llamar esta herramienta, confirma con el cliente el resumen "
             "de productos, cantidades y precios. "
             "Para ventas a CONSUMIDOR FINAL (RUC 9999999999999): si la empresa requiere datos "
-            "del consumidor final, pasa end_customer_name, end_customer_phone y end_customer_email."
+            "del consumidor final, pasa end_customer_name, end_customer_phone y end_customer_email. "
+            "En flujos B2B (agente con vendedor autenticado), pasa `salesperson_user_id` con el "
+            "odoo_user_id del vendedor para que Odoo le atribuya la comisión correspondiente."
         ),
         "inputSchema": {
             "type": "object",
@@ -601,6 +603,14 @@ MCP_TOOLS = [
                 "end_customer_name": {"type": "string", "description": "Nombre del consumidor final (solo para ventas a consumidor final)"},
                 "end_customer_phone": {"type": "string", "description": "Telefono del consumidor final"},
                 "end_customer_email": {"type": "string", "description": "Email del consumidor final"},
+                "salesperson_user_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID del vendedor asignado (Odoo res.users). Opcional. Cuando viene, "
+                        "Odoo lo usa para calcular comisiones (sale.order.user_id). En B2B, "
+                        "el agente lo pasa con el odoo_user_id del vendedor autenticado."
+                    ),
+                },
             },
             "required": ["partner_id", "lines"],
         },
@@ -619,7 +629,9 @@ MCP_TOOLS = [
             "cuando ya tienes uno en el contexto. "
             "FLUJO OBLIGATORIO: llama primero con confirmed=false para obtener un preview. "
             "Muéstraselo al usuario. Solo llama con confirmed=true tras recibir confirmación explícita "
-            "('sí', 'confirmo', 'dale')."
+            "('sí', 'confirmo', 'dale'). "
+            "En flujos B2B puedes pasar `salesperson_user_id`; el backend SOLO lo escribirá si la "
+            "cotización todavía no tiene vendedor asignado (nunca sobreescribe al vendedor existente)."
         ),
         "inputSchema": {
             "type": "object",
@@ -642,6 +654,14 @@ MCP_TOOLS = [
                     "type": "boolean",
                     "description": "Pon true SOLO después de mostrar el preview al usuario y recibir confirmación explícita. Default: false (retorna preview solamente).",
                     "default": False,
+                },
+                "salesperson_user_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID del vendedor (Odoo res.users). Opcional. Solo se aplica si la cotización "
+                        "todavía no tiene vendedor asignado — nunca sobreescribe al existente. En B2B, "
+                        "el agente lo pasa con el odoo_user_id del vendedor autenticado."
+                    ),
                 },
             },
             "required": ["order_id", "lines"],
@@ -1938,6 +1958,7 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             end_customer_name=args.get("end_customer_name"),
             end_customer_phone=args.get("end_customer_phone"),
             end_customer_email=args.get("end_customer_email"),
+            salesperson_user_id=args.get("salesperson_user_id"),
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
@@ -1949,6 +1970,7 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             args["lines"],
             confirmed=bool(args.get("confirmed", False)),
             session_active_quotation_id=session_active_quotation_id,
+            salesperson_user_id=args.get("salesperson_user_id"),
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 

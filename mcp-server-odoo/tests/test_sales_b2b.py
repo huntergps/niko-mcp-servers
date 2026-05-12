@@ -294,53 +294,156 @@ class TestCreateQuotationSalesperson:
 
 
 class TestAddToQuotationSalesperson:
-    """``odoo_add_to_quotation`` accepts the param but never overwrites
-    ``user_id`` — it only ever merges into an existing order."""
+    """``odoo_add_to_quotation`` accepts ``salesperson_user_id`` and only
+    writes it onto ``sale.order.user_id`` when the order has no vendor
+    assigned yet. An existing user_id is NEVER overwritten."""
 
-    def test_salesperson_param_does_not_modify_user_id(self):
-        # Call the python function directly (not via HTTP) because the
-        # add_to_quotation endpoint isn't registered in server.py — the
-        # MCP transport is the only entry point.
-        from mcp_odoo.tools import sales as sales_mod
+    @staticmethod
+    def _add_to_quote_mock_calls(*, existing_user_id):
+        """Build the side_effect sequence for an add_to_quotation happy path.
 
-        mock_pool = MagicMock()
-        mock_pool.execute.side_effect = [
-            # 1) read existing order header (state=draft, editable)
+        ``existing_user_id`` is what the pre-write order read returns for
+        ``user_id``: either ``False`` (Odoo's "empty Many2one") or a
+        ``[id, name]`` pair when a vendor is already assigned.
+        """
+        return [
+            # 1) read existing order header — includes user_id
             [{"id": 88, "state": "draft", "partner_id": [1, "Cliente"],
-              "name": "SO-EXISTING"}],
+              "name": "SO-EXISTING", "user_id": existing_user_id}],
             # 2) variant lookup for the new line
-            [{"id": 50, "product_tmpl_id": [10, "Producto"], "uom_id": [1, "Units"]}],
-            # 3) create new sale.order.line → returns id
+            [{"id": 50, "product_tmpl_id": [10, "Producto"],
+              "uom_id": [1, "Units"]}],
+            # 3) read existing sale.order.line for merge check (none)
+            [],
+            # 4) create new sale.order.line → returns id
             500,
-            # 4) read updated header
+            # 5) read updated header
             [{"id": 88, "name": "SO-EXISTING", "state": "draft",
               "partner_id": [1, "Cliente"], "amount_untaxed": 100.0,
               "amount_tax": 15.0, "amount_total": 115.0,
               "order_line": [500], "share_link_so": ""}],
-            # 5) read order line
+            # 6) read order line
             [{"product_id": [50, "Producto"], "product_uom_qty": 1,
-              "price_unit": 100.0, "price_subtotal": 100.0, "price_total": 115.0}],
+              "price_unit": 100.0, "price_subtotal": 100.0,
+              "price_total": 115.0}],
         ]
+
+    def test_does_not_overwrite_existing_user(self):
+        """Order with user_id=[5, 'Ana'] → must NOT touch sale.order.user_id."""
+        from mcp_odoo.tools import sales as sales_mod
+
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = self._add_to_quote_mock_calls(
+            existing_user_id=[5, "Ana"],
+        )
         with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
             result = sales_mod.odoo_add_to_quotation(
                 "test-tenant-001", "http://x", "db", "u", "p",
                 88,
                 [{"product_id": 10, "quantity": 1}],
+                confirmed=True,
                 salesperson_user_id=99,
             )
 
-        assert result["success"] is True
+        assert result["success"] is True, result
 
-        # Across all calls, never write user_id on sale.order.
+        # No sale.order WRITE should carry a user_id payload, because
+        # the order already had one.
         for call in mock_pool.execute.call_args_list:
             args = call.args
             model = args[5]
             method = args[6]
-            if model == "sale.order" and method in ("write", "create"):
-                # No "user_id" should be in the payload from this tool.
-                payload = args[7][0] if isinstance(args[7][0], dict) else args[7][1]
+            if model == "sale.order" and method == "write":
+                payload = args[7][1] if isinstance(args[7], list) else args[7]
                 if isinstance(payload, dict):
-                    assert "user_id" not in payload
+                    assert "user_id" not in payload, (
+                        f"add_to_quotation must not overwrite existing user_id "
+                        f"(got payload={payload!r})"
+                    )
+
+    def test_sets_user_id_when_order_has_no_vendor(self):
+        """Order with user_id=False → set sale.order.user_id = salesperson."""
+        from mcp_odoo.tools import sales as sales_mod
+
+        # Need an extra slot for the sale.order write that sets user_id.
+        calls = self._add_to_quote_mock_calls(existing_user_id=False)
+        # Insert the sale.order write between line create (idx 3) and the
+        # post-write read (idx 4). Our implementation issues the write
+        # AFTER the line create but BEFORE the read-after-write.
+        calls.insert(4, True)  # sale.order write → True
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = calls
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            result = sales_mod.odoo_add_to_quotation(
+                "test-tenant-001", "http://x", "db", "u", "p",
+                88,
+                [{"product_id": 10, "quantity": 1}],
+                confirmed=True,
+                salesperson_user_id=99,
+            )
+
+        assert result["success"] is True, result
+
+        sale_order_writes = [
+            c for c in mock_pool.execute.call_args_list
+            if c.args[5] == "sale.order" and c.args[6] == "write"
+        ]
+        assert sale_order_writes, (
+            "Expected exactly one sale.order write to set user_id"
+        )
+        # write payload is the 2nd positional inside args[7]:
+        # execute(..., 'sale.order', 'write', [ids, vals], {})
+        payload = sale_order_writes[0].args[7][1]
+        assert payload == {"user_id": 99}
+
+    def test_no_write_when_salesperson_user_id_omitted(self):
+        """No salesperson_user_id passed → no sale.order write at all,
+        regardless of whether the order has a vendor."""
+        from mcp_odoo.tools import sales as sales_mod
+
+        mock_pool = MagicMock()
+        mock_pool.execute.side_effect = self._add_to_quote_mock_calls(
+            existing_user_id=False,
+        )
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            result = sales_mod.odoo_add_to_quotation(
+                "test-tenant-001", "http://x", "db", "u", "p",
+                88,
+                [{"product_id": 10, "quantity": 1}],
+                confirmed=True,
+            )
+
+        assert result["success"] is True, result
+
+        sale_order_writes = [
+            c for c in mock_pool.execute.call_args_list
+            if c.args[5] == "sale.order" and c.args[6] == "write"
+        ]
+        assert sale_order_writes == [], (
+            "Without salesperson_user_id, add_to_quotation must never "
+            "write to sale.order"
+        )
+
+
+class TestCreateQuotationSalespersonValidation:
+    """Schema-level validation: the FastAPI endpoint must reject a
+    non-integer ``salesperson_user_id`` BEFORE the tool ever executes."""
+
+    def test_invalid_salesperson_id_rejected_by_pydantic(self, client):
+        # No need to mock the pool — Pydantic should reject the payload
+        # at parse-time and return 422 Unprocessable Entity.
+        mock_pool = MagicMock()
+        with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
+            response = client.post(
+                "/tools/odoo_create_quotation",
+                json={
+                    "partner_id": 1,
+                    "lines": [{"product_id": 10, "quantity": 1}],
+                    "salesperson_user_id": "abc",  # not an int
+                },
+            )
+        assert response.status_code == 422, response.text
+        mock_pool.execute.assert_not_called()
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -206,6 +206,7 @@ def odoo_create_quotation(
     end_customer_name: str | None = None,
     end_customer_phone: str | None = None,
     end_customer_email: str | None = None,
+    salesperson_user_id: int | None = None,
 ) -> dict:
     """Create a sale order (quotation/proforma) in draft state.
 
@@ -216,6 +217,11 @@ def odoo_create_quotation(
         end_customer_name: Name of the end customer (consumidor final)
         end_customer_phone: Phone of the end customer
         end_customer_email: Email of the end customer
+        salesperson_user_id: Optional res.users ID. When provided, it is
+            written to ``sale.order.user_id`` so Odoo attributes commissions
+            to that vendor. Used by the B2B flow where the agent passes the
+            authenticated seller's ``odoo_user_id``. If omitted, Odoo
+            defaults to the connection user.
 
     Returns the created order details (read-after-write).
     On failure returns {success: False, error_code, error_detail, partner_id, lines}.
@@ -403,6 +409,27 @@ def odoo_create_quotation(
     if end_customer_email:
         values["end_customer_email"] = end_customer_email
 
+    # Vendedor asignado (B2B commission attribution). Odoo calcula comisiones
+    # según sale.order.user_id; cuando el agente B2B autenticado pasa su
+    # odoo_user_id, lo escribimos aquí para que la cotización quede
+    # correctamente atribuida. Si viene None, Odoo usa el connection user
+    # por default.
+    if salesperson_user_id is not None:
+        try:
+            values["user_id"] = int(salesperson_user_id)
+        except (TypeError, ValueError):
+            err = (
+                f"salesperson_user_id debe ser entero, recibido "
+                f"{salesperson_user_id!r}"
+            )
+            _log_call("create_quotation", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {
+                "success": False,
+                "error_code": "invalid_salesperson_user_id",
+                "error_detail": err,
+            }
+
     # ── Create the sale.order ────────────────────────────────────────────
     try:
         order_id = odoo_create(
@@ -494,6 +521,7 @@ def odoo_add_to_quotation(
     lines: list[dict],
     confirmed: bool = False,
     session_active_quotation_id: int | None = None,
+    salesperson_user_id: int | None = None,
 ) -> dict:
     """Append product lines to an existing sale.order in draft state.
 
@@ -509,6 +537,12 @@ def odoo_add_to_quotation(
         order_id: existing sale.order ID
         lines: [{product_id (template_id), quantity}, ...]
         confirmed: False = dry-run preview only; True = execute the write
+        salesperson_user_id: Optional res.users ID. We NEVER overwrite an
+            already-assigned vendedor — that would steal commissions from
+            whoever owns the order. Only when the order has no user_id
+            (e.g. created by an automation without a vendor) AND a value is
+            provided here, we set it. This is the safest behaviour for
+            add-to operations.
 
     Returns the updated order summary (same shape as create_quotation) when
     confirmed=True, or a preview dict when confirmed=False.
@@ -559,7 +593,8 @@ def odoo_add_to_quotation(
     try:
         orders = odoo_read(
             tenant_id, url, db, user, password,
-            "sale.order", [order_id], ["id", "state", "partner_id", "name", "amount_total"],
+            "sale.order", [order_id],
+            ["id", "state", "partner_id", "name", "amount_total", "user_id"],
         )
     except Exception as e:
         err = f"Error leyendo sale.order {order_id}: {e}"
@@ -722,6 +757,27 @@ def odoo_add_to_quotation(
                 tenant_id, url, db, user, password,
                 "sale.order.line", vals,
             )
+
+        # B2B commission attribution: when a salesperson_user_id is provided
+        # AND the order has NO user assigned (rare; Odoo defaults to the
+        # connection user at create-time, but legacy data or imports can
+        # leave it empty), set it. We NEVER overwrite an existing user_id —
+        # that would steal commissions from the original vendedor.
+        if salesperson_user_id is not None:
+            try:
+                sp_id = int(salesperson_user_id)
+            except (TypeError, ValueError):
+                sp_id = None
+            existing_user = order.get("user_id")
+            # Odoo returns Many2one as either False, [id, name], or omitted.
+            has_user = bool(existing_user) and not (
+                isinstance(existing_user, list) and not existing_user
+            )
+            if sp_id is not None and not has_user:
+                odoo_write(
+                    tenant_id, url, db, user, password,
+                    "sale.order", [order_id], {"user_id": sp_id},
+                )
     except Exception as e:
         elapsed = int((time.time() - started) * 1000)
         tb = traceback.format_exc()
