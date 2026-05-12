@@ -10,6 +10,104 @@ from mcp_odoo.tools.generic import odoo_search, odoo_read, odoo_create, odoo_wri
 logger = logging.getLogger("mcp_odoo.sales")
 
 
+# ---------------------------------------------------------------------------
+# Anti-confusion guard: detect when an LLM passes the numeric suffix of a
+# sale.order ``name`` (ej. 'VENTA122173' → 122173) as if it were the
+# ``sale.order.id`` (which would be a different integer, ej. 113604).
+#
+# Production incident (2026-05-12): the LLM ran
+#   get_quotation(order_id=113604)        → ✅ returned VENTA122173
+#   find_quotation_by_name('VENTA122173') → redundant
+#   get_quotation(order_id=122173)        → ❌ order does not exist
+# and after the error, drifted off the original request.
+#
+# The heuristic below catches this: when the order_id falls in the range
+# of the in-use ``name`` suffixes AND a record ``name='VENTA{order_id}'``
+# exists, we reject the call with a precise error pointing at the real id.
+# ---------------------------------------------------------------------------
+
+# In-use VENTA suffix range as of 2026-05 (Tecnosmart).
+_NAME_SUFFIX_RANGE = (110_000, 130_000)
+
+
+def _looks_like_name_suffix(order_id_int: int) -> bool:
+    """Return True if ``order_id_int`` falls in the in-use ``name`` suffix range.
+
+    Tecnosmart sale.order.name follows the pattern ``VENTAxxxxxx`` with a
+    monotonically increasing 6-digit suffix in the [110000, 129999]
+    range as of 2026-05. Real ``sale.order.id`` values also live around
+    this range, so we CANNOT distinguish a real id from a name suffix by
+    value alone — we need a confirmation lookup downstream.
+
+    This function is the cheap pre-filter that skips the lookup for
+    values that obviously aren't suffix candidates (e.g. 42).
+    """
+    lo, hi = _NAME_SUFFIX_RANGE
+    return lo <= order_id_int <= hi
+
+
+def _guard_order_id_vs_name_suffix(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    order_id: int,
+) -> dict | None:
+    """If ``order_id`` looks like the suffix of an existing ``name``, reject.
+
+    Returns a structured error dict when confusion is detected, or
+    ``None`` when the value passes the guard (i.e. either it falls
+    outside the suspicious range, OR no ``VENTA{order_id}`` exists).
+
+    Important: we only reject when BOTH the value is in the suspicious
+    range AND a ``sale.order`` with ``name='VENTA{order_id}'`` exists in
+    this tenant. Otherwise the call goes through unchanged (so real
+    order_ids in [110000, 130000] keep working as long as no name with
+    the same suffix exists; if a name DOES exist with the same suffix
+    AND the value happens to be a valid order_id, the LLM should call
+    ``get_quotation_state_summary`` / ``find_quotation_by_name`` first
+    anyway — the false positive is intentional defense-in-depth).
+    """
+    if not _looks_like_name_suffix(order_id):
+        return None
+    try:
+        candidate_name = f"VENTA{order_id}"
+        check = odoo_search(
+            tenant_id, url, db, user, password,
+            "sale.order",
+            [["name", "=", candidate_name]],
+            ["id"],
+            limit=1,
+        )
+    except Exception:
+        # If the verification lookup fails, fall through to the normal
+        # flow — we never block legitimate calls because the guard
+        # itself errored out.
+        return None
+    if not check:
+        return None
+    real_id = check[0]["id"] if isinstance(check[0], dict) else check[0]
+    if real_id == order_id:
+        # The value IS a real order_id that happens to share its
+        # numeric value with its own name suffix — not confusion.
+        return None
+    err = (
+        f"order_id={order_id} parece ser el sufijo del name "
+        f"'{candidate_name}', NO el order_id real. El order_id de "
+        f"'{candidate_name}' es {real_id}. Reintenta con "
+        f"order_id={real_id}, O si no estás seguro llama "
+        f"find_quotation_by_name(name='{candidate_name}')."
+    )
+    return {
+        "success": False,
+        "error_code": "order_id_looks_like_name_suffix",
+        "error_detail": err,
+        "hint": (
+            "Pasa el order_id real (devuelto por list_quotations o "
+            "find_quotation_by_name), NO el sufijo numérico del name."
+        ),
+        "suggested_order_id": real_id,
+        "found_name": candidate_name,
+    }
+
+
 def _log_call(tool: str, tenant_id: str, args: dict, result: dict | None, error: str | None, elapsed_ms: int):
     """Structured log of every Odoo tool call. Goes to stdout (captured by docker logs)."""
     payload = {
@@ -559,6 +657,16 @@ def odoo_add_to_quotation(
         _log_call("add_to_quotation", tenant_id, log_args, None, err, 0)
         return {"success": False, "error_code": "no_lines", "error_detail": err}
 
+    # Anti-confusion guard: reject when order_id looks like the numeric
+    # suffix of a sale.order name (e.g. 'VENTA122173' → 122173).
+    guard = _guard_order_id_vs_name_suffix(
+        tenant_id, url, db, user, password, order_id,
+    )
+    if guard is not None:
+        _log_call("add_to_quotation", tenant_id, log_args, guard, None,
+                  int((time.time() - started) * 1000))
+        return guard
+
     # Dry-runs (confirmed=False) pass through so the LLM can show a preview
     # and the user can decide.
     #
@@ -1029,6 +1137,16 @@ def odoo_get_quotation(
     if not isinstance(order_id, int) or order_id <= 0:
         return {"success": False, "error_code": "invalid_order_id"}
 
+    # Anti-confusion guard: reject when order_id looks like the numeric
+    # suffix of a sale.order name (e.g. 'VENTA122173' → 122173).
+    guard = _guard_order_id_vs_name_suffix(
+        tenant_id, url, db, user, password, order_id,
+    )
+    if guard is not None:
+        _log_call("get_quotation", tenant_id, log_args, guard, None,
+                  int((time.time() - started) * 1000))
+        return guard
+
     try:
         orders = odoo_read(
             tenant_id, url, db, user, password,
@@ -1137,6 +1255,15 @@ def odoo_render_quotation_pdf(
     if not isinstance(order_id, int) or order_id <= 0:
         return {"success": False, "error_code": "invalid_order_id"}
 
+    # Anti-confusion guard: reject when order_id looks like a name suffix.
+    guard = _guard_order_id_vs_name_suffix(
+        tenant_id, url, db, user, password, order_id,
+    )
+    if guard is not None:
+        _log_call("render_quotation_pdf", tenant_id, log_args, guard, None,
+                  int((time.time() - started) * 1000))
+        return guard
+
     # ── 1. Resolve order name (used for filename) ───────────────────────
     try:
         rows = odoo_read(
@@ -1242,6 +1369,15 @@ def odoo_send_quotation(
         confirmed: False = dry-run preview only; True = execute the send
         session_active_quotation_id: active quotation ID from the user's session
     """
+    # Anti-confusion guard: reject when order_id looks like the numeric
+    # suffix of a sale.order name (e.g. 'VENTA122173' → 122173).
+    if isinstance(order_id, int) and order_id > 0:
+        guard = _guard_order_id_vs_name_suffix(
+            tenant_id, url, db, user, password, order_id,
+        )
+        if guard is not None:
+            return guard
+
     # Validate that the order_id matches the quotation the user explicitly
     # selected in this session.
     if session_active_quotation_id is None:
@@ -1346,6 +1482,15 @@ def odoo_confirm_sale_order(
         confirmed: False = dry-run preview only; True = execute the confirmation
         session_active_quotation_id: active quotation ID from the user's session
     """
+    # Anti-confusion guard: reject when order_id looks like the numeric
+    # suffix of a sale.order name (e.g. 'VENTA122173' → 122173).
+    if isinstance(order_id, int) and order_id > 0:
+        guard = _guard_order_id_vs_name_suffix(
+            tenant_id, url, db, user, password, order_id,
+        )
+        if guard is not None:
+            return guard
+
     # Validate that the order_id matches the quotation the user explicitly
     # selected in this session.
     if session_active_quotation_id is None:
@@ -2233,6 +2378,16 @@ def odoo_change_quotation_customer(
         "reprice_lines": reprice_lines, "confirmed": confirmed,
     }
 
+    # Anti-confusion guard: reject when order_id looks like a name suffix.
+    if isinstance(order_id, int) and order_id > 0:
+        guard = _guard_order_id_vs_name_suffix(
+            tenant_id, url, db, user, password, order_id,
+        )
+        if guard is not None:
+            _log_call("change_quotation_customer", tenant_id, log_args,
+                      guard, None, int((time.time() - started) * 1000))
+            return guard
+
     order = _read_sale_order(
         tenant_id, url, db, user, password, order_id,
         ["id", "name", "state", "partner_id", "pricelist_id",
@@ -2397,6 +2552,16 @@ def odoo_apply_global_discount(
         return {"success": False, "error_code": "discount_out_of_range",
                 "error_detail": f"discount_rate debe estar entre 0 y 100 para type=percent"}
 
+    # Anti-confusion guard: reject when order_id looks like a name suffix.
+    if isinstance(order_id, int) and order_id > 0:
+        guard = _guard_order_id_vs_name_suffix(
+            tenant_id, url, db, user, password, order_id,
+        )
+        if guard is not None:
+            _log_call("apply_global_discount", tenant_id, log_args,
+                      guard, None, int((time.time() - started) * 1000))
+            return guard
+
     order = _read_sale_order(
         tenant_id, url, db, user, password, order_id,
         ["id", "name", "state", "partner_id", "amount_untaxed"],
@@ -2522,6 +2687,16 @@ def odoo_set_quotation_header(
                     + ", ".join(_HEADER_FIELDS.keys())
                 )}
 
+    # Anti-confusion guard: reject when order_id looks like a name suffix.
+    if isinstance(order_id, int) and order_id > 0:
+        guard = _guard_order_id_vs_name_suffix(
+            tenant_id, url, db, user, password, order_id,
+        )
+        if guard is not None:
+            _log_call("set_quotation_header", tenant_id, log_args, guard,
+                      None, int((time.time() - started) * 1000))
+            return guard
+
     order = _read_sale_order(
         tenant_id, url, db, user, password, order_id,
         ["id", "name", "state"] + list(_HEADER_FIELDS.keys()),
@@ -2602,6 +2777,16 @@ def odoo_add_quotation_line(
     started = time.time()
     log_args = {"order_id": order_id, "product_id": product_id,
                 "code": code, "quantity": quantity, "confirmed": confirmed}
+
+    # Anti-confusion guard: reject when order_id looks like a name suffix.
+    if isinstance(order_id, int) and order_id > 0:
+        guard = _guard_order_id_vs_name_suffix(
+            tenant_id, url, db, user, password, order_id,
+        )
+        if guard is not None:
+            _log_call("add_quotation_line", tenant_id, log_args, guard,
+                      None, int((time.time() - started) * 1000))
+            return guard
 
     # Resolve code → product_id (template_id) when caller passed code only.
     if product_id is None and code:
@@ -2722,6 +2907,15 @@ def odoo_recalculate_quotation(
     cambios masivos cuando se sospecha que ``amount_total`` quedó
     desincronizado del subtotal de líneas."""
     started = time.time()
+
+    # Anti-confusion guard: reject when order_id looks like a name suffix.
+    if isinstance(order_id, int) and order_id > 0:
+        guard = _guard_order_id_vs_name_suffix(
+            tenant_id, url, db, user, password, order_id,
+        )
+        if guard is not None:
+            return guard
+
     order = _read_sale_order(
         tenant_id, url, db, user, password, order_id,
         ["id", "name", "state"],
@@ -2764,6 +2958,15 @@ def odoo_get_quotation_state_summary(
     modificar: estado, totales, lineas con flags de editabilidad,
     facturas vinculadas, pickings."""
     started = time.time()
+
+    # Anti-confusion guard: reject when order_id looks like a name suffix.
+    if isinstance(order_id, int) and order_id > 0:
+        guard = _guard_order_id_vs_name_suffix(
+            tenant_id, url, db, user, password, order_id,
+        )
+        if guard is not None:
+            return guard
+
     fields = [
         "id", "name", "state", "amount_untaxed", "amount_tax", "amount_total",
         "partner_id", "user_id", "date_order", "validity_date",
@@ -2905,6 +3108,16 @@ def odoo_transition_quotation(
                 )}
 
     method, allowed = _TRANSITIONS[action]
+
+    # Anti-confusion guard: reject when order_id looks like a name suffix.
+    if isinstance(order_id, int) and order_id > 0:
+        guard = _guard_order_id_vs_name_suffix(
+            tenant_id, url, db, user, password, order_id,
+        )
+        if guard is not None:
+            _log_call("transition_quotation", tenant_id, log_args, guard,
+                      None, int((time.time() - started) * 1000))
+            return guard
 
     order = _read_sale_order(
         tenant_id, url, db, user, password, order_id,
@@ -3155,6 +3368,17 @@ def odoo_get_order_delivery_status(
     if not isinstance(order_id, int) or order_id <= 0:
         return {"success": False, "error_code": "invalid_order_id",
                 "error_detail": "Se requiere order_id (entero) o order_name valido"}
+
+    # Anti-confusion guard: if order_id was passed directly (not
+    # resolved from order_name), reject when it looks like a name suffix.
+    if order_name is None:
+        guard = _guard_order_id_vs_name_suffix(
+            tenant_id, url, db, user, password, order_id,
+        )
+        if guard is not None:
+            _log_call("get_order_delivery_status", tenant_id, log_args,
+                      guard, None, int((time.time() - started) * 1000))
+            return guard
 
     # Leer cabecera del pedido
     try:
@@ -3762,6 +3986,7 @@ def odoo_duplicate_quotation(
         return {"success": False, "error_code": "missing_args", "error_detail": err}
 
     # Resolver order_name → order_id si hace falta
+    name_resolved = False
     if not order_id:
         resolved = odoo_find_quotation_by_name(
             tenant_id, url, db, user, password, order_name,
@@ -3772,6 +3997,19 @@ def odoo_duplicate_quotation(
                       int((time.time() - started) * 1000))
             return resolved
         order_id = resolved["order_id"]
+        name_resolved = True
+
+    # Anti-confusion guard: when order_id was passed directly (not
+    # resolved from order_name above), reject if it looks like a name
+    # suffix.
+    if not name_resolved and isinstance(order_id, int) and order_id > 0:
+        guard = _guard_order_id_vs_name_suffix(
+            tenant_id, url, db, user, password, order_id,
+        )
+        if guard is not None:
+            _log_call("duplicate_quotation", tenant_id, log_args, guard,
+                      None, int((time.time() - started) * 1000))
+            return guard
 
     # Verificar que la cotizacion existe
     try:
@@ -4193,6 +4431,16 @@ def odoo_get_quotation_margin(
     if not isinstance(order_id, int) or order_id <= 0:
         return {"success": False, "error_code": "invalid_order_id",
                 "error_detail": "Se requiere order_id (entero) o order_name valido"}
+
+    # Anti-confusion guard: only when caller passed order_id directly.
+    if order_name is None:
+        guard = _guard_order_id_vs_name_suffix(
+            tenant_id, url, db, user, password, order_id,
+        )
+        if guard is not None:
+            _log_call("get_quotation_margin", tenant_id, log_args, guard,
+                      None, int((time.time() - started) * 1000))
+            return guard
 
     # Leer cabecera. Pedimos `margin` directamente; si el modulo sale_margin
     # no esta instalado, Odoo lanza error y caemos al fallback.
@@ -4640,6 +4888,16 @@ def odoo_sign_quotation(
         _log_call("sign_quotation", tenant_id, log_args, None,
                   result["error_detail"], int((time.time() - started) * 1000))
         return result
+
+    # Anti-confusion guard: reject when order_id looks like a name suffix.
+    if isinstance(order_id, int) and order_id > 0:
+        guard = _guard_order_id_vs_name_suffix(
+            tenant_id, url, db, user, password, order_id,
+        )
+        if guard is not None:
+            _log_call("sign_quotation", tenant_id, log_args, guard, None,
+                      int((time.time() - started) * 1000))
+            return guard
 
     # 3) Read sale.order — verify it exists and is in a signable state.
     order = _read_sale_order(

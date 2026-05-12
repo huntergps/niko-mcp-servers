@@ -631,12 +631,24 @@ MCP_TOOLS = [
             "Muéstraselo al usuario. Solo llama con confirmed=true tras recibir confirmación explícita "
             "('sí', 'confirmo', 'dale'). "
             "En flujos B2B puedes pasar `salesperson_user_id`; el backend SOLO lo escribirá si la "
-            "cotización todavía no tiene vendedor asignado (nunca sobreescribe al vendedor existente)."
+            "cotización todavía no tiene vendedor asignado (nunca sobreescribe al vendedor existente). "
+            "Si recibes 'VENTAxxxxxx' del cliente o de otra tool, NUNCA extraigas los dígitos como "
+            "order_id — usa find_quotation_by_name."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "order_id": {"type": "integer", "description": "ID de la cotizacion existente (devuelto por create_quotation)"},
+                "order_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID INTERNO de sale.order (ej. 113604). REGLA CRÍTICA: el `name` "
+                        "humano (VENTA122173) tiene un sufijo numérico (122173) que NO es el "
+                        "order_id. NUNCA pases el sufijo del name como order_id. Si solo "
+                        "conoces el name (formato 'VENTA' + 6 dígitos), llama "
+                        "find_quotation_by_name(name='VENTA122173') primero para obtener el "
+                        "order_id real."
+                    ),
+                },
                 "lines": {
                     "type": "array",
                     "items": {
@@ -720,12 +732,24 @@ MCP_TOOLS = [
             "Usa SOLO cuando el cliente pida ver el detalle de una cotización específica "
             "('muéstrame VENTA120704', 'qué tiene esa cotización'). Para listar las cotizaciones "
             "recientes usa list_quotations. Para obtener 'la última proforma' usa "
-            "get_latest_quotation, NO get_quotation con order_id adivinado."
+            "get_latest_quotation, NO get_quotation con order_id adivinado. "
+            "Si recibes 'VENTAxxxxxx' del cliente o de otra tool, NUNCA extraigas los dígitos "
+            "como order_id — usa find_quotation_by_name."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "order_id": {"type": "integer", "description": "ID de la cotizacion (devuelto por list_quotations o create_quotation)"},
+                "order_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID INTERNO de sale.order (ej. 113604). REGLA CRÍTICA: el `name` "
+                        "humano (VENTA122173) tiene un sufijo numérico (122173) que NO es el "
+                        "order_id. NUNCA pases el sufijo del name como order_id. Si solo "
+                        "conoces el name (formato 'VENTA' + 6 dígitos), llama "
+                        "find_quotation_by_name(name='VENTA122173') primero para obtener el "
+                        "order_id real."
+                    ),
+                },
             },
             "required": ["order_id"],
         },
@@ -877,12 +901,23 @@ MCP_TOOLS = [
             "Para 'agrega 2 mas' (delta) usa add_to_quotation/add_quotation_line; esta tool REEMPLAZA. "
             "Para cambiar el producto puedes pasar `product_id` (template_id) o `code` (default_code, "
             "ej. 'MON0026'); si pasas code el backend resuelve internamente. "
-            "FLUJO OBLIGATORIO: confirmed=false primero (preview), confirmed=true tras confirmacion."
+            "FLUJO OBLIGATORIO: confirmed=false primero (preview), confirmed=true tras confirmacion. "
+            "IMPORTANTE: esta tool toma `line_id` (sale.order.line.id), NO order_id, NO el sufijo "
+            "numérico del name. Llama get_quotation_state_summary(order_id=...) o "
+            "get_quotation(order_id=...) primero para obtener el `line_id` real."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "line_id": {"type": "integer", "description": "ID de la sale.order.line — sale en get_quotation/get_quotation_state_summary"},
+                "line_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID INTERNO de sale.order.line (entero positivo). Se obtiene de "
+                        "get_quotation/get_quotation_state_summary — NUNCA inventes este ID "
+                        "ni uses el order_id o el sufijo del name (VENTA122173 → 122173) "
+                        "en su lugar."
+                    ),
+                },
                 "quantity": {"type": "number", "description": "Nueva cantidad TOTAL (no delta). Si quieres eliminar la linea, usa remove_quotation_line."},
                 "price_unit": {"type": "number", "description": "Nuevo precio unitario (sobreescribe el del producto)."},
                 "discount": {"type": "number", "description": "Descuento porcentual de la linea (0-100). Limitado por partner_max_sale_discount."},
@@ -900,12 +935,23 @@ MCP_TOOLS = [
             "Eliminar una linea de la cotizacion. En estado draft/sent hace unlink real; en sale "
             "cae automaticamente a qty=0 (porque l10n_ec_sri bloquea unlink si la orden tiene "
             "factura). Para 'cambiar a 0 unidades' que conserve la linea, usa update_quotation_line "
-            "con quantity=0. FLUJO OBLIGATORIO: confirmed=false (preview), confirmed=true (ejecuta)."
+            "con quantity=0. FLUJO OBLIGATORIO: confirmed=false (preview), confirmed=true (ejecuta). "
+            "IMPORTANTE: esta tool toma `line_id` (sale.order.line.id), NO order_id, NO el sufijo "
+            "numérico del name. Llama get_quotation_state_summary(order_id=...) primero para "
+            "obtener el `line_id` real."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "line_id": {"type": "integer", "description": "ID de la linea a eliminar"},
+                "line_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID INTERNO de la sale.order.line a eliminar. Se obtiene de "
+                        "get_quotation/get_quotation_state_summary — NUNCA inventes este ID "
+                        "ni uses el order_id o el sufijo del name (VENTA122173 → 122173) "
+                        "en su lugar."
+                    ),
+                },
                 "mode": {
                     "type": "string",
                     "enum": ["auto", "unlink", "qty_zero"],
@@ -1043,12 +1089,24 @@ MCP_TOOLS = [
             "Disparar una transicion de estado en la cotizacion. Acciones validas: confirm, cancel, "
             "draft, approve, reject, done, unlock, generar_despacho, generar_factura, "
             "procesar_venta, aprobar. ACCIONES POTENCIALMENTE IRREVERSIBLES — confirma con el "
-            "usuario antes."
+            "usuario antes. "
+            "Si recibes 'VENTAxxxxxx' del cliente o de otra tool, NUNCA extraigas los dígitos "
+            "como order_id — usa find_quotation_by_name."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "order_id": {"type": "integer"},
+                "order_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID INTERNO de sale.order (ej. 113604). REGLA CRÍTICA: el `name` "
+                        "humano (VENTA122173) tiene un sufijo numérico (122173) que NO es el "
+                        "order_id. NUNCA pases el sufijo del name como order_id. Si solo "
+                        "conoces el name (formato 'VENTA' + 6 dígitos), llama "
+                        "find_quotation_by_name(name='VENTA122173') primero para obtener el "
+                        "order_id real."
+                    ),
+                },
                 "action": {
                     "type": "string",
                     "enum": ["confirm", "cancel", "draft", "approve", "reject",
