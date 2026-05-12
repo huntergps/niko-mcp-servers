@@ -568,6 +568,11 @@ MCP_TOOLS = [
         "name": "create_quotation",
         "description": (
             "Crear una cotizacion/proforma en Odoo para un cliente con lineas de productos. "
+            "Cada linea acepta `product_id` (entero, template_id de Odoo) O `code` (string, "
+            "default_code visible como 'MON0026', 'LAP0176'). Si pasas `code` y NO `product_id`, "
+            "el backend resuelve internamente el template_id por default_code exacto — esta es la "
+            "forma PREFERIDA porque elimina la posibilidad de inventar template_ids. Si pasas "
+            "ambos, el backend valida que coincidan (error `product_code_mismatch` si no). "
             "IMPORTANTE: Antes de llamar esta herramienta, confirma con el cliente el resumen "
             "de productos, cantidades y precios. "
             "Para ventas a CONSUMIDOR FINAL (RUC 9999999999999): si la empresa requiere datos "
@@ -582,13 +587,14 @@ MCP_TOOLS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "product_id": {"type": "integer"},
-                            "code": {"type": "string", "description": "default_code del producto (ej. LAP0176). Declararlo permite validar que el template_id sea el correcto y evitar mezclar productos."},
+                            "product_id": {"type": "integer", "description": "template_id de Odoo (product.template.id). Alternativa a `code`."},
+                            "code": {"type": "string", "description": "Código visible del producto (default_code en Odoo, ej. 'MON0026'). Alternativa a `product_id`. Si pasas code y no product_id, el backend resuelve internamente. Si pasas ambos, el backend valida consistencia."},
                             "quantity": {"type": "number", "default": 1},
                             "price_unit": {"type": "number", "description": "Precio unitario manual. Si se omite, usa el precio de lista."},
                             "discount": {"type": "number", "description": "Descuento en porcentaje (0-100)."},
                         },
-                        "required": ["product_id"],
+                        # product_id OR code (al menos uno) — la validación es en el backend.
+                        "required": [],
                     },
                 },
                 "notes": {"type": "string", "description": "Notas adicionales", "default": ""},
@@ -603,6 +609,10 @@ MCP_TOOLS = [
         "name": "add_to_quotation",
         "description": (
             "Agregar productos a una cotización EXISTENTE en estado borrador. REQUIERE order_id válido. "
+            "Cada linea acepta `product_id` (entero, template_id) O `code` (string, default_code "
+            "visible como 'MON0026'). Si pasas `code` solo, el backend resuelve el template_id "
+            "internamente — PREFERIDO para evitar inventar IDs. Si pasas ambos, el backend valida "
+            "consistencia. "
             "Si NO tienes order_id: (1) revisa el SystemMessage de cotización activa; (2) si el usuario dijo "
             "'última/penúltima/etc', llama get_latest_quotation primero; (3) si no es claro, PREGUNTA al "
             "usuario. NUNCA inventes order_id. NUNCA llames list_quotations para 'encontrar' un order_id "
@@ -620,10 +630,12 @@ MCP_TOOLS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "product_id": {"type": "integer", "description": "template_id del producto"},
+                            "product_id": {"type": "integer", "description": "template_id del producto. Alternativa a `code`."},
+                            "code": {"type": "string", "description": "Código visible del producto (default_code en Odoo, ej. 'MON0026'). Alternativa a product_id. Si pasas code y no product_id, el backend resuelve internamente."},
                             "quantity": {"type": "number", "default": 1},
                         },
-                        "required": ["product_id"],
+                        # product_id OR code (al menos uno) — la validación es en el backend.
+                        "required": [],
                     },
                 },
                 "confirmed": {
@@ -843,6 +855,8 @@ MCP_TOOLS = [
             "descuento, descripcion o producto. Usa esto cuando el cliente diga 'cambia la cantidad', "
             "'pon X unidades', 'cambia el precio', 'aplica X% descuento a la linea'. "
             "Para 'agrega 2 mas' (delta) usa add_to_quotation/add_quotation_line; esta tool REEMPLAZA. "
+            "Para cambiar el producto puedes pasar `product_id` (template_id) o `code` (default_code, "
+            "ej. 'MON0026'); si pasas code el backend resuelve internamente. "
             "FLUJO OBLIGATORIO: confirmed=false primero (preview), confirmed=true tras confirmacion."
         ),
         "inputSchema": {
@@ -853,7 +867,8 @@ MCP_TOOLS = [
                 "price_unit": {"type": "number", "description": "Nuevo precio unitario (sobreescribe el del producto)."},
                 "discount": {"type": "number", "description": "Descuento porcentual de la linea (0-100). Limitado por partner_max_sale_discount."},
                 "name": {"type": "string", "description": "Nueva descripcion de la linea."},
-                "product_id": {"type": "integer", "description": "Cambiar el producto (template_id). Operacion intrusiva."},
+                "product_id": {"type": "integer", "description": "Cambiar el producto (template_id). Operacion intrusiva. Alternativa a `code`."},
+                "code": {"type": "string", "description": "Código visible del producto (default_code en Odoo, ej. 'MON0026'). Alternativa a product_id. Si pasas code y no product_id, el backend resuelve internamente."},
                 "confirmed": {"type": "boolean", "default": False},
             },
             "required": ["line_id"],
@@ -952,20 +967,24 @@ MCP_TOOLS = [
         "description": (
             "Agregar UNA sola linea a la cotizacion. Mas simple que add_to_quotation cuando es 1 "
             "producto — no hace merge automatico con lineas existentes. Si quieres SUMAR a una linea "
-            "existente, usa update_quotation_line con la nueva qty TOTAL."
+            "existente, usa update_quotation_line con la nueva qty TOTAL. "
+            "Acepta `product_id` (template_id) o `code` (default_code, ej. 'MON0026'). Pasa code "
+            "para evitar inventar template_ids; si pasas ambos, product_id gana."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "order_id": {"type": "integer"},
-                "product_id": {"type": "integer", "description": "template_id del producto"},
+                "product_id": {"type": "integer", "description": "template_id del producto. Alternativa a `code`."},
+                "code": {"type": "string", "description": "Código visible del producto (default_code en Odoo, ej. 'MON0026'). Alternativa a product_id. Si pasas code y no product_id, el backend resuelve internamente."},
                 "quantity": {"type": "number", "default": 1},
                 "price_unit": {"type": "number", "description": "Override del precio default"},
                 "discount": {"type": "number", "description": "Descuento porcentual de la linea"},
                 "name": {"type": "string"},
                 "confirmed": {"type": "boolean", "default": False},
             },
-            "required": ["order_id", "product_id"],
+            # product_id OR code — validado en el backend.
+            "required": ["order_id"],
         },
     },
     {
@@ -2009,6 +2028,7 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             discount=args.get("discount"),
             name=args.get("name"),
             product_id=args.get("product_id"),
+            code=args.get("code"),
             confirmed=bool(args.get("confirmed", False)),
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
@@ -2070,8 +2090,9 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         result = odoo_add_quotation_line(
             *creds,
             args["order_id"],
-            args["product_id"],
+            args.get("product_id"),
             float(args.get("quantity", 1)),
+            code=args.get("code"),
             price_unit=args.get("price_unit"),
             discount=args.get("discount"),
             name=args.get("name"),

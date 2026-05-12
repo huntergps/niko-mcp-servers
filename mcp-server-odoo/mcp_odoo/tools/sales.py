@@ -30,6 +30,155 @@ def _log_call(tool: str, tenant_id: str, args: dict, result: dict | None, error:
         logger.info("ODOO_CALL %s", payload)
 
 
+def _resolve_product_code_to_template_id(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    code: str,
+) -> dict:
+    """Resolve a product visible code (default_code) to a template_id.
+
+    Returns a dict that the caller can branch on:
+      - {"ok": True, "template_id": int, "code": "<normalized>"}      → unique match
+      - {"ok": False, "error_code": "product_code_not_found", ...}    → 0 matches
+      - {"ok": False, "error_code": "ambiguous_product_code", ...}    → >1 matches
+
+    The orchestrator/LLM passes the user-visible code (e.g. "MON0026")
+    instead of an integer template_id. This avoids the LLM hallucinating
+    sequential template_ids (the root cause of the 14791/14792/... bug
+    where it fabricates IDs from past search_products calls).
+
+    Match rule: case-insensitive exact match on ``product.template.default_code``
+    among active templates. We DO NOT use the BGE-M3 RAG here — that's
+    a separate concern (`search_products` for natural-language lookup);
+    once the LLM has the canonical SKU, this resolution must be exact.
+    """
+    if not code or not isinstance(code, str):
+        return {
+            "ok": False,
+            "error_code": "product_code_not_found",
+            "error_detail": "code vacío o no es string",
+        }
+
+    normalized = code.strip().upper()
+    if not normalized:
+        return {
+            "ok": False,
+            "error_code": "product_code_not_found",
+            "error_detail": "code vacío después de normalizar",
+        }
+
+    try:
+        rows = odoo_search(
+            tenant_id, url, db, user, password,
+            "product.template",
+            [["default_code", "=", normalized], ["active", "=", True]],
+            ["id", "default_code", "name"],
+            limit=10,
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "error_code": "product_code_lookup_failed",
+            "error_detail": f"Error consultando product.template por default_code={normalized!r}: {e}",
+            "code": normalized,
+        }
+
+    if not rows:
+        return {
+            "ok": False,
+            "error_code": "product_code_not_found",
+            "error_detail": f"No existe ningún producto con código '{normalized}'.",
+            "code": normalized,
+        }
+
+    if len(rows) > 1:
+        candidates = [
+            {
+                "template_id": r["id"],
+                "code": r.get("default_code") or "",
+                "name": r.get("name") or "",
+            }
+            for r in rows
+        ]
+        return {
+            "ok": False,
+            "error_code": "ambiguous_product_code",
+            "error_detail": (
+                f"El código '{normalized}' coincide con {len(rows)} productos activos. "
+                "Pasa product_id (template_id) en lugar de code para desambiguar."
+            ),
+            "code": normalized,
+            "candidates": candidates,
+        }
+
+    template_id = int(rows[0]["id"])
+    logger.debug(
+        "_resolve_product_code_to_template_id: code=%s -> template_id=%s",
+        normalized, template_id,
+    )
+    return {"ok": True, "template_id": template_id, "code": normalized}
+
+
+def _normalize_quotation_lines(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    lines: list[dict],
+) -> tuple[list[dict] | None, dict | None]:
+    """Normalize a ``lines`` payload for create/add_to_quotation.
+
+    Accepts each line with EITHER ``product_id`` (int, template_id) OR
+    ``code`` (string, default_code). When ``code`` is provided without
+    ``product_id``, this helper resolves the template_id via Odoo.
+
+    Returns ``(normalized_lines, None)`` on success, or
+    ``(None, error_dict)`` if any line fails to resolve. The error dict
+    has the same shape the tool returns to the orchestrator (so callers
+    can just propagate it).
+
+    Behaviour matrix per line:
+      - product_id only:       passthrough (legacy).
+      - template_id only:      aliased to product_id (legacy).
+      - code only:             resolve → fill product_id.
+      - product_id + code:     keep product_id, leave code in dict so the
+                               existing consistency guard later in
+                               create_quotation can validate them.
+      - none:                  error (no_valid_product_ids), same as before.
+    """
+    normalized: list[dict] = []
+    for line in lines:
+        pid = line.get("product_id") or line.get("template_id")
+        code = line.get("code")
+
+        if not pid and code:
+            res = _resolve_product_code_to_template_id(
+                tenant_id, url, db, user, password, str(code),
+            )
+            if not res.get("ok"):
+                err: dict[str, Any] = {
+                    "success": False,
+                    "error_code": res["error_code"],
+                    "error_detail": res.get("error_detail", ""),
+                    "code": res.get("code", code),
+                }
+                if "candidates" in res:
+                    err["candidates"] = res["candidates"]
+                return None, err
+            new_line = {**line, "product_id": res["template_id"]}
+            # Preserve the resolved code so the downstream mismatch
+            # validator stays a no-op (declared == real after resolution).
+            new_line["code"] = res["code"]
+            normalized.append(new_line)
+            continue
+
+        if pid:
+            normalized.append({**line, "product_id": pid})
+            continue
+
+        # No pid and no code → caller will raise no_valid_product_ids
+        # (we preserve the original line so the error count is accurate).
+        normalized.append(line)
+
+    return normalized, None
+
+
 def _build_card(order_data: dict) -> dict:
     """Build a standard _card dict from any order response.
 
@@ -128,14 +277,21 @@ def odoo_create_quotation(
     # this at the ORM level. So at THIS boundary (and only here) we resolve
     # template_id → first active variant. We also capture uom_id because
     # TecnoSmart's flex_erp override KeyError's on missing 'product_uom'.
-    # Normalize: accept "product_id" or "template_id" interchangeably.
-    normalized_lines = []
-    for line in lines:
-        pid = line.get("product_id") or line.get("template_id")
-        if pid:
-            normalized_lines.append({**line, "product_id": pid})
+    # Normalize: accept "product_id", "template_id", or "code" (default_code)
+    # interchangeably. Passing `code` is preferred — it removes the entire
+    # class of "LLM hallucinated a template_id" bugs.
+    normalized_lines, resolve_error = _normalize_quotation_lines(
+        tenant_id, url, db, user, password, lines,
+    )
+    if resolve_error is not None:
+        _log_call("create_quotation", tenant_id, log_args, None,
+                  resolve_error.get("error_code", "code_resolution_failed"),
+                  int((time.time() - started) * 1000))
+        return resolve_error
+    # Drop lines that ended up with no product_id (legacy behaviour).
+    normalized_lines = [ln for ln in (normalized_lines or []) if ln.get("product_id")]
     if not normalized_lines:
-        err = "Ninguna línea tiene product_id válido. Pasa product_id (template_id numérico) por línea."
+        err = "Ninguna línea tiene product_id ni code válido. Pasa product_id (template_id) o code (default_code) por línea."
         _log_call("create_quotation", tenant_id, log_args, None, err, int((time.time() - started) * 1000))
         return {"success": False, "error_code": "no_valid_product_ids", "error_detail": err}
     lines = normalized_lines
@@ -427,6 +583,26 @@ def odoo_add_to_quotation(
             "state": order["state"],
         }
 
+    # Normalize lines BEFORE the preview so dry-runs reflect the resolved
+    # product_id (the LLM may have passed `code` only). This also lets us
+    # short-circuit invalid codes early, before the user sees a misleading
+    # confirmation prompt.
+    # Accepts "product_id", "template_id", or "code" (default_code).
+    add_normalized, resolve_error = _normalize_quotation_lines(
+        tenant_id, url, db, user, password, lines,
+    )
+    if resolve_error is not None:
+        _log_call("add_to_quotation", tenant_id, log_args, None,
+                  resolve_error.get("error_code", "code_resolution_failed"),
+                  int((time.time() - started) * 1000))
+        return resolve_error
+    add_normalized = [ln for ln in (add_normalized or []) if ln.get("product_id")]
+    if not add_normalized:
+        err = "Ninguna línea tiene product_id ni code válido. Pasa product_id (template_id) o code (default_code) por línea."
+        _log_call("add_to_quotation", tenant_id, log_args, None, err, int((time.time() - started) * 1000))
+        return {"success": False, "error_code": "no_valid_product_ids", "error_detail": err}
+    lines = add_normalized
+
     # Dry-run / preview — return what would be done without writing to Odoo
     if not confirmed:
         line_descriptions = []
@@ -454,11 +630,6 @@ def odoo_add_to_quotation(
         return result
 
     # Resolve template_ids → variant + uom (same logic as create_quotation)
-    # Normalize: accept "product_id" or "template_id" interchangeably.
-    add_normalized = [{**ln, "product_id": ln.get("product_id") or ln.get("template_id")}
-                      for ln in lines if ln.get("product_id") or ln.get("template_id")]
-    if add_normalized:
-        lines = add_normalized
     template_ids = list({line["product_id"] for line in lines})
     try:
         variants = odoo_search(
@@ -1682,6 +1853,7 @@ def odoo_update_quotation_line(
     discount: float | None = None,
     name: str | None = None,
     product_id: int | None = None,
+    code: str | None = None,
     confirmed: bool = False,
 ) -> dict:
     """Modify an existing sale.order.line.
@@ -1707,10 +1879,29 @@ def odoo_update_quotation_line(
         _log_call("update_quotation_line", tenant_id, log_args, None, err, 0)
         return {"success": False, "error_code": "invalid_line_id", "error_detail": err}
 
-    if quantity is None and price_unit is None and discount is None and name is None and product_id is None:
+    if quantity is None and price_unit is None and discount is None and name is None and product_id is None and code is None:
         err = "Debes especificar al menos un campo a actualizar"
         _log_call("update_quotation_line", tenant_id, log_args, None, err, 0)
         return {"success": False, "error_code": "no_changes", "error_detail": err}
+
+    # Resolve code → product_id when the caller passed `code` only.
+    if product_id is None and code:
+        res = _resolve_product_code_to_template_id(
+            tenant_id, url, db, user, password, str(code),
+        )
+        if not res.get("ok"):
+            err_out: dict[str, Any] = {
+                "success": False,
+                "error_code": res["error_code"],
+                "error_detail": res.get("error_detail", ""),
+                "code": res.get("code", code),
+            }
+            if "candidates" in res:
+                err_out["candidates"] = res["candidates"]
+            _log_call("update_quotation_line", tenant_id, log_args, None,
+                      res["error_code"], 0)
+            return err_out
+        product_id = res["template_id"]
 
     line = _read_sale_order_line(
         tenant_id, url, db, user, password, line_id,
@@ -2332,9 +2523,10 @@ def odoo_set_quotation_header(
 def odoo_add_quotation_line(
     tenant_id: str, url: str, db: str, user: str, password: str,
     order_id: int,
-    product_id: int,
+    product_id: int | None = None,
     quantity: float = 1.0,
     *,
+    code: str | None = None,
     price_unit: float | None = None,
     discount: float | None = None,
     name: str | None = None,
@@ -2347,10 +2539,41 @@ def odoo_add_quotation_line(
     confunde al LLM). Si quieres mergear, llama esta tool con qty
     delta y luego `update_quotation_line` para consolidar; o usa
     add_to_quotation con explicit merge.
+
+    Acepta ``product_id`` (template_id) o ``code`` (default_code). Debe
+    pasarse al menos uno; si pasas ambos, ``product_id`` gana (legacy).
     """
     started = time.time()
     log_args = {"order_id": order_id, "product_id": product_id,
-                "quantity": quantity, "confirmed": confirmed}
+                "code": code, "quantity": quantity, "confirmed": confirmed}
+
+    # Resolve code → product_id (template_id) when caller passed code only.
+    if product_id is None and code:
+        res = _resolve_product_code_to_template_id(
+            tenant_id, url, db, user, password, str(code),
+        )
+        if not res.get("ok"):
+            err_out: dict[str, Any] = {
+                "success": False,
+                "error_code": res["error_code"],
+                "error_detail": res.get("error_detail", ""),
+                "code": res.get("code", code),
+            }
+            if "candidates" in res:
+                err_out["candidates"] = res["candidates"]
+            _log_call("add_quotation_line", tenant_id, log_args, None,
+                      res["error_code"], 0)
+            return err_out
+        product_id = res["template_id"]
+
+    if product_id is None:
+        err = "Debes pasar product_id (template_id) o code (default_code)."
+        _log_call("add_quotation_line", tenant_id, log_args, None, err, 0)
+        return {
+            "success": False,
+            "error_code": "missing_product_identifier",
+            "error_detail": err,
+        }
 
     order = _read_sale_order(
         tenant_id, url, db, user, password, order_id,
