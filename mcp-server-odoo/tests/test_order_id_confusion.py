@@ -54,12 +54,19 @@ class TestGetQuotationWithNameSuffixRejected:
 
     def test_get_quotation_with_name_suffix_rejected(self):
         """order_id=122173 (the suffix of VENTA122173 whose real id is 113604)
-        must be rejected with the precise error pointing at real id 113604."""
+        must be rejected with the precise error pointing at real id 113604.
+
+        With the 2026-05-12 collision fix the guard now runs TWO searches:
+        (1) id-existence check on order_id (must return empty for a real
+        suffix mistake — 122173 is not a real sale.order.id) and
+        (2) name-suffix lookup that finds VENTA122173 with id=113604.
+        """
         mock_pool = MagicMock()
-        # The guard's odoo_search('sale.order', [['name','=','VENTA122173']])
-        # finds a record with id=113604. That confirms confusion.
         mock_pool.execute.side_effect = [
-            [{"id": 113604}],  # guard lookup → name VENTA122173 exists, id=113604
+            # 1) guard id-existence check → id 122173 does not exist
+            [],
+            # 2) guard name lookup → name VENTA122173 exists, id=113604
+            [{"id": 113604}],
         ]
         with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
             result = sales_mod.odoo_get_quotation(
@@ -71,27 +78,33 @@ class TestGetQuotationWithNameSuffixRejected:
         assert result["error_code"] == "order_id_looks_like_name_suffix"
         assert result["suggested_order_id"] == 113604
         assert result["found_name"] == "VENTA122173"
-        # The guard ran a single odoo_search; the real odoo_read on the
-        # bad id was never attempted (the bug: would have returned
-        # order_not_found and let the LLM drift).
-        assert mock_pool.execute.call_count == 1
+        # Two probes: id-existence + name-lookup. The real odoo_read on
+        # the bad id was never attempted.
+        assert mock_pool.execute.call_count == 2
+        # 1st call → search_read on sale.order with domain id=122173
         first_call = mock_pool.execute.call_args_list[0]
-        # search_read on sale.order with domain name=VENTA122173
         assert first_call.args[5] == "sale.order"
         assert first_call.args[6] == "search_read"
-        assert first_call.args[7] == [[["name", "=", "VENTA122173"]]]
+        assert first_call.args[7] == [[["id", "=", 122173]]]
+        # 2nd call → search_read on sale.order with domain name=VENTA122173
+        second_call = mock_pool.execute.call_args_list[1]
+        assert second_call.args[5] == "sale.order"
+        assert second_call.args[6] == "search_read"
+        assert second_call.args[7] == [[["name", "=", "VENTA122173"]]]
 
 
 class TestGetQuotationWithRealIdWorks:
     """Test 2 — backward compat for actual sale.order.id values."""
 
     def test_get_quotation_with_real_id_proceeds_normally(self):
-        """order_id=113604 (a real id, also in the suspicious range) when
-        VENTA113604 does NOT exist in the tenant must proceed normally."""
+        """order_id=113604 (a real id, also in the suspicious range) must
+        proceed normally. With the 2026-05-12 fix the guard's first probe
+        is the id-existence check, which returns the record → short-circuit
+        without even running the name-suffix lookup."""
         mock_pool = MagicMock()
         mock_pool.execute.side_effect = [
-            # 1) guard lookup → no record named 'VENTA113604' → pass
-            [],
+            # 1) guard id-existence check → id 113604 exists → pass
+            [{"id": 113604}],
             # 2) regular odoo_read on sale.order header
             [{
                 "id": 113604, "name": "VENTA122173", "state": "draft",
@@ -111,7 +124,8 @@ class TestGetQuotationWithRealIdWorks:
         assert result["success"] is True
         assert result["order_id"] == 113604
         assert result["name"] == "VENTA122173"
-        # Two execute calls: guard + read.
+        # Two execute calls: id-existence probe + read. The name-suffix
+        # lookup is NOT issued because the id is real.
         assert mock_pool.execute.call_count == 2
 
 
@@ -154,9 +168,9 @@ class TestNoFalsePositiveWhenSelfReferential:
     def test_no_false_positive_when_id_equals_name_suffix(self):
         mock_pool = MagicMock()
         mock_pool.execute.side_effect = [
-            # 1) guard lookup → 'VENTA125000' exists with id=125000 (same).
+            # 1) guard id-existence check → id 125000 exists → short-circuit
             [{"id": 125000}],
-            # 2) regular odoo_read proceeds — guard did NOT short-circuit.
+            # 2) regular odoo_read proceeds — guard did NOT reject.
             [{
                 "id": 125000, "name": "VENTA125000", "state": "draft",
                 "partner_id": [1, "Cliente"], "amount_total": 100.0,
@@ -174,6 +188,8 @@ class TestNoFalsePositiveWhenSelfReferential:
 
         assert result["success"] is True
         assert result["order_id"] == 125000
+        # Only 2 calls: the id-existence probe shortcuts the guard before
+        # the name lookup is ever issued.
         assert mock_pool.execute.call_count == 2
 
 
@@ -188,7 +204,9 @@ class TestTransitionQuotationGuard:
     def test_transition_quotation_rejects_name_suffix(self):
         mock_pool = MagicMock()
         mock_pool.execute.side_effect = [
-            # Guard search hits 'VENTA122173' → id=113604, neq 122173.
+            # 1) guard id-existence check → 122173 not a real id
+            [],
+            # 2) guard name lookup → 'VENTA122173' exists with id=113604
             [{"id": 113604}],
         ]
         with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
@@ -200,8 +218,8 @@ class TestTransitionQuotationGuard:
         assert result["success"] is False
         assert result["error_code"] == "order_id_looks_like_name_suffix"
         assert result["suggested_order_id"] == 113604
-        # Only the guard search ran — no transition was attempted.
-        assert mock_pool.execute.call_count == 1
+        # Only the guard probes ran — no transition was attempted.
+        assert mock_pool.execute.call_count == 2
 
 
 class TestAddToQuotationGuard:
@@ -210,7 +228,10 @@ class TestAddToQuotationGuard:
     def test_add_to_quotation_rejects_name_suffix(self):
         mock_pool = MagicMock()
         mock_pool.execute.side_effect = [
-            [{"id": 113604}],  # guard lookup
+            # 1) guard id-existence check → 122173 not a real id
+            [],
+            # 2) guard name lookup → 'VENTA122173' exists with id=113604
+            [{"id": 113604}],
         ]
         with patch("mcp_odoo.tools.generic.odoo_pool", mock_pool):
             result = sales_mod.odoo_add_to_quotation(
@@ -224,4 +245,4 @@ class TestAddToQuotationGuard:
         assert result["error_code"] == "order_id_looks_like_name_suffix"
         assert result["suggested_order_id"] == 113604
         # We stopped at the guard — no real order read happened.
-        assert mock_pool.execute.call_count == 1
+        assert mock_pool.execute.call_count == 2

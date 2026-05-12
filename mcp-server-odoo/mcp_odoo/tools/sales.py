@@ -53,20 +53,52 @@ def _guard_order_id_vs_name_suffix(
     """If ``order_id`` looks like the suffix of an existing ``name``, reject.
 
     Returns a structured error dict when confusion is detected, or
-    ``None`` when the value passes the guard (i.e. either it falls
-    outside the suspicious range, OR no ``VENTA{order_id}`` exists).
+    ``None`` when the value passes the guard.
 
-    Important: we only reject when BOTH the value is in the suspicious
-    range AND a ``sale.order`` with ``name='VENTA{order_id}'`` exists in
-    this tenant. Otherwise the call goes through unchanged (so real
-    order_ids in [110000, 130000] keep working as long as no name with
-    the same suffix exists; if a name DOES exist with the same suffix
-    AND the value happens to be a valid order_id, the LLM should call
-    ``get_quotation_state_summary`` / ``find_quotation_by_name`` first
-    anyway — the false positive is intentional defense-in-depth).
+    Logic (collision-safe, 2026-05-12 fix):
+
+    1. Cheap pre-filter — if ``order_id`` is outside the in-use
+       suffix range it cannot possibly be confusion → pass.
+    2. **Authoritative check** — look up ``order_id`` as a real
+       ``sale.order.id``. If a record exists with that id, the value
+       IS a valid order_id and we MUST let it through, even if a
+       different ``sale.order`` happens to have ``name='VENTA{order_id}'``
+       (collision between an id of order A and a name suffix of order B).
+    3. Only when the id does NOT exist do we check for a name match
+       and surface the ``suggested_order_id`` error.
+
+    Production incident (2026-05-12, before fix step 2 was added): the
+    LLM called ``send_quotation(order_id=113998)`` where 113998 is the
+    REAL id of ``VENTA122567`` AND coincidentally another quotation
+    named ``VENTA113998`` exists with id 105429. The original guard
+    rejected the call with a false positive. Step 2 prevents this by
+    verifying the id first.
     """
     if not _looks_like_name_suffix(order_id):
         return None
+
+    # Step 2: authoritative existence check. If order_id is a real
+    # sale.order.id in this tenant, NEVER reject — collisions with a
+    # different record's name suffix are not confusion.
+    try:
+        id_check = odoo_search(
+            tenant_id, url, db, user, password,
+            "sale.order",
+            [["id", "=", order_id]],
+            ["id"],
+            limit=1,
+        )
+    except Exception:
+        # Don't block legitimate calls when the verification lookup
+        # itself errors out — fall through to the suffix check.
+        id_check = []
+    if id_check:
+        # The id is real → the value IS a valid order_id, regardless
+        # of whether some unrelated record also has name=VENTA{order_id}.
+        return None
+
+    # Step 3: id does not exist. Now check if it matches an existing
+    # name suffix and, if so, point at the real id.
     try:
         candidate_name = f"VENTA{order_id}"
         check = odoo_search(
@@ -85,8 +117,8 @@ def _guard_order_id_vs_name_suffix(
         return None
     real_id = check[0]["id"] if isinstance(check[0], dict) else check[0]
     if real_id == order_id:
-        # The value IS a real order_id that happens to share its
-        # numeric value with its own name suffix — not confusion.
+        # Defensive: should not happen (id_check above would have hit)
+        # but keep the original self-reference guard.
         return None
     err = (
         f"order_id={order_id} parece ser el sufijo del name "
