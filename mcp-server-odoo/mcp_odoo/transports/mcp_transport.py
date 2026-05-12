@@ -479,7 +479,11 @@ MCP_TOOLS = [
             "trae los primeros top_k productos (default 10) PRIORIZANDO los "
             "que tienen stock. Si el cliente pide ver mas, llama de nuevo "
             "con el MISMO query y offset=10 para los siguientes 10. "
-            "Resultados con precio y stock LIVE de Odoo."
+            "Resultados con precio y stock LIVE de Odoo. "
+            "Cuando el cliente menciona un presupuesto numerico "
+            "('maximo 500', 'hasta 800', 'entre 200 y 500', 'por 1000'), "
+            "pasa price_max y/o price_min para filtrar — NO presentes "
+            "productos sobre el limite del cliente."
         ),
         "inputSchema": {
             "type": "object",
@@ -487,6 +491,8 @@ MCP_TOOLS = [
                 "query": {"type": "string", "description": "Texto de busqueda natural (ej: 'laptop para oficina', 'tinta epson', 'procesador')"},
                 "top_k": {"type": "integer", "description": "Resultados por pagina (default 10). NO hay limite maximo — pide todos los que necesites; el sistema devuelve hasta lo que encuentre el catalogo.", "default": 10},
                 "offset": {"type": "integer", "description": "Offset para paginacion. Usa 0 en la primera llamada, top_k en la siguiente, etc.", "default": 0},
+                "price_min": {"type": "number", "description": "Precio minimo en USD (inclusivo). Usar cuando el cliente pide 'desde X' o 'entre X y Y'. Opcional."},
+                "price_max": {"type": "number", "description": "Precio maximo en USD (inclusivo). Usar cuando el cliente menciona presupuesto: 'maximo 500', 'hasta 800', 'por 1000', 'entre 200 y 500'. Opcional pero CRITICO si hay presupuesto explicito — items sobre este monto NO se presentan al cliente."},
             },
             "required": ["query"],
         },
@@ -1867,11 +1873,26 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
     )
 
     if tool_name == "search_products":
+        # Optional price filters: the LLM passes them when the customer
+        # states a budget ("max 500", "hasta 800", "entre 200 y 500").
+        # We accept numeric strings too so a fumbled tool call still
+        # filters instead of silently ignoring the constraint.
+        def _coerce_price(val):
+            if val is None or val == "":
+                return None
+            try:
+                f = float(val)
+                return f if f > 0 else None
+            except (TypeError, ValueError):
+                return None
+
         return await _rag_search(
             args["query"],
             top_k=max(int(args.get("top_k", 10)), 1),
             offset=max(int(args.get("offset", 0)), 0),
             tenant_id=tc["tenant_id"],
+            price_min=_coerce_price(args.get("price_min")),
+            price_max=_coerce_price(args.get("price_max")),
         )
 
     if tool_name == "get_product_details":
@@ -3621,7 +3642,12 @@ async def _get_tenant_slug(tenant_id: str) -> str:
 
 
 async def _rag_search(
-    query: str, top_k: int = 10, offset: int = 0, tenant_id: str = ""
+    query: str,
+    top_k: int = 10,
+    offset: int = 0,
+    tenant_id: str = "",
+    price_min: float | None = None,
+    price_max: float | None = None,
 ) -> str:
     """Hybrid product search: pgvector RRF + ILIKE merge + live Odoo + paginated.
 
@@ -3635,11 +3661,26 @@ async def _rag_search(
        can ask for as many as the catalog has. The pagination is for
        UX (Telegram messages have a length limit) and to absorb burst
        traffic.
+
+    Price filtering
+    ---------------
+    ``price_min`` / ``price_max`` (USD, inclusive) filter the ranked
+    list AT PRESENTATION TIME — they are NOT part of the cache key, so
+    the same ranked list serves any budget. This matters because the
+    LLM was caught presenting products above the customer's stated
+    budget (B3 bug, 2026-05-12). When the customer says "máximo 500",
+    we must not show items priced over 500. Items with unknown live
+    price (``_live is None`` — tenants without Odoo wired) are kept
+    only when no price filter is requested; otherwise we drop them
+    because we can't certify they fit the budget.
     """
     cache_key = query.strip().lower()
     cached_ranked = _query_cache_get(tenant_id, cache_key)
     if cached_ranked is not None:
-        return _format_ranked_page(cached_ranked, top_k, offset)
+        return _format_ranked_page(
+            cached_ranked, top_k, offset,
+            price_min=price_min, price_max=price_max,
+        )
 
     # Cache miss — fetch a wide candidate pool. We aim for at least
     # 5x the page size or 100, whichever is bigger. This is just a
@@ -3803,10 +3844,19 @@ async def _rag_search(
     # of the same cached list).
     ranked = in_stock + out_of_stock + unknown_stock
     _query_cache_set(tenant_id, cache_key, ranked)
-    return _format_ranked_page(ranked, top_k, offset)
+    return _format_ranked_page(
+        ranked, top_k, offset,
+        price_min=price_min, price_max=price_max,
+    )
 
 
-def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
+def _format_ranked_page(
+    ranked: list[dict],
+    top_k: int,
+    offset: int,
+    price_min: float | None = None,
+    price_max: float | None = None,
+) -> str:
     """Render a slice [offset:offset+top_k] of a pre-ranked product list.
 
     Returns a JSON string with the structured shape:
@@ -3841,8 +3891,44 @@ def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
          concatenando header + line_text de cada row + footer. NUNCA
          muestres template_id. Memoriza la posicion (1,2,3...) → template_id
          para usar despues en create_quotation."
+
+    Price filtering
+    ---------------
+    When ``price_min`` and/or ``price_max`` are set, the ranked list is
+    filtered BEFORE pagination so the LLM never sees items the customer
+    cannot afford. Items whose live price is None (tenant without Odoo
+    wired) are dropped when ANY price bound is active — we cannot
+    certify they meet the budget. The envelope's ``filter_applied``
+    flag and an explicit header note tell the LLM the result is
+    budget-respecting so the response copy can be adjusted accordingly.
     """
     import json as _json
+
+    price_filter_active = price_min is not None or price_max is not None
+    total_before_filter = len(ranked)
+
+    if price_filter_active:
+        filtered: list[dict] = []
+        for r in ranked:
+            live_data = r.get("_live")
+            # Drop unknown-price rows under any active filter: we can't
+            # guarantee they're in budget so showing them would
+            # reintroduce the very bug we're fixing.
+            if live_data is None:
+                continue
+            price = live_data.get("price")
+            if price is None:
+                continue
+            try:
+                p = float(price)
+            except (TypeError, ValueError):
+                continue
+            if price_min is not None and p < float(price_min):
+                continue
+            if price_max is not None and p > float(price_max):
+                continue
+            filtered.append(r)
+        ranked = filtered
 
     total = len(ranked)
     page = ranked[offset : offset + top_k]
@@ -3916,18 +4002,42 @@ def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
     showing_to = min(offset + top_k, total)
     has_more = showing_to < total
 
-    if fallback_count and fallback_count == len(page):
+    # Format a human-friendly budget hint reused in header + footer below.
+    def _fmt_budget() -> str:
+        if price_min is not None and price_max is not None:
+            return f"USD {price_min:.2f}–{price_max:.2f}"
+        if price_max is not None:
+            return f"hasta USD {price_max:.2f}"
+        if price_min is not None:
+            return f"desde USD {price_min:.2f}"
+        return ""
+
+    budget_str = _fmt_budget()
+
+    if price_filter_active and total == 0:
+        # The filter eliminated every candidate. Tell the LLM explicitly
+        # so it surfaces "no tengo nada en ese presupuesto" instead of
+        # making up products.
+        header = (
+            f"📦 0 productos en el presupuesto ({budget_str}). "
+            f"Se evaluaron {total_before_filter} candidatos pero ninguno "
+            f"cumple el limite."
+        )
+    elif fallback_count and fallback_count == len(page):
         header = (
             f"📦 {total} productos en catalogo (no puedo confirmar "
             f"precio/stock ahora — Odoo no responde):"
         )
     elif in_stock_total == 0 and total > 0:
         header = (
-            f"📦 {total} productos relacionados, NINGUNO con stock disponible:"
+            f"📦 {total} productos relacionados"
+            + (f" en presupuesto ({budget_str})" if price_filter_active else "")
+            + ", NINGUNO con stock disponible:"
         )
     else:
+        budget_note = f" · 💵 presupuesto {budget_str}" if price_filter_active else ""
         header = (
-            f"📦 {total} productos ({in_stock_total} con stock) · "
+            f"📦 {total} productos ({in_stock_total} con stock){budget_note} · "
             f"Mostrando {showing_from}-{showing_to}"
         )
 
@@ -3947,6 +4057,10 @@ def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
         "header": header,
         "rows": rows,
         "footer": footer,
+        "filter_applied": {
+            "price_min": price_min,
+            "price_max": price_max,
+        } if price_filter_active else None,
         "instructions_internal": (
             "Para responder al usuario: escribe header, luego una linea en blanco, "
             "luego cada line_text en orden separados por linea en blanco, luego "
@@ -3956,7 +4070,12 @@ def _format_ranked_page(ranked: list[dict], top_k: int, offset: int) -> str:
             "que aparece en este JSON. "
             "Cada row incluye 'price' (precio de venta) y 'cost' (costo de adquisicion). "
             "Cuando el vendedor pida precio 'sobre el costo' o 'margen sobre costo', "
-            "usa el campo 'cost' de este JSON como base — NO el 'price'."
+            "usa el campo 'cost' de este JSON como base — NO el 'price'. "
+            "Si filter_applied no es null, el resultado YA respeta el presupuesto "
+            "del cliente — no necesitas filtrar de nuevo ni avisar 'me sale sobre "
+            "tu presupuesto'. Si filter_applied y rows esta vacio, dile al "
+            "cliente claramente que no hay productos en ese rango y ofrece el "
+            "siguiente paso (subir presupuesto, sugerir categoria alterna)."
         ),
     }
     return _json.dumps(payload, ensure_ascii=False)
