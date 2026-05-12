@@ -795,6 +795,14 @@ async def _execute_tool(tool_name: str, args: dict, ctx: dict | None = None) -> 
 
     # ----- Conversation RAG: save_conversation_turn -----
     if tool_name == "save_conversation_turn":
+        # Inserts into tenant_<slug>.conversation_embeddings.
+        #
+        # We MUST go through the public.save_conversation_embedding RPC instead
+        # of POSTing directly to /rest/v1/conversation_embeddings with
+        # Content-Profile, because PostgREST is configured with
+        # PGRST_DB_SCHEMAS=public,graphql_public,storage and rejects tenant_*
+        # schemas with HTTP 406 PGRST106 "Invalid schema".
+        # See supabase/migrations/484_fix_conversation_embeddings.sql.
         try:
             import httpx
 
@@ -808,58 +816,30 @@ async def _execute_tool(tool_name: str, args: dict, ctx: dict | None = None) -> 
                 embed_resp.raise_for_status()
                 embedding = embed_resp.json()["embeddings"][0]
 
-                # Insert into tenant schema conversation_embeddings (RAG)
+                # Insert via public RPC (exposed in PGRST_DB_SCHEMAS).
                 resp = await client.post(
-                    f"{SUPABASE_URL}/rest/v1/conversation_embeddings",
+                    f"{SUPABASE_URL}/rest/v1/rpc/save_conversation_embedding",
                     headers={
                         "apikey": SUPABASE_SERVICE_KEY,
                         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
                         "Content-Type": "application/json",
-                        "Content-Profile": f"tenant_{tenant_slug}",
-                        "Prefer": "return=representation",
                     },
                     json={
-                        "channel": args["channel"],
-                        "channel_user_id": args["channel_user_id"],
-                        "content": content,
-                        "direction": args.get("direction", "outbound"),
-                        "summary": args.get("summary"),
-                        "embedding": embedding,
+                        "p_tenant_slug": tenant_slug,
+                        "p_channel": args["channel"],
+                        "p_channel_user_id": args["channel_user_id"],
+                        "p_content": content,
+                        "p_embedding": embedding,
+                        "p_direction": args.get("direction", "outbound"),
+                        "p_summary": args.get("summary"),
                     },
                 )
-                resp.raise_for_status()
-
-                # ALSO persist to tenant.conversation_messages so the dashboard
-                # /conversations endpoint sees the full history (not just live).
-                try:
-                    msg_resp = await client.post(
-                        f"{SUPABASE_URL}/rest/v1/conversation_messages",
-                        headers={
-                            "apikey": SUPABASE_SERVICE_KEY,
-                            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                            "Content-Type": "application/json",
-                            "Content-Profile": f"tenant_{tenant_slug}",
-                            "Prefer": "return=minimal",
-                        },
-                        json={
-                            "channel": args["channel"],
-                            "channel_user_id": args["channel_user_id"],
-                            "direction": args.get("direction", "outbound"),
-                            "message_text": content,
-                            "message_type": "text",
-                            "agent_name": ctx.get("agent_slug"),
-                            "tools_called": args.get("tools_called") or None,
-                            "response_ms": args.get("response_ms"),
-                            "tokens_used": args.get("tokens_used"),
-                        },
+                if resp.status_code >= 400:
+                    logger.error(
+                        "save_conversation_embedding RPC failed %s: %s",
+                        resp.status_code, resp.text[:300]
                     )
-                    if msg_resp.status_code >= 400:
-                        logger.warning(
-                            "conversation_messages insert failed: %s",
-                            msg_resp.text[:200],
-                        )
-                except Exception as e:
-                    logger.warning(f"conversation_messages persist failed: {e}")
+                resp.raise_for_status()
 
             return json.dumps({"success": True}, ensure_ascii=False)
         except Exception as e:
