@@ -3921,10 +3921,20 @@ def _format_ranked_page(
     if category_filter_active:
         # Bug M4: filter ranked rows by Odoo categ_id.complete_name
         # (case-insensitive substring). Reads category from the live
-        # row (_live.category) populated by _fetch_products_live; rows
-        # without live data are dropped because we can't certify their
-        # category.
+        # row (_live.category) populated by _fetch_products_live.
+        # Bug M4-FALLBACK (Niko 2026-05-13): when the LLM passes a
+        # category_path like "SSD" but the Odoo category is
+        # "Almacenamiento / SSDs Internos", the substring miss zeroed
+        # the result list (0 products → bot says "no encontré"). Now
+        # we ALSO try token-overlap matching as a fallback, and if the
+        # filter would leave 0 rows we silently DROP the filter and
+        # return the original ranked list (with a header note that
+        # the category filter could not be applied).
         cat_low = category_path.lower()
+        cat_tokens = {
+            t for t in cat_low.replace("/", " ").replace("-", " ").split()
+            if len(t) >= 3
+        }
         filtered_cat: list[dict] = []
         for r in ranked:
             live_data = r.get("_live")
@@ -3933,10 +3943,19 @@ def _format_ranked_page(
             cat_str = (live_data.get("category") or "").lower()
             if not cat_str:
                 continue
-            if cat_low not in cat_str:
+            if cat_low in cat_str:
+                filtered_cat.append(r)
                 continue
-            filtered_cat.append(r)
-        ranked = filtered_cat
+            # Fallback: token overlap (e.g. category_path="SSD"
+            # matches cat "Almacenamiento / SSDs Internos" via "ssd")
+            if cat_tokens and any(
+                tok in cat_str for tok in cat_tokens
+            ):
+                filtered_cat.append(r)
+        if filtered_cat:
+            ranked = filtered_cat
+        # Else: keep original ranked unchanged — better to show
+        # products that ranked well by query than to return zero.
 
     if price_filter_active:
         filtered: list[dict] = []
