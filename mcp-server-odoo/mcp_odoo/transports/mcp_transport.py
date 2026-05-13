@@ -1873,6 +1873,162 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         int(_aqid_str) if _aqid_str.isdigit() else None
     )
 
+    # C1 — Cross-client data leak fix (2026-05-12). The orchestrator pins
+    # the expected partner_id for B2C sessions; we use it to reject any
+    # quotation-touching tool whose underlying sale.order belongs to a
+    # DIFFERENT partner. Header is absent for B2B sellers and for sessions
+    # where the customer is not yet identified — those cases skip the
+    # cross-partner enforcement here (the orchestrator still runs its
+    # own post-tool validation as defence in depth).
+    _epid_str = request.headers.get("x-expected-partner-id", "")
+    expected_partner_id: int | None = (
+        int(_epid_str) if _epid_str.isdigit() else None
+    )
+
+    # Tools whose result envelope must belong to ``expected_partner_id``.
+    # We resolve the underlying sale.order.partner_id via a single
+    # odoo_read and short-circuit with a ``cross_partner_quotation``
+    # envelope BEFORE the tool runs — never let it return real data
+    # of someone else's quotation.
+    _QUOTATION_TOOLS_PARTNER_CHECK = {
+        "get_quotation",
+        "get_quotation_state_summary",
+        "find_quotation_by_name",
+        "add_to_quotation",
+        "update_quotation_line",
+        "remove_quotation_line",
+        "confirm_quotation",
+        "apply_global_discount",
+        "send_quotation",
+        "render_quotation_pdf",
+        "create_payphone_link",
+        "change_quotation_customer",
+        "add_quotation_line",
+        "set_quotation_header",
+        "recalculate_quotation",
+        "transition_quotation",
+        "sign_quotation",
+        "get_quotation_margin",
+        "niko_send_sign_request",
+        "duplicate_quotation",
+    }
+
+    if expected_partner_id and tool_name in _QUOTATION_TOOLS_PARTNER_CHECK:
+        _candidate_id = args.get("order_id")
+        # update_quotation_line / remove_quotation_line take line_id;
+        # resolve the parent order's partner_id from sale.order.line.
+        _line_id = args.get("line_id") if tool_name in (
+            "update_quotation_line", "remove_quotation_line",
+        ) else None
+        _check_partner_id: int | None = None
+        try:
+            from mcp_odoo.tools.generic import odoo_read, odoo_search
+            if _line_id:
+                try:
+                    _line_rows = odoo_read(
+                        *creds, "sale.order.line", [int(_line_id)],
+                        ["order_id"],
+                    )
+                except Exception:
+                    _line_rows = []
+                if _line_rows:
+                    _ord_ref = _line_rows[0].get("order_id")
+                    if isinstance(_ord_ref, list) and _ord_ref:
+                        _candidate_id = _ord_ref[0]
+            if _candidate_id:
+                try:
+                    _ord_rows = odoo_read(
+                        *creds, "sale.order", [int(_candidate_id)],
+                        ["partner_id"],
+                    )
+                except Exception:
+                    _ord_rows = []
+                if _ord_rows:
+                    _p_ref = _ord_rows[0].get("partner_id")
+                    if isinstance(_p_ref, list) and _p_ref:
+                        try:
+                            _check_partner_id = int(_p_ref[0])
+                        except (TypeError, ValueError):
+                            _check_partner_id = None
+            # find_quotation_by_name uses ``name`` instead of order_id —
+            # resolve via search.
+            if (
+                tool_name == "find_quotation_by_name"
+                and not _check_partner_id
+                and args.get("name")
+            ):
+                try:
+                    _by_name_rows = odoo_search(
+                        *creds, "sale.order",
+                        [["name", "=", str(args.get("name")).strip()]],
+                        ["partner_id"], limit=1,
+                    )
+                except Exception:
+                    _by_name_rows = []
+                if _by_name_rows:
+                    _p_ref = _by_name_rows[0].get("partner_id")
+                    if isinstance(_p_ref, list) and _p_ref:
+                        try:
+                            _check_partner_id = int(_p_ref[0])
+                        except (TypeError, ValueError):
+                            _check_partner_id = None
+        except Exception as _cp_exc:
+            logger.warning(
+                "cross_partner pre-check failed (tool=%s args=%s): %s — "
+                "letting tool run, orchestrator post-validation still applies",
+                tool_name, args, _cp_exc,
+            )
+            _check_partner_id = None
+        if _check_partner_id and _check_partner_id != expected_partner_id:
+            logger.error(
+                "C1 cross_partner_quotation BLOCKED: tool=%s tenant=%s "
+                "expected_partner_id=%s order_partner_id=%s order_id=%s",
+                tool_name, tc["tenant_id"], expected_partner_id,
+                _check_partner_id, _candidate_id,
+            )
+            return json.dumps({
+                "success": False,
+                "error_code": "cross_partner_quotation",
+                "error_detail": (
+                    "Esa cotizacion pertenece a otro cliente. No puedo "
+                    "operar sobre ella desde esta sesion. Pidele al "
+                    "cliente la cotizacion correcta (suya) o usa "
+                    "get_latest_quotation con su partner_id."
+                ),
+                "expected_partner_id": expected_partner_id,
+            }, ensure_ascii=False)
+
+    # get_latest_quotation / list_quotations / get_active_quotation take
+    # ``partner_id`` directly — if the LLM passed someone else's id,
+    # reject up front so we don't expose the other customer's list.
+    if (
+        expected_partner_id
+        and tool_name in {
+            "get_latest_quotation", "list_quotations", "get_active_quotation",
+        }
+        and args.get("partner_id")
+    ):
+        try:
+            _pid_arg = int(args["partner_id"])
+        except (TypeError, ValueError):
+            _pid_arg = None
+        if _pid_arg and _pid_arg != expected_partner_id:
+            logger.error(
+                "C1 cross_partner_quotation BLOCKED: tool=%s tenant=%s "
+                "expected_partner_id=%s arg_partner_id=%s",
+                tool_name, tc["tenant_id"], expected_partner_id, _pid_arg,
+            )
+            return json.dumps({
+                "success": False,
+                "error_code": "cross_partner_quotation",
+                "error_detail": (
+                    "No puedo consultar cotizaciones de otro cliente "
+                    "desde esta sesion. Usa el partner_id del cliente "
+                    "actual."
+                ),
+                "expected_partner_id": expected_partner_id,
+            }, ensure_ascii=False)
+
     if tool_name == "search_products":
         # Optional price filters: the LLM passes them when the customer
         # states a budget ("max 500", "hasta 800", "entre 200 y 500").
