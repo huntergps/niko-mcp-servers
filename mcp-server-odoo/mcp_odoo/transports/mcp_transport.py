@@ -493,6 +493,7 @@ MCP_TOOLS = [
                 "offset": {"type": "integer", "description": "Offset para paginacion. Usa 0 en la primera llamada, top_k en la siguiente, etc.", "default": 0},
                 "price_min": {"type": "number", "description": "Precio minimo en USD (inclusivo). Usar cuando el cliente pide 'desde X' o 'entre X y Y'. Opcional."},
                 "price_max": {"type": "number", "description": "Precio maximo en USD (inclusivo). Usar cuando el cliente menciona presupuesto: 'maximo 500', 'hasta 800', 'por 1000', 'entre 200 y 500'. Opcional pero CRITICO si hay presupuesto explicito — items sobre este monto NO se presentan al cliente."},
+                "category_path": {"type": "string", "description": "Filtro por categoria Odoo (categ_id.complete_name, busqueda parcial ilike). Usar cuando el cliente nombra una categoria especifica para EVITAR ruido: 'Laptops', 'Monitores', 'Computadoras', 'Impresoras'. Cuando se proporciona, solo se devuelven productos cuya categoria contiene este texto. Opcional."},
             },
             "required": ["query"],
         },
@@ -1886,6 +1887,10 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             except (TypeError, ValueError):
                 return None
 
+        _cat_raw = args.get("category_path") or args.get("category_id")
+        category_path = (
+            str(_cat_raw).strip() if _cat_raw not in (None, "") else None
+        )
         return await _rag_search(
             args["query"],
             top_k=max(int(args.get("top_k", 10)), 1),
@@ -1893,6 +1898,7 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             tenant_id=tc["tenant_id"],
             price_min=_coerce_price(args.get("price_min")),
             price_max=_coerce_price(args.get("price_max")),
+            category_path=category_path,
         )
 
     if tool_name == "get_product_details":
@@ -3648,6 +3654,7 @@ async def _rag_search(
     tenant_id: str = "",
     price_min: float | None = None,
     price_max: float | None = None,
+    category_path: str | None = None,
 ) -> str:
     """Hybrid product search: pgvector RRF + ILIKE merge + live Odoo + paginated.
 
@@ -3680,6 +3687,7 @@ async def _rag_search(
         return _format_ranked_page(
             cached_ranked, top_k, offset,
             price_min=price_min, price_max=price_max,
+            category_path=category_path,
         )
 
     # Cache miss — fetch a wide candidate pool. We aim for at least
@@ -3847,6 +3855,7 @@ async def _rag_search(
     return _format_ranked_page(
         ranked, top_k, offset,
         price_min=price_min, price_max=price_max,
+        category_path=category_path,
     )
 
 
@@ -3856,6 +3865,7 @@ def _format_ranked_page(
     offset: int,
     price_min: float | None = None,
     price_max: float | None = None,
+    category_path: str | None = None,
 ) -> str:
     """Render a slice [offset:offset+top_k] of a pre-ranked product list.
 
@@ -3905,7 +3915,28 @@ def _format_ranked_page(
     import json as _json
 
     price_filter_active = price_min is not None or price_max is not None
+    category_filter_active = bool(category_path)
     total_before_filter = len(ranked)
+
+    if category_filter_active:
+        # Bug M4: filter ranked rows by Odoo categ_id.complete_name
+        # (case-insensitive substring). Reads category from the live
+        # row (_live.category) populated by _fetch_products_live; rows
+        # without live data are dropped because we can't certify their
+        # category.
+        cat_low = category_path.lower()
+        filtered_cat: list[dict] = []
+        for r in ranked:
+            live_data = r.get("_live")
+            if live_data is None:
+                continue
+            cat_str = (live_data.get("category") or "").lower()
+            if not cat_str:
+                continue
+            if cat_low not in cat_str:
+                continue
+            filtered_cat.append(r)
+        ranked = filtered_cat
 
     if price_filter_active:
         filtered: list[dict] = []

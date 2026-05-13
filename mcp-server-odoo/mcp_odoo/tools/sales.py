@@ -30,6 +30,42 @@ logger = logging.getLogger("mcp_odoo.sales")
 _NAME_SUFFIX_RANGE = (110_000, 130_000)
 
 
+def _absolutize_share_link(share_link: str | None, base_url: str | None) -> str:
+    """Return an absolute URL for an Odoo ``share_link_so`` value.
+
+    Bug M9 (May 2026): the customer sometimes received a path-only
+    ``/files/quotations/VENTA122584.pdf`` from Odoo when ``web.base.url``
+    was unset. We normalise here so the LLM always surfaces a clickable
+    https://... link.
+
+    Rules:
+      * Empty / None input → return "".
+      * Already absolute (starts with ``http://`` or ``https://``) →
+        returned unchanged.
+      * ``//host/path`` (protocol-relative) → prefix with ``https:``.
+      * Relative path (``/x/y`` or ``x/y``) → prefix with ``base_url``
+        when present; otherwise return as-is (best effort).
+    """
+    if not share_link:
+        return ""
+    link = str(share_link).strip()
+    if not link:
+        return ""
+    low = link.lower()
+    if low.startswith(("http://", "https://")):
+        return link
+    if link.startswith("//"):
+        return "https:" + link
+    if not base_url:
+        # No Odoo URL hint — surface the raw link rather than risk
+        # corrupting it.
+        return link
+    base = str(base_url).rstrip("/")
+    if not link.startswith("/"):
+        link = "/" + link
+    return base + link
+
+
 def _looks_like_name_suffix(order_id_int: int) -> bool:
     """Return True if ``order_id_int`` falls in the in-use ``name`` suffix range.
 
@@ -638,7 +674,7 @@ def odoo_create_quotation(
         "subtotal": order["amount_untaxed"],
         "tax": order["amount_tax"],
         "total": order["amount_total"],
-        "share_link": order.get("share_link_so") or "",
+        "share_link": _absolutize_share_link(order.get("share_link_so"), url),
     }
     result["_card"] = _build_card(result)
     _log_call("create_quotation", tenant_id, log_args, result, None, int((time.time() - started) * 1000))
@@ -973,7 +1009,7 @@ def odoo_add_to_quotation(
         "subtotal": order["amount_untaxed"],
         "tax": order["amount_tax"],
         "total": order["amount_total"],
-        "share_link": order.get("share_link_so") or "",
+        "share_link": _absolutize_share_link(order.get("share_link_so"), url),
     }
     result["_card"] = _build_card(result)
     _log_call("add_to_quotation", tenant_id, log_args, result, None, int((time.time() - started) * 1000))
@@ -1134,7 +1170,7 @@ def odoo_list_quotations(
             "subtotal": r["amount_untaxed"],
             "date_order": r.get("date_order") or r.get("create_date"),
             "lines_count": len(line_ids),
-            "share_link": r.get("share_link_so") or "",
+            "share_link": _absolutize_share_link(r.get("share_link_so"), url),
         })
 
     result = {
@@ -1242,7 +1278,7 @@ def odoo_get_quotation(
         # template. Distinct from Niko's signature mini-app (which is
         # served at /sign/ on niko.galapagos.tech). The LLM should
         # share THIS link when the user asks for "el link de la venta".
-        "share_link": order.get("share_link_so") or "",
+        "share_link": _absolutize_share_link(order.get("share_link_so"), url),
     }
     result["_card"] = _build_card(result)
     _log_call("get_quotation", tenant_id, log_args, {"name": order["name"], "lines": len(lines_detail)}, None, int((time.time() - started) * 1000))
