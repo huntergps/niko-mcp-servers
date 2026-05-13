@@ -4447,15 +4447,20 @@ def _format_ranked_page(
 
         line_text = f"{title}\n      {price_part}{stock_part}"
 
-        cost = live_data.get("cost") if live_data else (
-            (r.get("metadata") or {}).get("cost") or 0
-        )
+        # cost is deliberately NOT echoed in the row dict any more.
+        # Audit 2026-05-13: the LLM was seeing internal margin data on
+        # every product list, response_guard had to sanitize. The few
+        # legitimate consumers (seller-asks-for-margin-based-discount in
+        # the internal B2B assistant) request cost explicitly via
+        # get_product_details. For the customer-facing search_products
+        # response there is no use case for `cost` reaching the prompt.
+        in_stock_flag = qty is not None and qty > 0
         rows.append({
             "template_id": tmpl_id,
             "code": code or "",
             "name": name or "",
             "price": round(float(price), 2) if price else 0,
-            "cost": round(float(cost), 2) if cost else 0,
+            "in_stock": in_stock_flag,
             "line_text": line_text,
         })
 
@@ -4507,33 +4512,36 @@ def _format_ranked_page(
     # (c) normal in-stock pagination. Audit 2026-05-13: generic footer
     # ("Dime el numero o codigo para cotizar") was misleading when EVERY
     # row was "agotado" because the customer had nothing to pick.
+    #
+    # Format conventions (matches what WhatsApp/Telegram render as
+    # native buttons or selectable options):
+    #   * Numbered ACTIONS use plain "1." / "2." / "3." — these are
+    #     menus of next steps, not product picks.
+    #   * Product PICKS use emoji badges (1️⃣ 2️⃣ ...) inside the rows
+    #     themselves (handled by ``line_text``), not the footer.
+    #   * "👉" prefixes are kept for non-numbered conversational cues
+    #     (single line hints).
     footer_parts: list[str] = []
     if total == 0:
         # Empty result. Already covered by the header but we offer the
         # most useful next steps so the LLM doesn't have to improvise.
+        footer_parts.append("¿Qué prefieres hacer?")
         if price_filter_active:
-            footer_parts.append(
-                "👉 ¿Subimos el presupuesto para ver más opciones?"
-            )
+            footer_parts.append("1. Subir el presupuesto para ver más opciones")
+            footer_parts.append("2. Revisar otra categoría")
         else:
-            footer_parts.append(
-                "👉 ¿Buscamos por otra categoría o marca?"
-            )
+            footer_parts.append("1. Buscar por otra categoría")
+            footer_parts.append("2. Probar con otra marca o palabra clave")
     elif in_stock_total == 0:
         # All candidates are out of stock — the "pick a number" prompt
-        # is useless here because nothing is buyable. Offer the natural
-        # follow-ups instead.
-        footer_parts.append(
-            "👉 Ninguna opción tiene stock disponible ahora mismo."
-        )
+        # is useless here. Offer numbered next-step ACTIONS instead.
+        footer_parts.append("¿Qué prefieres hacer?")
         if price_filter_active:
-            footer_parts.append(
-                "👉 Puedo buscar sin límite de presupuesto o revisar otra categoría."
-            )
+            footer_parts.append("1. Buscar opciones disponibles sin límite de presupuesto")
+            footer_parts.append("2. Revisar otra categoría dentro del mismo presupuesto")
         else:
-            footer_parts.append(
-                "👉 ¿Reviso otra categoría o variante?"
-            )
+            footer_parts.append("1. Revisar otra categoría o variante")
+            footer_parts.append("2. Que registre tu interés y te avise cuando entre stock")
     else:
         # Normal case — we have at least one in-stock candidate.
         footer_parts.append(
@@ -4557,20 +4565,39 @@ def _format_ranked_page(
             "price_max": price_max,
         } if price_filter_active else None,
         "instructions_internal": (
-            "Para responder al usuario: escribe header, luego una linea en blanco, "
-            "luego cada line_text en orden separados por linea en blanco, luego "
-            "linea en blanco, luego footer. NUNCA muestres template_id al usuario. "
-            "Memoriza la posicion (1,2,3...) -> template_id para usar despues en "
-            "create_quotation. NUNCA inventes template_id; usa exactamente el numero "
-            "que aparece en este JSON. "
-            "Cada row incluye 'price' (precio de venta) y 'cost' (costo de adquisicion). "
-            "Cuando el vendedor pida precio 'sobre el costo' o 'margen sobre costo', "
-            "usa el campo 'cost' de este JSON como base — NO el 'price'. "
-            "Si filter_applied no es null, el resultado YA respeta el presupuesto "
-            "del cliente — no necesitas filtrar de nuevo ni avisar 'me sale sobre "
-            "tu presupuesto'. Si filter_applied y rows esta vacio, dile al "
-            "cliente claramente que no hay productos en ese rango y ofrece el "
-            "siguiente paso (subir presupuesto, sugerir categoria alterna)."
+            # Rendering ----------------------------------------------
+            "Render: escribe header, linea en blanco, cada line_text en orden "
+            "separados por linea en blanco, linea en blanco, footer. NUNCA "
+            "muestres template_id al usuario. Memoriza la posicion (1,2,3...) "
+            "-> template_id para usar despues en create_quotation / "
+            "add_to_quotation. NUNCA inventes template_id; usa exactamente "
+            "el numero que aparece en este JSON. "
+            # Caso "todos agotados" ----------------------------------
+            "Si TODOS los rows tienen in_stock=false, muestra solo 3-5 rows "
+            "como referencia (no los 10) — el cliente debe poder ver que "
+            "modelos EXISTEN dentro de su presupuesto aunque no haya stock. "
+            "Despues del bloque de rows, escribe el footer tal cual viene "
+            "(ya esta formateado como menu numerado de acciones '1.' '2.'). "
+            "NO inventes acciones que no esten en el footer. "
+            # Promesas de follow-up ---------------------------------
+            "Si vas a prometer al cliente 'te aviso cuando entre stock' o "
+            "'registro tu interes' o cualquier follow-up futuro, PRIMERO "
+            "llama save_memory con el contenido especifico ('cliente quiere "
+            "<modelo o codigo> cuando regrese a stock') y/o create_task "
+            "para el vendedor. Si no llamaste esas tools, NO hagas la "
+            "promesa — el cliente entiende 'te aviso' literal. "
+            # Filtros pre-aplicados ---------------------------------
+            "Si filter_applied no es null, el resultado YA respeta el "
+            "presupuesto del cliente — no necesitas filtrar de nuevo ni "
+            "avisar 'me sale sobre tu presupuesto'. Si rows esta vacio "
+            "(total=0), usa el footer que ya viene con las opciones "
+            "numeradas; NO inventes 'laptops usadas' ni 'reacondicionadas' "
+            "si no tienes una tool real para buscarlas. "
+            # Formato de menus --------------------------------------
+            "Convencion de formato: emoji 1️⃣ 2️⃣... SOLO para datos "
+            "(productos, opciones tangibles). Numeros planos '1.' '2.' "
+            "para menus de ACCIONES (que hacer despues). El footer ya "
+            "respeta esa convencion — preservalo verbatim."
         ),
     }
     return _json.dumps(payload, ensure_ascii=False)
