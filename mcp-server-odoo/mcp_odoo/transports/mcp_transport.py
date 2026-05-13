@@ -4565,39 +4565,45 @@ def _format_ranked_page(
             "price_max": price_max,
         } if price_filter_active else None,
         "instructions_internal": (
-            # Rendering ----------------------------------------------
-            "Render: escribe header, linea en blanco, cada line_text en orden "
-            "separados por linea en blanco, linea en blanco, footer. NUNCA "
-            "muestres template_id al usuario. Memoriza la posicion (1,2,3...) "
-            "-> template_id para usar despues en create_quotation / "
+            # Rendering core ------------------------------------------
+            "CONTRATO DE RENDER (obligatorio): escribe header, linea en "
+            "blanco, line_text de cada row VERBATIM (sin reformatear, sin "
+            "resumir nombres, sin reordenar), linea en blanco, footer "
+            "VERBATIM. NUNCA muestres template_id al usuario. Memoriza la "
+            "posicion (1,2,3...) -> template_id para create_quotation / "
             "add_to_quotation. NUNCA inventes template_id; usa exactamente "
-            "el numero que aparece en este JSON. "
-            # Caso "todos agotados" ----------------------------------
-            "Si TODOS los rows tienen in_stock=false, muestra solo 3-5 rows "
-            "como referencia (no los 10) — el cliente debe poder ver que "
-            "modelos EXISTEN dentro de su presupuesto aunque no haya stock. "
-            "Despues del bloque de rows, escribe el footer tal cual viene "
-            "(ya esta formateado como menu numerado de acciones '1.' '2.'). "
-            "NO inventes acciones que no esten en el footer. "
-            # Promesas de follow-up ---------------------------------
-            "Si vas a prometer al cliente 'te aviso cuando entre stock' o "
-            "'registro tu interes' o cualquier follow-up futuro, PRIMERO "
-            "llama save_memory con el contenido especifico ('cliente quiere "
-            "<modelo o codigo> cuando regrese a stock') y/o create_task "
-            "para el vendedor. Si no llamaste esas tools, NO hagas la "
-            "promesa — el cliente entiende 'te aviso' literal. "
-            # Filtros pre-aplicados ---------------------------------
+            "el que aparece en este JSON. "
+            # Filtrado por stock (NUEVO 2026-05-13) -------------------
+            "FILTRADO POR STOCK: si algunas rows tienen in_stock=true y "
+            "otras false, muestra SOLO las rows con in_stock=true en la "
+            "primera respuesta — el cliente no necesita ver agotadas si "
+            "hay disponibles. El header dice cuantas hay con stock; mantenlo. "
+            "Si TODOS los rows tienen in_stock=false, muestra solo 3-5 "
+            "como referencia para que el cliente vea modelos existentes; "
+            "el footer dinamico ya ofrece la accion correcta (subir "
+            "presupuesto / cambiar categoria / registrar interes). "
+            # Footer policy -------------------------------------------
+            "FOOTER: copia el campo 'footer' EXACTAMENTE como viene. NO "
+            "agregues opciones que no esten en el footer (ej. 'Filtrar por "
+            "presupuesto especifico', 'Te aviso cuando entre stock', "
+            "'Laptops usadas'). Si necesitas una opcion adicional, deja "
+            "que el cliente la pida; no la inventes en el menu. "
+            # Promesas de follow-up ----------------------------------
+            "Promesas tipo 'te aviso cuando entre stock' o 'registro tu "
+            "interes': solo puedes hacerlas si PRIMERO llamaste save_memory "
+            "con el contenido especifico ('cliente quiere <codigo> cuando "
+            "regrese a stock') y/o create_task. Sin tool call previo, NO "
+            "hagas la promesa. "
+            # Filtros pre-aplicados ----------------------------------
             "Si filter_applied no es null, el resultado YA respeta el "
-            "presupuesto del cliente — no necesitas filtrar de nuevo ni "
-            "avisar 'me sale sobre tu presupuesto'. Si rows esta vacio "
-            "(total=0), usa el footer que ya viene con las opciones "
-            "numeradas; NO inventes 'laptops usadas' ni 'reacondicionadas' "
-            "si no tienes una tool real para buscarlas. "
-            # Formato de menus --------------------------------------
-            "Convencion de formato: emoji 1️⃣ 2️⃣... SOLO para datos "
-            "(productos, opciones tangibles). Numeros planos '1.' '2.' "
-            "para menus de ACCIONES (que hacer despues). El footer ya "
-            "respeta esa convencion — preservalo verbatim."
+            "presupuesto. No filtres de nuevo, no avises 'me sale sobre tu "
+            "presupuesto'. Si rows esta vacio (total=0), el footer ya "
+            "trae opciones numeradas; usalo verbatim. NO inventes "
+            "categorias inexistentes (usadas, reacondicionadas, etc). "
+            # Formato de menus ---------------------------------------
+            "Convencion: emoji 1️⃣ 2️⃣... SOLO para datos (productos, "
+            "opciones tangibles). Numeros planos '1.' '2.' para menus "
+            "de ACCIONES. El footer ya respeta esa convencion."
         ),
     }
     return _json.dumps(payload, ensure_ascii=False)
