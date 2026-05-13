@@ -3803,6 +3803,206 @@ async def _get_tenant_slug(tenant_id: str) -> str:
     return slug
 
 
+# ---------------------------------------------------------------------------
+# Product intent classification (audit 2026-05-13)
+# ---------------------------------------------------------------------------
+#
+# When the customer asks for a "laptop", the semantic + ILIKE search
+# also pulls in "TECLADO PARA LAPTOP HP", "CABLE DE SEGURIDAD PARA
+# LAPTOP", "KIT DE LIMPIEZA PARA LAPTOP" etc. We classify the query
+# into a coarse intent so we can drop accessories/parts when the
+# customer obviously wants a *complete* product. The classification
+# is purely keyword-based — fast, deterministic, no ML dependency.
+#
+# Each kind maps to:
+#   * a set of category hints (Odoo categ_id substrings)
+#   * a set of code prefixes that count as the "right" kind
+#   * a set of disqualifying tokens (when present in the candidate
+#     row's name, exclude regardless of category)
+#
+# The filter is BEST-EFFORT: if it would zero out the result list, we
+# silently return the unfiltered ranking so the customer still sees
+# something.
+
+_INTENT_RULES: list[dict] = [
+    # Computing platforms — main draw
+    {
+        "kind": "laptop_complete",
+        "query_any": ["laptop", "notebook", "portatil", "portátil", "ultrabook"],
+        "query_exclude_part": [
+            "teclado", "pantalla", "bateria", "batería", "cargador",
+            "fuente", "repuesto", "carcasa", "bisagra", "memoria",
+            "ram", "ssd", "disco",
+        ],
+        "category_hints": ["laptop", "notebook", "portable", "computadores y portables"],
+        "code_prefixes": ["LAP"],
+        "name_excludes": [
+            "teclado", "pantalla", "bateria", "batería", "cargador",
+            "carcasa", "bisagra", "cable de seguridad", "kit de limpieza",
+            "candado",
+        ],
+    },
+    {
+        "kind": "desktop_complete",
+        "query_any": ["desktop", "escritorio", "all in one", "all-in-one", "torre", "workstation"],
+        "query_exclude_part": ["repuesto", "case", "cooler", "fuente"],
+        "category_hints": ["desktop", "escritorio", "all in one", "computadores"],
+        "code_prefixes": ["PCD", "PCS"],
+        "name_excludes": ["fuente para", "carcasa", "kit de"],
+    },
+    {
+        "kind": "monitor",
+        "query_any": ["monitor", "pantalla", "display"],
+        "query_exclude_part": ["cable", "soporte", "brazo", "repuesto", "limpieza"],
+        "category_hints": ["monitor", "tv"],
+        "code_prefixes": ["MON"],
+        "name_excludes": ["cable", "soporte", "brazo", "kit de limpieza"],
+    },
+    {
+        "kind": "printer",
+        "query_any": ["impresora", "multifuncional", "printer"],
+        "query_exclude_part": ["tinta", "toner", "cartucho", "papel", "repuesto"],
+        "category_hints": ["impresora", "printer"],
+        "code_prefixes": ["IMP"],
+        "name_excludes": ["tinta", "toner", "cartucho", "papel"],
+    },
+    {
+        "kind": "mouse",
+        "query_any": ["mouse", "raton", "ratón"],
+        "query_exclude_part": ["mousepad", "pad para mouse"],
+        "category_hints": ["mouse"],
+        "code_prefixes": ["MOU"],
+        "name_excludes": ["mousepad"],
+    },
+    {
+        "kind": "keyboard",
+        "query_any": ["teclado", "keyboard"],
+        "query_exclude_part": ["para laptop", "para notebook", "repuesto"],
+        "category_hints": ["teclado", "keyboard"],
+        "code_prefixes": ["TEC"],
+        "name_excludes": ["para laptop", "para notebook"],
+    },
+]
+
+
+def _classify_product_intent(query: str) -> dict | None:
+    """Classify a product query into one of :data:`_INTENT_RULES`.
+
+    Returns the matching rule dict or ``None`` when no rule fires
+    (generic query like "algo para mi oficina"). Multiple matches
+    resolve to the FIRST one in the list (laptop_complete wins over
+    monitor when both keywords appear, matching the usual user phrasing
+    "una laptop con monitor").
+    """
+    q = (query or "").lower()
+    for rule in _INTENT_RULES:
+        if not any(kw in q for kw in rule["query_any"]):
+            continue
+        # Demote to the "part/accessory" variant when the user query
+        # mentions parts (e.g. "teclado para laptop" → keyboard, not
+        # laptop_complete). We model this by returning None for those
+        # cases — the caller falls back to unfiltered semantic search,
+        # which is the right answer because the semantic rank will
+        # actually surface the parts the customer wants.
+        if any(part in q for part in rule.get("query_exclude_part", [])):
+            return None
+        return rule
+    return None
+
+
+def _apply_kind_filter(
+    ranked: list[dict], intent_rule: dict
+) -> tuple[list[dict], int]:
+    """Drop rows that don't match ``intent_rule``.
+
+    Returns ``(filtered, dropped_count)``. A row passes when ANY of
+    these are true:
+      * its ``code`` starts with one of the rule's ``code_prefixes``
+      * its live ``category`` contains one of ``category_hints``
+    A row is REJECTED when its ``name`` contains one of
+    ``name_excludes`` (regardless of the positive matches above) —
+    that catches "TECLADO PARA LAPTOP" that lives in a laptop-adjacent
+    Odoo category but is clearly an accessory.
+
+    When the filter would leave 0 rows, the caller is expected to
+    fall back to the unfiltered ranking (handled in ``_rag_search``).
+    """
+    prefixes = tuple(p.upper() for p in intent_rule.get("code_prefixes", []))
+    hints = [h.lower() for h in intent_rule.get("category_hints", [])]
+    excludes = [e.lower() for e in intent_rule.get("name_excludes", [])]
+    kept: list[dict] = []
+    dropped = 0
+    for r in ranked:
+        live = r.get("_live") or {}
+        name_low = (live.get("name") or r.get("name") or "").lower()
+        code = (live.get("code") or r.get("code") or "").upper()
+        category_low = (live.get("category") or "").lower()
+        if excludes and any(x in name_low for x in excludes):
+            dropped += 1
+            continue
+        passes = False
+        if prefixes and code.startswith(prefixes):
+            passes = True
+        elif hints and any(h in category_low for h in hints):
+            passes = True
+        if passes:
+            kept.append(r)
+        else:
+            dropped += 1
+    return kept, dropped
+
+
+async def _direct_by_code(tenant_id: str, code: str) -> list[dict] | None:
+    """Resolve a product by ``default_code`` straight from Odoo.
+
+    Used by :func:`_rag_search` as the code-direct shortcut: when the
+    query looks like a product code we skip the embedding + ILIKE merge
+    and read the live row from Odoo by ``default_code``. Returns a
+    list-of-one in the same shape :func:`_format_ranked_page` expects
+    (``[{"odoo_id": int, "_live": dict, ...}]``), or ``None`` when no
+    such code exists in the tenant's catalog (caller falls back to the
+    semantic search).
+    """
+    tc = await _get_tenant_config_by_id(tenant_id)
+    if not tc or not tc.get("url"):
+        return None
+    from mcp_odoo.tools.generic import odoo_search as _read
+    rows = _read(
+        tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
+        "product.template",
+        [["default_code", "=ilike", code]],
+        fields=[
+            "id", "name", "default_code", "list_price", "standard_price",
+            "qty_available", "virtual_available", "categ_id",
+            "description_sale", "active",
+        ],
+        limit=1,
+    )
+    if not rows:
+        return None
+    p = rows[0]
+    if not p.get("active", True):
+        return None
+    live = {
+        "name": p.get("name", ""),
+        "code": p.get("default_code", "") or "",
+        "price": float(p.get("list_price") or 0),
+        "cost": float(p.get("standard_price") or 0),
+        "qty": float(p.get("qty_available") or 0),
+        "virtual": float(p.get("virtual_available") or 0),
+        "category": p.get("categ_id", [None, ""])[1]
+                    if isinstance(p.get("categ_id"), list) else "",
+        "description": p.get("description_sale") or "",
+    }
+    return [{
+        "odoo_id": p["id"],
+        "code": live["code"],
+        "name": live["name"],
+        "_live": live,
+        "metadata": {"odoo_id": p["id"], "code": live["code"]},
+    }]
+
+
 async def _rag_search(
     query: str,
     top_k: int = 10,
@@ -3837,6 +4037,36 @@ async def _rag_search(
     only when no price filter is requested; otherwise we drop them
     because we can't certify they fit the budget.
     """
+    # Code-direct shortcut. When the query looks like a product code
+    # (3-letter prefix + 3-4 digits, e.g. "RAM0413", "LAP0030", "MOU0154"),
+    # bypass the embedding + ILIKE merge entirely and read live from
+    # Odoo by default_code. Reasons:
+    #   * Embedding for a code string is wasteful (no semantic content).
+    #   * The ILIKE fallback would still match accessories named
+    #     "TECLADO PARA LAPTOP HP MOU0154" — same noise we are trying
+    #     to avoid.
+    #   * Odoo XMLRPC read by code is O(1) — fastest path.
+    #
+    # If the code is malformed or doesn't exist in Odoo, we fall through
+    # to the regular semantic search so the customer still gets options.
+    import re as _re_local
+    _code_match = _re_local.fullmatch(
+        r"\s*([A-Z]{2,4}\d{3,5})\s*", query, _re_local.IGNORECASE,
+    )
+    if _code_match:
+        _code = _code_match.group(1).upper()
+        try:
+            _direct = await _direct_by_code(tenant_id, _code)
+            if _direct:
+                return _format_ranked_page(
+                    _direct, top_k=1, offset=0,
+                    price_min=price_min, price_max=price_max,
+                    category_path=category_path,
+                )
+        except Exception as _direct_exc:
+            print(f"[RAG] code-direct lookup failed: {_direct_exc}", flush=True)
+        # Falls through to semantic search if code lookup returned nothing.
+
     cache_key = query.strip().lower()
     cached_ranked = _query_cache_get(tenant_id, cache_key)
     if cached_ranked is not None:
@@ -4007,11 +4237,36 @@ async def _rag_search(
     # _format_ranked_page so paginated calls can hit different slices
     # of the same cached list).
     ranked = in_stock + out_of_stock + unknown_stock
+
+    # Intent-aware filter — drop accessories/parts when the customer
+    # clearly wants a complete product (e.g. "laptop oficina" filters
+    # out "TECLADO PARA LAPTOP HP"). When the filter would leave zero
+    # rows we keep the unfiltered list so the customer still gets
+    # options (better than "no encontré").
+    intent_rule = _classify_product_intent(query)
+    intent_kind = intent_rule.get("kind") if intent_rule else None
+    if intent_rule:
+        filtered, dropped = _apply_kind_filter(ranked, intent_rule)
+        if filtered:
+            print(
+                f"[RAG] intent={intent_kind}: kept {len(filtered)}/"
+                f"{len(ranked)} rows (dropped {dropped} accessories/parts)",
+                flush=True,
+            )
+            ranked = filtered
+        else:
+            print(
+                f"[RAG] intent={intent_kind}: filter would zero result "
+                f"({len(ranked)} candidates) — keeping unfiltered",
+                flush=True,
+            )
+
     _query_cache_set(tenant_id, cache_key, ranked)
     return _format_ranked_page(
         ranked, top_k, offset,
         price_min=price_min, price_max=price_max,
         category_path=category_path,
+        intent_kind=intent_kind,
     )
 
 
@@ -4022,6 +4277,7 @@ def _format_ranked_page(
     price_min: float | None = None,
     price_max: float | None = None,
     category_path: str | None = None,
+    intent_kind: str | None = None,
 ) -> str:
     """Render a slice [offset:offset+top_k] of a pre-ranked product list.
 
@@ -4247,15 +4503,47 @@ def _format_ranked_page(
             f"Mostrando {showing_from}-{showing_to}"
         )
 
-    # Footer: selection + pagination hints
+    # State-aware footer — adapts to (a) empty result, (b) all-out-of-stock,
+    # (c) normal in-stock pagination. Audit 2026-05-13: generic footer
+    # ("Dime el numero o codigo para cotizar") was misleading when EVERY
+    # row was "agotado" because the customer had nothing to pick.
     footer_parts: list[str] = []
-    footer_parts.append(
-        "👉 Dime el numero (ej: 1) o el codigo (ej: CPU0245) para cotizar."
-    )
-    if has_more:
+    if total == 0:
+        # Empty result. Already covered by the header but we offer the
+        # most useful next steps so the LLM doesn't have to improvise.
+        if price_filter_active:
+            footer_parts.append(
+                "👉 ¿Subimos el presupuesto para ver más opciones?"
+            )
+        else:
+            footer_parts.append(
+                "👉 ¿Buscamos por otra categoría o marca?"
+            )
+    elif in_stock_total == 0:
+        # All candidates are out of stock — the "pick a number" prompt
+        # is useless here because nothing is buyable. Offer the natural
+        # follow-ups instead.
         footer_parts.append(
-            f"👉 Di \"siguiente\" para ver los proximos {min(top_k, total - showing_to)}."
+            "👉 Ninguna opción tiene stock disponible ahora mismo."
         )
+        if price_filter_active:
+            footer_parts.append(
+                "👉 Puedo buscar sin límite de presupuesto o revisar otra categoría."
+            )
+        else:
+            footer_parts.append(
+                "👉 ¿Reviso otra categoría o variante?"
+            )
+    else:
+        # Normal case — we have at least one in-stock candidate.
+        footer_parts.append(
+            "👉 Dime el número (ej: 1) o el código (ej: CPU0245) para cotizar."
+        )
+        if has_more:
+            footer_parts.append(
+                f"👉 Di \"siguiente\" para ver los próximos "
+                f"{min(top_k, total - showing_to)}."
+            )
     footer = "\n".join(footer_parts)
 
     payload = {
@@ -4263,6 +4551,7 @@ def _format_ranked_page(
         "header": header,
         "rows": rows,
         "footer": footer,
+        "intent_kind": intent_kind,  # informational; LLM may use it for copy
         "filter_applied": {
             "price_min": price_min,
             "price_max": price_max,
