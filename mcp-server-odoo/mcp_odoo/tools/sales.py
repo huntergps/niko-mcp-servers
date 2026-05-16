@@ -2724,18 +2724,47 @@ def odoo_apply_global_discount(
             "action": "apply_global_discount",
         }
 
+    # Tecnosmart gotcha (Odoo 13 + l10n_ec_sri):
+    # ``sale.order.calculate_discount(order_id)`` returns ``None``
+    # server-side; Odoo's XMLRPC layer then raises "cannot marshal None
+    # unless allow_none is enabled" even though the discount DID get
+    # written and propagated to lines. Same fix-shape used by
+    # ``odoo_sign_quotation`` (L5092) and ``action_confirm`` fallback
+    # (L5137): catch the marshal-None error and treat as success.
     try:
         odoo_write(tenant_id, url, db, user, password,
                    "sale.order", [order_id],
                    {"discount_type": discount_type, "discount_rate": float(discount_rate)})
+    except Exception as e:
+        err_msg = str(e)
+        if "cannot marshal None" in err_msg or "allow_none" in err_msg:
+            logger.info(
+                "apply_global_discount: write returned marshal-None on order=%s — treating as success",
+                order_id,
+            )
+        else:
+            elapsed = int((time.time() - started) * 1000)
+            tb = traceback.format_exc()
+            logger.error("apply_global_discount write failed order=%s err=%s\n%s", order_id, e, tb)
+            _log_call("apply_global_discount", tenant_id, log_args, None, str(e), elapsed)
+            return {"success": False, "error_code": "discount_failed", "error_detail": err_msg}
+
+    try:
         odoo_call_method(tenant_id, url, db, user, password,
                          "sale.order", "calculate_discount", [order_id])
     except Exception as e:
-        elapsed = int((time.time() - started) * 1000)
-        tb = traceback.format_exc()
-        logger.error("apply_global_discount failed order=%s err=%s\n%s", order_id, e, tb)
-        _log_call("apply_global_discount", tenant_id, log_args, None, str(e), elapsed)
-        return {"success": False, "error_code": "discount_failed", "error_detail": str(e)}
+        err_msg = str(e)
+        if "cannot marshal None" in err_msg or "allow_none" in err_msg:
+            logger.info(
+                "apply_global_discount: calculate_discount returned marshal-None on order=%s — treating as success",
+                order_id,
+            )
+        else:
+            elapsed = int((time.time() - started) * 1000)
+            tb = traceback.format_exc()
+            logger.error("apply_global_discount calculate_discount failed order=%s err=%s\n%s", order_id, e, tb)
+            _log_call("apply_global_discount", tenant_id, log_args, None, str(e), elapsed)
+            return {"success": False, "error_code": "discount_failed", "error_detail": err_msg}
 
     summary = _recompute_summary(tenant_id, url, db, user, password, order_id)
     # Read the discount-related fields after the call.
