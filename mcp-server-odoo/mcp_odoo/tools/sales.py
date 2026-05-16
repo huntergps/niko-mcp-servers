@@ -442,6 +442,53 @@ def odoo_create_quotation(
             "partner_id": partner_id,
         }
 
+    # ── Tenant-owner partner guard (PII leak prevention) ────────────────
+    # Bug observed prod 2026-05-15: LLM passed partner_id=1 (the
+    # tenant owner's res.partner) when it could not identify the lead
+    # Nataly Torres. Odoo accepted it because the partner exists, and
+    # the quote was created under "Aldas Romero Erik Andres" (the
+    # vendor) leaking the owner's PII back to the customer.
+    #
+    # Reject any partner_id that belongs to a res.company on this Odoo
+    # instance. The legitimate path for unidentified leads is
+    # ``create_partner`` first, then ``create_quotation`` with the new
+    # partner_id.
+    try:
+        companies = odoo_search(
+            tenant_id, url, db, user, password,
+            "res.company", [], fields=["partner_id"], limit=100,
+        )
+        company_partner_ids = {
+            c["partner_id"][0]
+            for c in (companies or [])
+            if isinstance(c.get("partner_id"), list) and c["partner_id"]
+        }
+        if partner_id in company_partner_ids:
+            err = (
+                f"partner_id={partner_id} pertenece a una res.company "
+                "(dueño del tenant). No puede ser destinatario de "
+                "una cotización. Identifica al cliente real o crea un "
+                "partner nuevo con create_partner."
+            )
+            _log_call("create_quotation", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {
+                "success": False,
+                "error_code": "partner_is_tenant_company",
+                "error_detail": err,
+                "partner_id": partner_id,
+                "hint": (
+                    "Antes de cotizar para un cliente nuevo (sin RUC), "
+                    "llama create_partner con nombre/email/teléfono. "
+                    "El partner_id retornado SI puede usarse en "
+                    "create_quotation."
+                ),
+            }
+    except Exception as _comp_exc:
+        # Non-fatal: si la verificación de company falla seguimos
+        # adelante. El guard es defense-in-depth, no el único filtro.
+        log.debug("company partner guard skipped: %s", _comp_exc)
+
     # The entire RAG/search/details pipeline canonicalizes on `product.template`
     # IDs (that's what _fetch_products_live, get_product_details and the
     # embedding store all use, matching what the Odoo UI shows). But
