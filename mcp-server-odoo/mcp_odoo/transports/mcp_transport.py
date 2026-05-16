@@ -511,6 +511,7 @@ MCP_TOOLS = [
             "type": "object",
             "properties": {
                 "product_code": {"type": "string", "description": "Codigo interno del producto (default_code)"},
+                "partner_id": {"type": "integer", "description": "Cliente identificado (res.partner.id). El orchestrator lo inyecta automáticamente — no necesitas pasarlo. Cuando viene, ``price`` refleja la pricelist del cliente y se agrega ``list_price`` si difiere del precio público."},
             },
             "required": ["product_code"],
         },
@@ -2096,6 +2097,31 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             )
         if not products:
             return _ERROR_MAP["product_not_found"]
+
+        # B1: si el orchestrator inyectó partner_id, reescribir el
+        # precio mostrado con la pricelist del cliente para no divergir
+        # con create_quotation.
+        _gpd_pid_raw = args.get("partner_id")
+        try:
+            _gpd_partner_id = int(_gpd_pid_raw) if _gpd_pid_raw not in (None, "") else None
+            if _gpd_partner_id is not None and _gpd_partner_id <= 0:
+                _gpd_partner_id = None
+        except (TypeError, ValueError):
+            _gpd_partner_id = None
+        pricelist_prices: dict[int, float] = {}
+        if _gpd_partner_id:
+            _gpd_live = {
+                int(p["id"]): {"price": float(p.get("list_price") or 0)}
+                for p in products if isinstance(p.get("id"), int)
+            }
+            if _gpd_live:
+                await _apply_pricelist_to_live(
+                    tc["tenant_id"], _gpd_partner_id, _gpd_live,
+                )
+                for tid, data in _gpd_live.items():
+                    if isinstance(data, dict) and "price" in data:
+                        pricelist_prices[tid] = float(data["price"])
+
         base_url = tc["url"].rstrip("/")
         results = []
         for p in products:
@@ -2105,11 +2131,13 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
                 f"{base_url}/web/image/product.template/{p['id']}/image_256"
                 if has_image else None
             )
-            results.append({
+            list_price = p.get("list_price", 0)
+            effective_price = pricelist_prices.get(p["id"], list_price)
+            entry = {
                 "id": p["id"],
                 "code": p.get("default_code", ""),
                 "name": p.get("name", ""),
-                "price": p.get("list_price", 0),
+                "price": effective_price,
                 "cost": p.get("standard_price", 0),
                 "stock": p.get("qty_available", 0),
                 "available": p.get("virtual_available", 0),
@@ -2117,7 +2145,12 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
                 "category": p.get("categ_id", [None, ""])[1] if isinstance(p.get("categ_id"), list) else "",
                 "barcode": p.get("barcode") or "",
                 "image_url": image_url,
-            })
+            }
+            # Surface list_price separately when it differs so the LLM
+            # can explain "público $206 / tu precio $230" if asked.
+            if effective_price != list_price:
+                entry["list_price"] = list_price
+            results.append(entry)
         return json.dumps(results if len(results) > 1 else results[0], indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "odoo_search":
