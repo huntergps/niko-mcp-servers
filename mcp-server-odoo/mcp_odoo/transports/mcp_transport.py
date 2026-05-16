@@ -3753,9 +3753,15 @@ async def _apply_pricelist_to_live(
     producto (no hay regla específica), Odoo devuelve el list_price y la
     sobrescritura es no-op.
 
-    Latencia: 1 lectura del partner + N lecturas pricelist.get_product_price
-    (N = productos en live). Cache 60s por (tenant, partner, template) para
-    amortizar la siguiente página de la misma búsqueda.
+    Implementación: una sola llamada ``read`` a ``product.template`` con
+    context ``{pricelist, partner}`` — Odoo 13 computa
+    ``product.template.price`` server-side aplicando todas las reglas de
+    la pricelist en un round-trip. Probamos antes con
+    ``pricelist.get_product_price`` pero ese método espera browse records
+    (no ids) y falla por XML-RPC con AttributeError ``categ_id``.
+
+    Cache 60s por (tenant, partner, template) para amortizar la siguiente
+    página de la misma búsqueda.
     """
     if not partner_id or not live:
         return
@@ -3790,33 +3796,57 @@ async def _apply_pricelist_to_live(
     if not pricelist_id:
         return
 
+    # Split live entries into cached vs miss
+    cached_prices: dict[int, float] = {}
+    misses: list[int] = []
+    for tid in live.keys():
+        cached = _pricelist_cache_get(tenant_id, partner_id, tid)
+        if cached is not None:
+            cached_prices[tid] = cached
+        else:
+            misses.append(tid)
+
+    # Batch-read the misses with pricelist context applied
+    fresh_prices: dict[int, float] = {}
+    if misses:
+        try:
+            rows = odoo_call_method(
+                tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
+                "product.template", "read",
+                misses,
+                [["id", "price"]],
+                {"context": {"pricelist": pricelist_id, "partner": partner_id}},
+            )
+            for row in rows or []:
+                tid = row.get("id")
+                price_val = row.get("price")
+                if not isinstance(tid, int) or price_val is None:
+                    continue
+                try:
+                    p = float(price_val)
+                except (TypeError, ValueError):
+                    continue
+                if p <= 0:
+                    # Skip 0 — usually means the partner is missing on the
+                    # pricelist's compute path; keep the list_price.
+                    continue
+                fresh_prices[tid] = p
+                _pricelist_cache_set(tenant_id, partner_id, tid, p)
+        except Exception as exc:
+            logger.warning(
+                "_apply_pricelist_to_live: batch read failed pricelist=%s n=%d err=%s",
+                pricelist_id, len(misses), exc,
+            )
+
+    # Apply rewritten prices in-place
     for tid, data in live.items():
         if not isinstance(data, dict):
             continue
-        cached = _pricelist_cache_get(tenant_id, partner_id, tid)
-        if cached is not None:
-            data["list_price"] = data.get("price", 0)
-            data["price"] = cached
+        new_price = cached_prices.get(tid) or fresh_prices.get(tid)
+        if new_price is None:
             continue
-        try:
-            raw_price = odoo_call_method(
-                tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
-                "product.pricelist", "get_product_price",
-                [pricelist_id],
-                [tid, 1.0, partner_id],
-            )
-            if raw_price is None:
-                continue
-            price = float(raw_price)
-        except Exception as exc:
-            logger.warning(
-                "_apply_pricelist_to_live: get_product_price failed pricelist=%s tid=%s err=%s",
-                pricelist_id, tid, exc,
-            )
-            continue
-        _pricelist_cache_set(tenant_id, partner_id, tid, price)
         data["list_price"] = data.get("price", 0)
-        data["price"] = price
+        data["price"] = new_price
 
 
 async def _get_tenant_config_by_id(tenant_id: str) -> dict | None:
