@@ -494,6 +494,7 @@ MCP_TOOLS = [
                 "price_min": {"type": "number", "description": "Precio minimo en USD (inclusivo). Usar cuando el cliente pide 'desde X' o 'entre X y Y'. Opcional."},
                 "price_max": {"type": "number", "description": "Precio maximo en USD (inclusivo). Usar cuando el cliente menciona presupuesto: 'maximo 500', 'hasta 800', 'por 1000', 'entre 200 y 500'. Opcional pero CRITICO si hay presupuesto explicito — items sobre este monto NO se presentan al cliente."},
                 "category_path": {"type": "string", "description": "Filtro por categoria Odoo (categ_id.complete_name, busqueda parcial ilike). Usar cuando el cliente nombra una categoria especifica para EVITAR ruido: 'Laptops', 'Monitores', 'Computadoras', 'Impresoras'. Cuando se proporciona, solo se devuelven productos cuya categoria contiene este texto. Opcional."},
+                "partner_id": {"type": "integer", "description": "Cliente identificado (res.partner.id). El orchestrator lo inyecta automáticamente cuando el cliente ya está identificado en la sesión — no necesitas pasarlo a mano. Cuando viene, los precios se calculan con la lista de precios (pricelist) configurada para ese cliente en Odoo; sin él, se devuelve el precio público (list_price). Esto evita que el catálogo muestre $206 y la cotización cobre $229 al mismo cliente B2B con tarifa especial."},
             },
             "required": ["query"],
         },
@@ -2047,6 +2048,13 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         category_path = (
             str(_cat_raw).strip() if _cat_raw not in (None, "") else None
         )
+        _pid_raw = args.get("partner_id")
+        try:
+            _partner_id_int = int(_pid_raw) if _pid_raw not in (None, "") else None
+            if _partner_id_int is not None and _partner_id_int <= 0:
+                _partner_id_int = None
+        except (TypeError, ValueError):
+            _partner_id_int = None
         return await _rag_search(
             args["query"],
             top_k=max(int(args.get("top_k", 10)), 1),
@@ -2055,6 +2063,7 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             price_min=_coerce_price(args.get("price_min")),
             price_max=_coerce_price(args.get("price_max")),
             category_path=category_path,
+            partner_id=_partner_id_int,
         )
 
     if tool_name == "get_product_details":
@@ -3706,6 +3715,110 @@ async def _fetch_products_live(
     return out
 
 
+_PRICELIST_CACHE_TTL = 60  # seconds; tenants edit pricelists rarely
+_pricelist_cache: dict[tuple[str, int, int], tuple[float, float]] = {}
+# key: (tenant_id, partner_id, template_id) → (timestamp, pricelist_price)
+
+
+def _pricelist_cache_get(tenant_id: str, partner_id: int, template_id: int) -> float | None:
+    key = (tenant_id, partner_id, template_id)
+    hit = _pricelist_cache.get(key)
+    if not hit:
+        return None
+    ts, price = hit
+    if time.time() - ts > _PRICELIST_CACHE_TTL:
+        _pricelist_cache.pop(key, None)
+        return None
+    return price
+
+
+def _pricelist_cache_set(tenant_id: str, partner_id: int, template_id: int, price: float) -> None:
+    _pricelist_cache[(tenant_id, partner_id, template_id)] = (time.time(), price)
+
+
+async def _apply_pricelist_to_live(
+    tenant_id: str, partner_id: int, live: dict[int, dict]
+) -> None:
+    """Rewrite ``live[tid]["price"]`` to the partner's pricelist price.
+
+    B1 (prod 2026-05-16, sim Mario v3): clientes B2B con pricelist veían
+    list_price en search_products ($206.31) pero create_quotation aplicaba
+    su pricelist ($229.99) — diferencia de hasta 12% que confunde al
+    cliente y rompe la confianza ("¿me cobran más de lo que ofrecen?").
+
+    Pre-condición: ``live`` ya viene de ``_fetch_products_live`` (precios
+    públicos). Esta función lo muta in-place: cada entry conserva
+    ``list_price`` original para auditoría y sobrescribe ``price`` con el
+    valor de la pricelist del partner. Si la pricelist no afecta a un
+    producto (no hay regla específica), Odoo devuelve el list_price y la
+    sobrescritura es no-op.
+
+    Latencia: 1 lectura del partner + N lecturas pricelist.get_product_price
+    (N = productos en live). Cache 60s por (tenant, partner, template) para
+    amortizar la siguiente página de la misma búsqueda.
+    """
+    if not partner_id or not live:
+        return
+    tc = await _get_tenant_config_by_id(tenant_id)
+    if not tc or not tc.get("url"):
+        return  # tenant without Odoo wired — nothing to compute
+
+    from mcp_odoo.tools.generic import odoo_read, odoo_call_method
+
+    # Resolve partner pricelist once.
+    try:
+        partners = odoo_read(
+            tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
+            "res.partner", [partner_id],
+            ["id", "property_product_pricelist"],
+        )
+    except Exception as exc:
+        logger.warning(
+            "_apply_pricelist_to_live: partner read failed tenant=%s partner=%s err=%s",
+            tenant_id, partner_id, exc,
+        )
+        return
+    if not partners:
+        return
+    pricelist_raw = partners[0].get("property_product_pricelist")
+    if isinstance(pricelist_raw, list) and pricelist_raw:
+        pricelist_id = pricelist_raw[0]
+    elif isinstance(pricelist_raw, int):
+        pricelist_id = pricelist_raw
+    else:
+        return  # no pricelist configured — keep list_price
+    if not pricelist_id:
+        return
+
+    for tid, data in live.items():
+        if not isinstance(data, dict):
+            continue
+        cached = _pricelist_cache_get(tenant_id, partner_id, tid)
+        if cached is not None:
+            data["list_price"] = data.get("price", 0)
+            data["price"] = cached
+            continue
+        try:
+            raw_price = odoo_call_method(
+                tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
+                "product.pricelist", "get_product_price",
+                [pricelist_id],
+                [tid, 1.0, partner_id],
+            )
+            if raw_price is None:
+                continue
+            price = float(raw_price)
+        except Exception as exc:
+            logger.warning(
+                "_apply_pricelist_to_live: get_product_price failed pricelist=%s tid=%s err=%s",
+                pricelist_id, tid, exc,
+            )
+            continue
+        _pricelist_cache_set(tenant_id, partner_id, tid, price)
+        data["list_price"] = data.get("price", 0)
+        data["price"] = price
+
+
 async def _get_tenant_config_by_id(tenant_id: str) -> dict | None:
     """Look up Odoo creds for a tenant_id without needing a Request.
 
@@ -4011,6 +4124,7 @@ async def _rag_search(
     price_min: float | None = None,
     price_max: float | None = None,
     category_path: str | None = None,
+    partner_id: int | None = None,
 ) -> str:
     """Hybrid product search: pgvector RRF + ILIKE merge + live Odoo + paginated.
 
@@ -4058,6 +4172,21 @@ async def _rag_search(
         try:
             _direct = await _direct_by_code(tenant_id, _code)
             if _direct:
+                if partner_id:
+                    _direct_live = {
+                        r["odoo_id"]: dict(r["_live"])
+                        for r in _direct
+                        if isinstance(r.get("odoo_id"), int)
+                        and isinstance(r.get("_live"), dict)
+                    }
+                    if _direct_live:
+                        await _apply_pricelist_to_live(
+                            tenant_id, partner_id, _direct_live,
+                        )
+                        for r in _direct:
+                            oid = r.get("odoo_id")
+                            if oid in _direct_live:
+                                r["_live"] = _direct_live[oid]
                 return _format_ranked_page(
                     _direct, top_k=1, offset=0,
                     price_min=price_min, price_max=price_max,
@@ -4067,7 +4196,11 @@ async def _rag_search(
             print(f"[RAG] code-direct lookup failed: {_direct_exc}", flush=True)
         # Falls through to semantic search if code lookup returned nothing.
 
+    # Cache key isolates per-partner pricing so a B2B customer's pricelist
+    # never leaks into the anonymous result set (and vice versa).
     cache_key = query.strip().lower()
+    if partner_id:
+        cache_key = f"{cache_key}|p{partner_id}"
     cached_ranked = _query_cache_get(tenant_id, cache_key)
     if cached_ranked is not None:
         return _format_ranked_page(
@@ -4209,6 +4342,21 @@ async def _rag_search(
             odoo_ids.append(oid)
 
     live = await _fetch_products_live(tenant_id, odoo_ids)
+
+    # ── B1: rewrite prices to the partner's pricelist ────────────────
+    # When a partner_id is in scope (customer is identified), the prices
+    # shown to them must match what create_quotation will charge. Without
+    # this rewrite the catalog shows list_price and the quotation
+    # silently applies the B2B pricelist — a $200 vs $230 divergence we
+    # caught in sim Mario v3 (RUC 0919258160001, partner_id=33).
+    #
+    # ``_fetch_products_live`` returns references to the per-product
+    # cache; mutating in place would leak B2B prices into anonymous
+    # callers. We clone the dicts before rewriting.
+    if partner_id:
+        live = {pid: dict(data) if isinstance(data, dict) else data
+                for pid, data in live.items()}
+        await _apply_pricelist_to_live(tenant_id, partner_id, live)
 
     # ── Re-rank: in-stock first, out-of-stock second ─────────────────
     # The RAG returned candidate_k products by semantic relevance.
