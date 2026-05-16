@@ -2133,12 +2133,24 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             )
             list_price = p.get("list_price", 0)
             effective_price = pricelist_prices.get(p["id"], list_price)
+            # ``cost`` is the internal supplier price. It is intentionally
+            # not surfaced to the customer-facing tool result: every time
+            # we exposed it, the LLM either leaked it ("internal_cost_leak"
+            # in response_guard) or responded blandly to avoid the leak
+            # (prod 2026-05-16: Mario asked "cuánto cuesta el PCD0048" and
+            # the bot answered "Buen día Mario, ¿en qué puedo ayudarte?"
+            # to dodge cost=162.45 instead of stating price=229.99). The
+            # seller-facing flow uses get_pricelist_price for discount
+            # calcs — that tool surfaces ``discount_applied`` instead.
+            # ``list_price`` is also withheld unless asked: when it differs
+            # from the effective price, surfacing both confuses the LLM
+            # (which price to quote?). If the customer asks "¿y el precio
+            # público?" the agent can call get_pricelist_price.
             entry = {
                 "id": p["id"],
                 "code": p.get("default_code", ""),
                 "name": p.get("name", ""),
                 "price": effective_price,
-                "cost": p.get("standard_price", 0),
                 "stock": p.get("qty_available", 0),
                 "available": p.get("virtual_available", 0),
                 "description": p.get("description_sale") or "",
@@ -2146,10 +2158,6 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
                 "barcode": p.get("barcode") or "",
                 "image_url": image_url,
             }
-            # Surface list_price separately when it differs so the LLM
-            # can explain "público $206 / tu precio $230" if asked.
-            if effective_price != list_price:
-                entry["list_price"] = list_price
             results.append(entry)
         return json.dumps(results if len(results) > 1 else results[0], indent=2, ensure_ascii=False, default=str)
 
