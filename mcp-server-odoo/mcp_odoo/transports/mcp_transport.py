@@ -3726,14 +3726,14 @@ def _pricelist_cache_get(tenant_id: str, partner_id: int, template_id: int) -> f
     if not hit:
         return None
     ts, price = hit
-    if time.time() - ts > _PRICELIST_CACHE_TTL:
+    if _t.time() - ts > _PRICELIST_CACHE_TTL:
         _pricelist_cache.pop(key, None)
         return None
     return price
 
 
 def _pricelist_cache_set(tenant_id: str, partner_id: int, template_id: int, price: float) -> None:
-    _pricelist_cache[(tenant_id, partner_id, template_id)] = (time.time(), price)
+    _pricelist_cache[(tenant_id, partner_id, template_id)] = (_t.time(), price)
 
 
 async def _apply_pricelist_to_live(
