@@ -742,9 +742,24 @@ def odoo_add_to_quotation(
     quotation and wants to add another product to it. The order must be
     in 'draft' or 'sent' state — confirmed orders are immutable.
 
-    IMPORTANT: Call first with confirmed=False (default) to get a preview.
-    Show the preview to the user. Only call with confirmed=True after receiving
-    explicit confirmation ('sí', 'confirmo', 'dale').
+    USAGE — confirmed flag (CRITICAL, read carefully):
+
+    - **Intent IMPLÍCITO del usuario** (verbos imperativos como "agrega",
+      "añade", "ponme", "mete", "a la actual", "agrégalo a mi proforma",
+      "súbelo", "incluye"): the customer has ALREADY confirmed by stating
+      intent. Call DIRECTLY with confirmed=True. Do NOT make an extra
+      preview round-trip — they already gave the go-ahead.
+
+    - **Intent EXPLORATORIO del usuario** ("muéstrame qué quedaría con X",
+      "y si agrego Y", "haz un dry-run", "ver cómo se vería"): call with
+      confirmed=False, show the preview, then wait for an additional
+      confirmation ('sí', 'confirmo', 'dale', 'procede') before calling
+      again with confirmed=True.
+
+    The preview return (when confirmed=False) is sanitized human-readable
+    summary: it contains product codes and names only — never internal
+    product_id integers. You can pass the ``preview`` field verbatim to
+    the user.
 
     Args:
         order_id: existing sale.order ID
@@ -861,19 +876,61 @@ def odoo_add_to_quotation(
         return {"success": False, "error_code": "no_valid_product_ids", "error_detail": err}
     lines = add_normalized
 
-    # Dry-run / preview — return what would be done without writing to Odoo
+    # Dry-run / preview — return what would be done without writing to Odoo.
+    #
+    # IMPORTANT (fixed 2026-05-17): the preview MUST NOT contain raw
+    # ``product_id=N`` strings. The response_guard at the orchestrator
+    # layer flags any integer-id leak as ``internal_id_leak`` and forces
+    # a retry, which leads to garbled customer-facing messages
+    # ("Para recomendarte componentes que faltan necesito ver el catálogo
+    # en vivo …"). Instead we resolve template_id → (default_code, name,
+    # list_price) so the preview reads like a real invoice line.
     if not confirmed:
-        line_descriptions = []
+        template_ids_for_preview = list({ln["product_id"] for ln in lines if ln.get("product_id")})
+        tmpl_map: dict[int, dict] = {}
+        if template_ids_for_preview:
+            try:
+                tmpls = odoo_read(
+                    tenant_id, url, db, user, password,
+                    "product.template", template_ids_for_preview,
+                    ["id", "default_code", "name", "list_price"],
+                )
+                tmpl_map = {t["id"]: t for t in (tmpls or [])}
+            except Exception as _read_exc:
+                logger.warning(
+                    "add_to_quotation preview: could not resolve product names: %s",
+                    _read_exc,
+                )
+
+        line_descriptions: list[str] = []
         for ln in lines:
-            pid = ln.get("product_id", "?")
+            pid = ln.get("product_id")
             qty = ln.get("quantity", 1)
-            line_descriptions.append(f"product_id={pid} x{qty}")
+            tmpl = tmpl_map.get(pid) if pid is not None else None
+            if tmpl:
+                code = tmpl.get("default_code") or ""
+                name = (tmpl.get("name") or "producto").strip()
+                # Trim names so the preview stays scannable.
+                if len(name) > 70:
+                    name = name[:67].rstrip() + "…"
+                price = tmpl.get("list_price") or 0
+                prefix = f"{code} · " if code else ""
+                line_descriptions.append(
+                    f"{prefix}{name} x{qty} (USD {price:.2f})"
+                )
+            else:
+                # Fallback when the read failed; still avoid leaking the
+                # raw template_id integer to the LLM.
+                line_descriptions.append(f"producto (código no resuelto) x{qty}")
+
         order_name = order.get("name", f"orden {order_id}")
         current_total = order.get("amount_total", 0)
         preview_msg = (
-            f"Agregaras {', '.join(line_descriptions)} a {order_name} "
-            f"(total actual: USD {current_total:.2f}). "
-            "Llama de nuevo con confirmed=true para proceder."
+            f"Voy a agregar a {order_name} (total actual USD {current_total:.2f}):\n  - "
+            + "\n  - ".join(line_descriptions)
+            + "\nSi el usuario ya dio intent claro ('agrega', 'añade', 'a la actual'), "
+            "llama de nuevo con confirmed=true SIN preguntar otra vez. "
+            "Si fue exploratorio, muestra esta lista y espera confirmación."
         )
         result = {
             "success": False,
