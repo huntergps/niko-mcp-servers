@@ -601,9 +601,16 @@ def odoo_create_quotation(
             "product_uom_qty": line.get("quantity", 1),
             "product_uom": uom_by_variant.get(variant_pid, 1),
         }
+        # Iter 75: ver comment en add_to_quotation — price_unit del bot
+        # IGNORADO. Odoo aplica pricelist + product.list_price.
         if "price_unit" in line:
-            line_vals["price_unit"] = line["price_unit"]
+            logger.warning(
+                "create_quotation: IGNORING bot-supplied price_unit=%s "
+                "for template=%s — using Odoo pricelist instead",
+                line.get("price_unit"), tmpl_id,
+            )
         if "discount" in line:
+            # tecno_discount_sale valida vs sale.partner_max_sale_discount
             line_vals["discount"] = line["discount"]
         order_lines.append((0, 0, line_vals))
 
@@ -1006,7 +1013,20 @@ def odoo_add_to_quotation(
         tmpl_id = line["product_id"]
         variant_pid = variant_by_template[tmpl_id]
         qty_to_add = float(line.get("quantity", 1) or 1)
-        has_overrides = "price_unit" in line or "discount" in line
+        # Iter 75: price_unit del bot SE IGNORA. Odoo aplica
+        # product.pricelist.get_product_price(template, qty, partner)
+        # automáticamente cuando creamos la línea con product_id sin
+        # price_unit override. Carlos-LLM v7 confirmó bot inflando
+        # PSU007 $15.30→$19.99 (+30%) y RAM0043 $98.42→$135.56 (+37%).
+        # tecno_discount_sale module valida discount contra
+        # sale.partner_max_sale_discount config → si exceed → UserError.
+        if "price_unit" in line:
+            logger.warning(
+                "add_to_quotation: IGNORING bot-supplied price_unit=%s "
+                "for template=%s — using Odoo pricelist instead",
+                line.get("price_unit"), tmpl_id,
+            )
+        has_overrides = "discount" in line
         existing = qty_by_variant.get(variant_pid)
         if existing and not has_overrides:
             # Merge: same product already on the order — bump its qty.
@@ -1019,8 +1039,7 @@ def odoo_add_to_quotation(
             "product_uom_qty": qty_to_add,
             "product_uom": uom_by_variant.get(variant_pid, 1),
         }
-        if "price_unit" in line:
-            line_vals["price_unit"] = line["price_unit"]
+        # NO price_unit override. Odoo auto-computes from pricelist.
         if "discount" in line:
             line_vals["discount"] = line["discount"]
         new_line_cmds.append(line_vals)
