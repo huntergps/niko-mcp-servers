@@ -2356,8 +2356,17 @@ def odoo_update_quotation_line(
     vals: dict = {}
     if quantity is not None:
         vals["product_uom_qty"] = float(quantity)
+    # Iter 75b: IGNORAR price_unit del bot también en update_quotation_line.
+    # Carlos-LLM v9 vio VENTA123543 con PSU007=$19.99 (catálogo $15.30),
+    # RAM0043=$135.56 (catálogo $98.42). No había log "IGNORING" porque
+    # iter75 inicial sólo cubría create_quotation y add_to_quotation.
+    # Este endpoint singular era la puerta de atrás.
     if price_unit is not None:
-        vals["price_unit"] = float(price_unit)
+        logger.warning(
+            "update_quotation_line: IGNORING bot-supplied price_unit=%s "
+            "for line_id=%s — Odoo pricelist remains authoritative",
+            price_unit, line_id,
+        )
     if discount is not None:
         vals["discount"] = float(discount)
     if name is not None:
@@ -3069,8 +3078,14 @@ def odoo_add_quotation_line(
         "product_uom_qty": float(quantity),
         "product_uom": v["uom_id"][0] if isinstance(v.get("uom_id"), list) else v.get("uom_id") or 1,
     }
+    # Iter 75b: IGNORAR price_unit en add_quotation_line singular (puerta
+    # de atrás detectada por Carlos-LLM v9 — VENTA123543 con precios fab).
     if price_unit is not None:
-        line_vals["price_unit"] = float(price_unit)
+        logger.warning(
+            "add_quotation_line: IGNORING bot-supplied price_unit=%s "
+            "for product_id=%s — Odoo pricelist remains authoritative",
+            price_unit, product_id,
+        )
     if discount is not None:
         line_vals["discount"] = float(discount)
     if name is not None:
