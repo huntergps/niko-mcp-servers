@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import re as _re
+
 from mcp_odoo.formatters.whatsapp import (
     _MORE_HINT,
     _fmt_date_compact,
@@ -33,6 +35,24 @@ _STATE_FILTER_LABEL_ES = {
     "not_paid": "pendientes",
     "overdue": "vencidas",
 }
+
+# Iter 81b — WhatsApp/Telegram detectan ``\\d+-\\d+-\\d+`` como teléfonos
+# y los renderizan con dial. Las facturas migradas Tecnosmart tienen
+# ``name='002-002-000014038'`` (formato SRI: establecimiento-punto-
+# secuencial). Reemplazamos guiones por puntos para romper el patrón
+# sin perder legibilidad humana. Owner-evidencia (screenshot WhatsApp
+# 2026-05-23): "002-002-000014038" se subrayaba en verde como tap-to-call.
+_SRI_DOC_PATTERN = _re.compile(r"^\d{2,4}-\d{2,4}-\d{6,12}$")
+
+
+def _safe_doc_name(name: Any) -> str:
+    """Disable phone-number auto-link for SRI invoice numbers."""
+    if not name:
+        return ""
+    s = str(name).strip()
+    if _SRI_DOC_PATTERN.fullmatch(s):
+        return s.replace("-", ".")
+    return s
 
 
 def _fmt_overdue_tag(days_overdue: Any) -> str:
@@ -109,7 +129,7 @@ def format_invoices_list(
         lines.append("_" + " · ".join(bits) + "_")
 
     for inv in visible:
-        name = (inv.get("name") or "").strip() or "(sin número)"
+        name = _safe_doc_name(inv.get("name")) or "(sin número)"
         amount_total = inv.get("amount_total")
         amount_residual = inv.get("amount_residual")
         state_lbl = (inv.get("payment_state_label") or "").strip()
@@ -158,7 +178,7 @@ def format_invoices_list(
         lines.append(f"_y {hidden} más._ " + _MORE_HINT)
 
     lines.append("Dime el número (ej.: _" +
-                 (visible[0].get("name") or "FACV/...") +
+                 (_safe_doc_name(visible[0].get("name")) or "FACV/...") +
                  "_) para ver el detalle o el PDF.")
     return "\n\n".join(lines)
 
@@ -172,7 +192,7 @@ def format_invoice_detail(
     if not invoice or not isinstance(invoice, dict):
         return "🧾 No pude leer esa factura."
 
-    name = (invoice.get("name") or "").strip() or "(sin número)"
+    name = _safe_doc_name(invoice.get("name")) or "(sin número)"
     amount_total = invoice.get("amount_total")
     amount_residual = invoice.get("amount_residual")
     amount_untaxed = invoice.get("amount_untaxed")
@@ -309,13 +329,15 @@ def format_payments_list(
         lines.append(f"_total {_fmt_total(total)}_")
 
     for p in visible:
-        name = (p.get("name") or "").strip() or "(sin número)"
+        name = _safe_doc_name((p.get("name") or "").strip()) or "(sin número)"
         amount = p.get("amount")
         journal = (p.get("journal") or "").strip()
         date_str = _fmt_date_compact(p.get("payment_date"), with_time=False)
         applied = p.get("applied_to") or []
         applied_names = [
-            (a.get("name") if isinstance(a, dict) else str(a)).strip()
+            _safe_doc_name(
+                (a.get("name") if isinstance(a, dict) else str(a)).strip()
+            )
             for a in applied if a
         ]
         applied_names = [n for n in applied_names if n]
@@ -413,7 +435,7 @@ def format_statement_summary(
         visible, hidden = _truncate(movements)
         for m in visible:
             mtype = (m.get("type") or "").strip()
-            name = (m.get("name") or "").strip() or "(sin número)"
+            name = _safe_doc_name(m.get("name")) or "(sin número)"
             amount = m.get("amount") or 0
             date_str = _fmt_date_compact(m.get("date"), with_time=False)
             arrow = "▪"

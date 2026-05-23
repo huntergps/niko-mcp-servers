@@ -3314,12 +3314,36 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         _supa_key = _s.supabase_service_key or _s.supabase_jwt_secret
         _tenant = tc["tenant_id"]
         partner_id = args["partner_id"]
-        # Iter 78c: resolver email/channel/channel_user_id sin pedirlos al
-        # LLM. Bug previo (trace d414f8ca→543e4765 2026-05-22): el LLM no
-        # tenia el email del cliente y, en lugar de leerlo desde Odoo,
-        # PEDIA AL CLIENTE su email manual. Pero el partner_id ya estaba
-        # identificado y res.partner.email existe. Fix: fallback en cadena
-        # args -> Odoo (para email) / args -> X-Channel header (para canal).
+        # Iter 81b: skip OTP generation when session is already valid.
+        # Bug WhatsApp 2026-05-23 trace 63360085: cliente verificó OTP a
+        # las 02:13 (sesion valida hasta 24-may 02:13). A las 02:15 pidio
+        # "dame mi saldo" → LLM principal llamo request_otp(partner_id=62)
+        # SIN chequear si ya habia sesion → MCP envio nuevo email al
+        # cliente innecesariamente. Fix: si _otp_check_session devuelve
+        # true, devolver un short-circuit "ya estas autorizado" para que
+        # el LLM llame check_balance directo.
+        _ch_for_check = (
+            args.get("channel")
+            or request.headers.get("x-channel")
+            or request.headers.get("X-Channel")
+            or ""
+        ).strip().lower()
+        if _ch_for_check:
+            has_session = await _otp_check_session(
+                _supa_url, _supa_key, _tenant, int(partner_id), _ch_for_check,
+            )
+            if has_session:
+                return json.dumps({
+                    "success": True,
+                    "already_verified": True,
+                    "message": (
+                        "El cliente ya tiene una sesion OTP verificada y "
+                        "valida. NO envies otro codigo — puedes consultar "
+                        "datos financieros directamente (check_balance, "
+                        "get_customer_invoices, get_customer_payments, "
+                        "get_customer_statement)."
+                    ),
+                }, ensure_ascii=False)
         email = (args.get("email") or "").strip()
         if not email:
             try:
