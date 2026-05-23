@@ -503,29 +503,40 @@ MCP_TOOLS = [
     {
         "name": "get_partner_profile",
         "description": (
-            "Leer datos del cliente actual cuando ya tienes su `partner_id` en sesion "
-            "(por identify_customer / search_partner / contexto). Devuelve nombre, "
-            "email, telefono/movil, RUC/cedula, direccion. "
+            "Leer perfil completo del cliente cuando ya tienes su `partner_id` "
+            "en sesion. Devuelve nombre, email, telefono/movil, RUC/cedula, "
+            "direccion. Si pasas `include_activity=true` tambien devuelve sus "
+            "ultimas cotizaciones, facturas recientes, productos mas comprados "
+            "y ticket promedio — todo en un solo call. El campo `display_text` "
+            "incluye una version pre-formateada WhatsApp-friendly que puedes "
+            "copiar TAL CUAL al cliente. "
             "Usala cuando el cliente pregunte cosas como '¿que sabes de mi?', "
-            "'¿que datos tienes mios?', '¿cual es mi correo registrado?', o cuando "
-            "necesites personalizar el saludo con el nombre del cliente. "
-            "TAMBIEN usala como fallback cuando honcho_peer_chat / "
-            "honcho_peer_representation devuelvan vacio o poca informacion. "
-            "Diferente de search_partner: search_partner busca por TEXTO (nombre), "
-            "esta lee por ID exacto."
+            "'¿que datos tienes mios?', '¿cual es mi correo registrado?', "
+            "'¿que he comprado?', '¿cuales son mis ultimas cotizaciones?'. "
+            "Para esos casos pasa SIEMPRE include_activity=true para una "
+            "respuesta completa. "
+            "Diferente de search_partner: esta lee por ID exacto."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "partner_id": {"type": "integer", "description": "ID numerico del cliente (res.partner.id) en Odoo"},
+                "include_activity": {
+                    "type": "boolean",
+                    "description": (
+                        "Si true, anade ultimas cotizaciones, facturas y top "
+                        "productos. Default false. SIEMPRE true para preguntas "
+                        "tipo '¿que sabes de mi?'."
+                    ),
+                    "default": False,
+                },
                 "fields": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": (
-                        "(Opcional) Campos especificos a leer. Default incluye: "
-                        "name, email, phone, mobile, vat, street, city, state_id, "
-                        "country_id, lang, customer_rank, supplier_rank. "
-                        "Pide solo lo que necesites para evitar leaks de PII."
+                        "(Opcional) Campos especificos a leer del partner. "
+                        "Default incluye un set canonico (name, email, phone, "
+                        "mobile, vat, address). Pide solo lo que necesites."
                     ),
                     "default": [],
                 },
@@ -1898,6 +1909,120 @@ def _attach_display_text(
     return result
 
 
+def _format_partner_profile_chat(
+    partner: dict, activity: dict | None = None,
+) -> str:
+    """Iter 79b — render perfil 360° del cliente en formato WhatsApp.
+
+    Combina los datos del res.partner con la actividad reciente
+    (purchase_history + recent_quotations + recent_invoices) en un
+    bloque legible que el LLM puede copiar tal cual al cliente.
+    """
+    lines: list[str] = []
+    name = partner.get("display_name") or partner.get("name") or "Cliente"
+    lines.append(f"👤 *Esto es lo que tengo de ti, {name}:*")
+    lines.append("")
+    lines.append("*Contacto:*")
+
+    def _mask_email(email: str) -> str:
+        if not email or "@" not in email:
+            return email or "—"
+        local, domain = email.split("@", 1)
+        return f"{local[:3]}***@{domain}"
+
+    def _mask_phone(phone: str) -> str:
+        if not phone:
+            return "—"
+        digits = "".join(ch for ch in phone if ch.isdigit())
+        if len(digits) <= 4:
+            return phone
+        return f"{digits[:3]}***{digits[-2:]}"
+
+    if partner.get("email"):
+        lines.append(f"• Email: {_mask_email(partner['email'])}")
+    if partner.get("phone") or partner.get("mobile"):
+        ph = partner.get("phone") or partner.get("mobile")
+        lines.append(f"• Teléfono: {_mask_phone(ph)}")
+    if partner.get("vat"):
+        lines.append(f"• RUC/Cédula: {partner['vat']}")
+    addr_bits = [
+        partner.get("street"),
+        partner.get("city"),
+        (partner.get("state_id") or {}).get("name") if isinstance(partner.get("state_id"), dict) else None,
+    ]
+    addr_bits = [b for b in addr_bits if b]
+    if addr_bits:
+        lines.append(f"• Dirección: {', '.join(addr_bits)}")
+    if partner.get("lang"):
+        lines.append(f"• Idioma: {partner['lang']}")
+
+    if not activity:
+        lines.append("")
+        lines.append("_Aún no tengo historial de compras en memoria. Si necesitas info financiera (saldo / crédito) pídeme y te envío OTP._")
+        return "\n".join(lines)
+
+    # ── Actividad reciente ─────────────────────────────────────────
+    ph_data = (activity or {}).get("purchase_history") or {}
+    if ph_data.get("success") and ph_data.get("orders_count"):
+        lines.append("")
+        lines.append("🛒 *Historial de compras (este año):*")
+        oc = ph_data.get("orders_count", 0)
+        total = ph_data.get("total_amount", 0)
+        avg = ph_data.get("avg_ticket", 0)
+        lines.append(f"• {oc} órdenes · USD {total:,.2f} total · ticket promedio USD {avg:,.2f}")
+        top = ph_data.get("top_products") or []
+        if top:
+            lines.append("• *Top productos comprados:*")
+            for p in top[:3]:
+                code = p.get("code") or ""
+                pname = (p.get("name") or "").strip()
+                qty = p.get("total_qty") or 0
+                tag = f" ({code})" if code else ""
+                lines.append(f"   ▪ {pname}{tag} — {qty:g} u")
+
+    rq_data = (activity or {}).get("recent_quotations") or {}
+    if rq_data.get("success") and rq_data.get("orders"):
+        orders = rq_data["orders"][:5]
+        lines.append("")
+        lines.append("📋 *Cotizaciones recientes:*")
+        for o in orders:
+            name_o = o.get("name", "?")
+            total_o = o.get("total", 0)
+            state_lbl = o.get("state_label") or o.get("state") or ""
+            date_o = (o.get("date_order") or "")[:10]
+            lines.append(f"• *{name_o}* — USD {total_o:,.2f} · _{state_lbl}_ · {date_o}")
+
+    rinv = (activity or {}).get("recent_invoices") or {}
+    if rinv.get("success") and rinv.get("invoices"):
+        invs = rinv["invoices"][:5]
+        lines.append("")
+        lines.append("🧾 *Últimas facturas:*")
+        for inv in invs:
+            name_i = inv.get("name", "?")
+            total_i = inv.get("amount_total", 0)
+            residual = inv.get("amount_residual", 0)
+            state_p = inv.get("invoice_payment_state", "?")
+            date_i = (inv.get("invoice_date") or "")[:10]
+            status_lbl = {
+                "paid": "pagada",
+                "in_payment": "pagada (en pago)",
+                "not_paid": f"pendiente USD {residual:,.2f}",
+            }.get(state_p, state_p)
+            lines.append(f"• *{name_i}* — USD {total_i:,.2f} · _{status_lbl}_ · {date_i}")
+
+    if not any([
+        ph_data.get("orders_count"),
+        rq_data.get("orders"),
+        rinv.get("invoices"),
+    ]):
+        lines.append("")
+        lines.append("_Aún no tienes movimientos registrados — eres cliente nuevo en el sistema._")
+
+    lines.append("")
+    lines.append("_Si quieres ver saldo / crédito disponible, dime y te envío un OTP a tu correo._")
+    return "\n".join(lines)
+
+
 async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
     """Execute a tool and return text result."""
     from mcp_odoo.config import settings
@@ -2319,11 +2444,92 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         for k, v in list(partner.items()):
             if v is False and k not in ("is_company",):
                 partner[k] = None
-        return json.dumps({
+
+        # Iter 79b: include_activity → enriquecer con purchase history +
+        # facturas. Owner-feedback (WhatsApp 2026-05-23): cuando el cliente
+        # pregunta "que sabes de mi", debe ver perfil + ultimas cotizaciones
+        # + facturas + top productos, no solo datos de contacto.
+        include_activity = bool(args.get("include_activity", False))
+        activity = None
+        if include_activity:
+            from mcp_odoo.tools.sales import (
+                odoo_get_customer_purchase_history,
+                odoo_list_quotations,
+            )
+            from mcp_odoo.tools.generic import odoo_search as _odoo_search
+            activity = {
+                "purchase_history": None,
+                "recent_quotations": None,
+                "recent_invoices": None,
+            }
+            # 1. Historial de compras (incluye top_products + avg_ticket)
+            try:
+                activity["purchase_history"] = odoo_get_customer_purchase_history(
+                    *creds, partner_id=partner_id, limit=5,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "get_partner_profile activity.purchase_history failed: %s", exc,
+                )
+                activity["purchase_history"] = {"success": False, "error": str(exc)}
+            # 2. Cotizaciones recientes (todos los estados)
+            try:
+                activity["recent_quotations"] = odoo_list_quotations(
+                    *creds, partner_id=partner_id, limit=5,
+                    states=["draft", "sent", "sale", "done", "cancel"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "get_partner_profile activity.recent_quotations failed: %s", exc,
+                )
+                activity["recent_quotations"] = {"success": False, "error": str(exc)}
+            # 3. Facturas recientes (account.move type=out_invoice/out_refund)
+            try:
+                invs = _odoo_search(
+                    *creds, "account.move",
+                    [
+                        ["partner_id", "=", partner_id],
+                        ["type", "in", ["out_invoice", "out_refund"]],
+                        ["state", "=", "posted"],
+                    ],
+                    fields=[
+                        "id", "name", "invoice_date",
+                        "amount_total", "amount_residual",
+                        "invoice_payment_state", "type",
+                    ],
+                    limit=5,
+                    order="invoice_date desc, id desc",
+                )
+                activity["recent_invoices"] = {"success": True, "invoices": invs}
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "get_partner_profile activity.recent_invoices failed: %s", exc,
+                )
+                activity["recent_invoices"] = {"success": False, "error": str(exc)}
+
+        # Iter 79b: display_text WhatsApp-friendly cuando el canal lo amerita
+        # o include_activity=true (el LLM lo usa tal cual sin re-formatear).
+        _ch_for_fmt = (
+            request.headers.get("x-channel")
+            or request.headers.get("X-Channel")
+            or ""
+        ).strip().lower()
+        display_text: str | None = None
+        if include_activity or _ch_for_fmt in ("whatsapp", "telegram"):
+            display_text = _format_partner_profile_chat(
+                partner=partner, activity=activity,
+            )
+
+        result = {
             "success": True,
             "partner": partner,
             "partner_id": partner_id,
-        }, ensure_ascii=False, indent=2, default=str)
+        }
+        if activity is not None:
+            result["activity"] = activity
+        if display_text:
+            result["display_text"] = display_text
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
 
     if tool_name == "identify_customer":
         return await _identify_customer(creds, args["cedula_ruc"])
