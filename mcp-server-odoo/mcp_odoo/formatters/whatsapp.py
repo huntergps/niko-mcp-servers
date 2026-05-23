@@ -61,10 +61,23 @@ def _parse_dt(raw: Any) -> datetime | None:
     if not isinstance(raw, str):
         return None
     s = raw.strip()
-    # Try common formats: full datetime, then date-only.
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+    # Try common formats: full datetime first (19 chars), then ISO with T
+    # separator, then date-only (10 chars). The trim length must match the
+    # WIDTH of the formatted output, not ``len(fmt)`` (the format string is
+    # shorter than the strings it formats: ``%Y`` is 2 chars but expands
+    # to 4). ZETA iter 80: account.move.invoice_date is a Date column so
+    # it arrives as ``"YYYY-MM-DD"`` (10 chars). The old code sliced to
+    # ``len("%Y-%m-%d") == 8`` so the parse always failed → dates were
+    # silently dropped from the rendered output.
+    for fmt, width in (
+        ("%Y-%m-%d %H:%M:%S", 19),
+        ("%Y-%m-%dT%H:%M:%S", 19),
+        ("%Y-%m-%d", 10),
+    ):
+        if len(s) < width:
+            continue
         try:
-            return datetime.strptime(s[: len(fmt) + 0], fmt)
+            return datetime.strptime(s[:width], fmt)
         except ValueError:
             continue
     # Last attempt: cut to the first 19 chars and retry full datetime.
