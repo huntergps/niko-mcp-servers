@@ -1474,6 +1474,141 @@ MCP_TOOLS = [
         },
     },
     {
+        # ETA iter 81 — PDF oficial del estado de cuenta (mismo reporte
+        # que el cron mensual: ``tecno_l10n_ec_payment.report_account_balance``).
+        # Owner feedback (WhatsApp 2026-05-23): "obtener el email desde
+        # Odoo y pasarlo a PDF asi la informacion seria la correcta y
+        # oficial de Odoo". El bot debe entregar el documento descargable
+        # que el cliente ya conoce, no una version reconstruida en niko.
+        "name": "get_customer_statement_pdf",
+        "description": (
+            "Generar el PDF OFICIAL del estado de cuenta del cliente "
+            "(mismo documento que recibe por correo cada 15 dias del "
+            "cron de Odoo). REQUIERE verificacion OTP previa. Usa esta "
+            "tool cuando el cliente pide el documento descargable: "
+            "'mandame mi estado de cuenta en PDF', 'envíame el archivo', "
+            "'necesito el documento oficial', 'el mismo que me mandan "
+            "por correo'. Para preguntas conversacionales como '¿cuánto "
+            "debo?' usa get_customer_statement (sin PDF). El resultado "
+            "incluye un ``pdf_url`` publico que el cliente puede abrir "
+            "directamente — incluyelo en tu respuesta verbatim."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {
+                    "type": "integer",
+                    "description": "ID del cliente en Odoo (res.partner.id)",
+                },
+                "days_back": {
+                    "type": "integer",
+                    "description": (
+                        "Periodo en dias hacia atras (informativo en el "
+                        "envelope; el reporte Odoo no acepta filtro de "
+                        "dias directo, devuelve todo el saldo abierto). "
+                        "Default 90."
+                    ),
+                    "default": 90,
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "(Opcional) Canal para validar OTP. Default desde X-Channel.",
+                },
+            },
+            "required": ["partner_id"],
+        },
+    },
+    {
+        # ETA iter 81 — RIDE oficial de la factura (Tecnosmart Odoo 13
+        # con l10n_ec_sri_ece). Auto-detecta NC vs factura via type.
+        "name": "get_invoice_pdf",
+        "description": (
+            "Generar el RIDE OFICIAL en PDF de una factura electronica "
+            "(el mismo documento autorizado por el SRI). REQUIERE "
+            "verificacion OTP previa. Si la factura es nota de credito "
+            "(type=out_refund), automaticamente usa el reporte de NC. "
+            "Usala cuando el cliente pide 'mandame el RIDE', 'envia el "
+            "PDF de la factura', 'el archivo oficial de la factura', "
+            "'el comprobante autorizado por el SRI'. Para listar facturas "
+            "primero usa get_customer_invoices y luego pasa el invoice_id "
+            "elegido."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "invoice_id": {
+                    "type": "integer",
+                    "description": "ID numerico de la factura (account.move.id).",
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "(Opcional) Canal para validar OTP. Default desde X-Channel.",
+                },
+            },
+            "required": ["invoice_id"],
+        },
+    },
+    {
+        # ETA iter 81 — RIDE de nota de credito. Refuses cuando el
+        # account.move no es out_refund.
+        "name": "get_credit_note_pdf",
+        "description": (
+            "Generar el RIDE OFICIAL en PDF de una nota de credito "
+            "electronica (account.move type='out_refund'). REQUIERE "
+            "verificacion OTP previa. Si el id pasado no es una nota "
+            "de credito, devuelve error — para facturas normales usa "
+            "get_invoice_pdf. Usala cuando el cliente pida 'el PDF de "
+            "la nota de credito X', 'mandame la NC', 'el RIDE de la "
+            "devolucion'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "refund_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID numerico de la nota de credito "
+                        "(account.move.id con type='out_refund')."
+                    ),
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "(Opcional) Canal para validar OTP. Default desde X-Channel.",
+                },
+            },
+            "required": ["refund_id"],
+        },
+    },
+    {
+        # ETA iter 81 — Comprobante de retencion (l10n_ec_sri_ece
+        # report_retencion_electronica). Para retenciones que clientes
+        # B2B le hicieron a Tecnosmart.
+        "name": "get_retention_pdf",
+        "description": (
+            "Generar el RIDE OFICIAL en PDF de un comprobante de "
+            "retencion electronica (cuando un cliente B2B retuvo "
+            "impuestos a Tecnosmart). REQUIERE verificacion OTP previa. "
+            "El retention_id es el id del account.move tipo retencion "
+            "(NO el id de la factura asociada). Usala cuando el cliente "
+            "pida 'mandame el comprobante de la retencion que te hice', "
+            "'el RIDE de la retencion N'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "retention_id": {
+                    "type": "integer",
+                    "description": "ID numerico de la retencion (account.move.id tipo retencion).",
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "(Opcional) Canal para validar OTP. Default desde X-Channel.",
+                },
+            },
+            "required": ["retention_id"],
+        },
+    },
+    {
         "name": "lookup_sri",
         "description": (
             "Consultar datos de una persona o empresa en el SRI (Servicio de Rentas Internas) "
@@ -3438,6 +3573,345 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             )
             result = _attach_display_text(result, request_channel, kind="statement")
             return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    # ----- ETA iter 81: PDF report tools ---------------------------------
+    # Four tools that wrap the official Odoo HTTP report endpoint so the
+    # customer receives the SAME PDF Odoo generates internally (statement
+    # cron mail / RIDE SRI / etc). Like the ZETA iter80 read tools they
+    # require an OTP-verified session — financial documents must not be
+    # served without identity check.
+    if tool_name in (
+        "get_customer_statement_pdf",
+        "get_invoice_pdf",
+        "get_credit_note_pdf",
+        "get_retention_pdf",
+    ):
+        from mcp_odoo.config import settings as _settings_pdf
+        from mcp_odoo.tools.odoo_reports import (
+            OdooReportError,
+            fetch_odoo_report_pdf,
+        )
+
+        _supa_url = _settings_pdf.supabase_url or "http://localhost:8000"
+        _supa_key = _settings_pdf.supabase_service_key or _settings_pdf.supabase_jwt_secret
+        _tenant = tc["tenant_id"]
+        _channel = (
+            args.get("channel")
+            or request.headers.get("x-channel")
+            or request.headers.get("X-Channel")
+            or "unknown"
+        ).strip().lower() or "unknown"
+
+        # Resolve partner_id for the OTP gate.
+        # * statement_pdf: pasa partner_id directo.
+        # * invoice_pdf / credit_note_pdf / retention_pdf: resolver desde
+        #   el account.move antes de gatear OTP (mismo patron que
+        #   get_invoice_detail).
+        _otp_partner_id: int | None = None
+        # account.move row, cached for the dispatch below (saves a second
+        # odoo_read when we already know type + name).
+        _move_row: dict | None = None
+        _id_arg_name: str
+        _id_arg_value: int
+        if tool_name == "get_customer_statement_pdf":
+            try:
+                _otp_partner_id = int(args["partner_id"])
+            except (KeyError, TypeError, ValueError):
+                return json.dumps({
+                    "success": False,
+                    "error_code": "invalid_partner_id",
+                    "error_detail": "partner_id requerido (entero).",
+                }, ensure_ascii=False)
+        else:
+            # invoice_pdf / credit_note_pdf / retention_pdf
+            _id_arg_name = (
+                "invoice_id" if tool_name == "get_invoice_pdf"
+                else ("refund_id" if tool_name == "get_credit_note_pdf"
+                      else "retention_id")
+            )
+            try:
+                _id_arg_value = int(args[_id_arg_name])
+            except (KeyError, TypeError, ValueError):
+                return json.dumps({
+                    "success": False,
+                    "error_code": f"invalid_{_id_arg_name}",
+                    "error_detail": f"{_id_arg_name} requerido (entero).",
+                }, ensure_ascii=False)
+            try:
+                from mcp_odoo.tools.generic import odoo_read as _odoo_read_pdf
+                _rows = _odoo_read_pdf(
+                    *creds, "account.move", [_id_arg_value],
+                    ["id", "name", "type", "partner_id"],
+                )
+                if _rows:
+                    _move_row = _rows[0]
+                    _pid = _move_row.get("partner_id")
+                    if isinstance(_pid, (list, tuple)) and _pid:
+                        _otp_partner_id = int(_pid[0])
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning(
+                    "%s: partner lookup failed id=%s: %s",
+                    tool_name, _id_arg_value, _exc,
+                )
+            if not _move_row:
+                return json.dumps({
+                    "success": False,
+                    "error_code": "move_not_found",
+                    "error_detail": (
+                        f"No existe el account.move id={_id_arg_value}."
+                    ),
+                }, ensure_ascii=False)
+
+        # Cross-partner enforcement (same as iter80 read tools).
+        if (
+            expected_partner_id
+            and _otp_partner_id
+            and expected_partner_id != _otp_partner_id
+        ):
+            return json.dumps({
+                "success": False,
+                "error_code": "cross_partner_invoice",
+                "error_detail": (
+                    "El recurso pertenece a otro cliente. Identifica al "
+                    "cliente correcto antes de generar su PDF."
+                ),
+            }, ensure_ascii=False)
+
+        if _otp_partner_id:
+            has_session = await _otp_check_session(
+                _supa_url, _supa_key, _tenant, _otp_partner_id, _channel,
+            )
+            if not has_session:
+                return (
+                    "VERIFICACION REQUERIDA: El cliente no ha verificado "
+                    "su identidad. Para enviar el PDF oficial, primero usa "
+                    "request_otp para enviar un codigo al correo del "
+                    "cliente y luego verify_otp cuando te de el codigo."
+                )
+
+        # ── Dispatch per-tool ───────────────────────────────────────────
+        import os as _os_pdf
+        import secrets as _secrets_pdf
+        from datetime import date as _date_pdf
+
+        _odoo_url = tc["url"]
+        _odoo_db = tc["db"]
+        _odoo_user = tc["user"]
+        _odoo_password = tc["password"]
+        # Public base URL for the niko-served PDF. ``niko_public_url``
+        # may be overridden via env (NIKO_PUBLIC_URL); strip trailing /.
+        _public_base = (
+            _os_pdf.environ.get("NIKO_PUBLIC_URL")
+            or getattr(_settings_pdf, "niko_public_url", "")
+            or ""
+        ).rstrip("/")
+
+        if tool_name == "get_customer_statement_pdf":
+            try:
+                pdf_bytes, _ = fetch_odoo_report_pdf(
+                    tenant_id=_tenant,
+                    odoo_url=_odoo_url, odoo_db=_odoo_db,
+                    odoo_user=_odoo_user, odoo_password=_odoo_password,
+                    report_xmlid="tecno_l10n_ec_payment.report_account_balance",
+                    res_ids=[_otp_partner_id],
+                )
+            except OdooReportError as exc:
+                return json.dumps({
+                    "success": False,
+                    "error_code": exc.code,
+                    "error_detail": exc.detail,
+                }, ensure_ascii=False)
+
+            out_dir = "/files/statements"
+            try:
+                _os_pdf.makedirs(out_dir, exist_ok=True)
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({
+                    "success": False,
+                    "error_code": "mkdir_failed",
+                    "error_detail": str(exc),
+                }, ensure_ascii=False)
+            token = _secrets_pdf.token_urlsafe(6)
+            today_iso = _date_pdf.today().isoformat()
+            fname = f"estado_cuenta_partner{_otp_partner_id}_{today_iso}_{token}.pdf"
+            path = f"{out_dir}/{fname}"
+            try:
+                with open(path, "wb") as fh:
+                    fh.write(pdf_bytes)
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({
+                    "success": False,
+                    "error_code": "save_failed",
+                    "error_detail": str(exc),
+                }, ensure_ascii=False)
+
+            # ETA iter 81 — compute expiry timestamp (7d retention) and
+            # a localised "generated_at" for the display_text.
+            from datetime import datetime as _dt_pdf, timedelta as _td_pdf, timezone as _tz_pdf
+            now_utc = _dt_pdf.now(_tz_pdf.utc)
+            expires_at = (now_utc + _td_pdf(days=7)).isoformat()
+            # America/Guayaquil = UTC-5 fixed (no DST), per memory
+            # "Mostrar timestamps en zona Ecuador".
+            try:
+                from zoneinfo import ZoneInfo as _ZI
+                local_dt = now_utc.astimezone(_ZI("America/Guayaquil"))
+            except Exception:  # noqa: BLE001
+                local_dt = now_utc - _td_pdf(hours=5)
+            generated_at_local = local_dt.strftime("%d-%b %H:%M")
+
+            pdf_url = (
+                f"{_public_base}/files/statements/{fname}"
+                if _public_base else f"/files/statements/{fname}"
+            )
+            result = {
+                "success": True,
+                "partner_id": _otp_partner_id,
+                "report_xmlid": "tecno_l10n_ec_payment.report_account_balance",
+                "pdf_filename": fname,
+                "pdf_size_bytes": len(pdf_bytes),
+                "pdf_url": pdf_url,
+                "generated_at": now_utc.isoformat(),
+                "generated_at_local": generated_at_local,
+                "expires_at": expires_at,
+                "days_back": int(args.get("days_back") or 90),
+            }
+            try:
+                from mcp_odoo.formatters.whatsapp_invoices import format_statement_pdf
+                if request_channel in _CHAT_CHANNELS:
+                    result["display_text"] = format_statement_pdf(result)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("statement_pdf formatter failed: %s", exc)
+            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+        # ── Invoice / NC / Retention PDF (all three share the save logic)
+        # Pick the right Odoo xmlid based on tool + move type.
+        move_type = (_move_row or {}).get("type") or ""
+        move_name = (_move_row or {}).get("name") or ""
+        if tool_name == "get_invoice_pdf":
+            # Auto-detect NC: type='out_refund' uses the NC report. Any
+            # other supported invoice type uses the factura report. We
+            # refuse anything that is not a customer invoice / refund.
+            if move_type == "out_refund":
+                xmlid = "l10n_ec_sri_ece.report_nota_credito_electronica"
+                kind_label = "credit_note"
+            elif move_type in ("out_invoice",):
+                xmlid = "l10n_ec_sri_ece.report_factura_electronica"
+                kind_label = "invoice"
+            else:
+                return json.dumps({
+                    "success": False,
+                    "error_code": "not_an_invoice",
+                    "error_detail": (
+                        f"El account.move {_id_arg_value} es type={move_type!r}; "
+                        "esta tool solo aplica a facturas (out_invoice) y "
+                        "notas de credito (out_refund)."
+                    ),
+                }, ensure_ascii=False)
+        elif tool_name == "get_credit_note_pdf":
+            if move_type != "out_refund":
+                return json.dumps({
+                    "success": False,
+                    "error_code": "not_a_credit_note",
+                    "error_detail": (
+                        f"El account.move {_id_arg_value} es type={move_type!r}; "
+                        "get_credit_note_pdf solo aplica a notas de credito "
+                        "(out_refund). Para facturas normales usa get_invoice_pdf."
+                    ),
+                }, ensure_ascii=False)
+            xmlid = "l10n_ec_sri_ece.report_nota_credito_electronica"
+            kind_label = "credit_note"
+        else:  # get_retention_pdf
+            # Retentions are stored as account.move entries (type='entry').
+            # We don't enforce the type strictly — Odoo will refuse to
+            # render the report if the move is not a retention, and
+            # ``fetch_odoo_report_pdf`` surfaces that as
+            # ``odoo_report_not_pdf``. Surfacing the typed error is more
+            # informative than a custom guess here.
+            xmlid = "l10n_ec_sri_ece.report_retencion_electronica"
+            kind_label = "retention"
+
+        try:
+            pdf_bytes, _ = fetch_odoo_report_pdf(
+                tenant_id=_tenant,
+                odoo_url=_odoo_url, odoo_db=_odoo_db,
+                odoo_user=_odoo_user, odoo_password=_odoo_password,
+                report_xmlid=xmlid,
+                res_ids=[_id_arg_value],
+            )
+        except OdooReportError as exc:
+            return json.dumps({
+                "success": False,
+                "error_code": exc.code,
+                "error_detail": exc.detail,
+            }, ensure_ascii=False)
+
+        out_dir = "/files/rides"
+        try:
+            _os_pdf.makedirs(out_dir, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            return json.dumps({
+                "success": False,
+                "error_code": "mkdir_failed",
+                "error_detail": str(exc),
+            }, ensure_ascii=False)
+
+        token = _secrets_pdf.token_urlsafe(6)
+        # account.move.name can be "FACV/2025/4897" or "VENTA122584";
+        # sanitize for filesystem.
+        safe_name = move_name.replace("/", "_").replace(" ", "_") or f"move{_id_arg_value}"
+        fname = f"{kind_label}_{safe_name}_{token}.pdf"
+        path = f"{out_dir}/{fname}"
+        try:
+            with open(path, "wb") as fh:
+                fh.write(pdf_bytes)
+        except Exception as exc:  # noqa: BLE001
+            return json.dumps({
+                "success": False,
+                "error_code": "save_failed",
+                "error_detail": str(exc),
+            }, ensure_ascii=False)
+
+        from datetime import datetime as _dt_pdf, timedelta as _td_pdf, timezone as _tz_pdf
+        now_utc = _dt_pdf.now(_tz_pdf.utc)
+        expires_at = (now_utc + _td_pdf(days=7)).isoformat()
+        pdf_url = (
+            f"{_public_base}/files/rides/{fname}"
+            if _public_base else f"/files/rides/{fname}"
+        )
+        result = {
+            "success": True,
+            "kind": kind_label,
+            "report_xmlid": xmlid,
+            "pdf_filename": fname,
+            "pdf_size_bytes": len(pdf_bytes),
+            "pdf_url": pdf_url,
+            "expires_at": expires_at,
+        }
+        if kind_label == "retention":
+            result["retention_id"] = _id_arg_value
+            result["retention_name"] = move_name or None
+        else:
+            result["invoice_id"] = _id_arg_value
+            result["invoice_name"] = move_name or None
+            result["invoice_type"] = move_type or None
+
+        try:
+            from mcp_odoo.formatters.whatsapp_invoices import (
+                format_credit_note_pdf,
+                format_invoice_pdf,
+                format_retention_pdf,
+            )
+            if request_channel in _CHAT_CHANNELS:
+                if kind_label == "credit_note":
+                    result["display_text"] = format_credit_note_pdf(result)
+                elif kind_label == "retention":
+                    result["display_text"] = format_retention_pdf(result)
+                else:
+                    result["display_text"] = format_invoice_pdf(result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ride_pdf formatter failed: %s", exc)
+
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "lookup_sri":
         return await _lookup_sri(args["cedula_ruc"])

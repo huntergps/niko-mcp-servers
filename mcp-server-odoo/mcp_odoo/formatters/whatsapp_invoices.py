@@ -437,9 +437,134 @@ def format_statement_summary(
     return "\n\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# ETA iter 81 — PDF download formatters
+# ---------------------------------------------------------------------------
+# Each formatter takes the tool result envelope and returns a short
+# message the LLM can copy verbatim to the customer. The PDF URL goes on
+# its own line so WhatsApp/Telegram render it as a clickable preview.
+
+
+def _fmt_kb(size_bytes: Any) -> str:
+    """Render byte count as 'NN KB' (rounded). Returns '' on bad input."""
+    try:
+        b = int(size_bytes)
+    except (TypeError, ValueError):
+        return ""
+    if b <= 0:
+        return ""
+    if b < 1024:
+        return f"{b} B"
+    kb = b / 1024.0
+    if kb < 1024:
+        return f"{kb:.0f} KB"
+    return f"{kb / 1024.0:.1f} MB"
+
+
+def format_statement_pdf(result: dict | None) -> str:
+    """Render ``get_customer_statement_pdf`` envelope for chat channels."""
+    if not isinstance(result, dict) or not result.get("success"):
+        return "📄 No pude generar el PDF de tu estado de cuenta."
+    pdf_url = (result.get("pdf_url") or "").strip()
+    if not pdf_url:
+        return "📄 El estado de cuenta se generó pero no tengo URL para enviártelo."
+
+    size_str = _fmt_kb(result.get("pdf_size_bytes"))
+    generated_at = (result.get("generated_at_local") or "").strip()
+    expires_at = (result.get("expires_at") or "").strip()[:10]
+
+    lines: list[str] = ["📄 *Tu estado de cuenta oficial*"]
+    meta_bits: list[str] = []
+    if generated_at:
+        meta_bits.append(f"Generado: {generated_at}")
+    fmt_bits = ["PDF"]
+    if size_str:
+        fmt_bits.append(f"({size_str})")
+    meta_bits.append(
+        " ".join(fmt_bits) +
+        " — incluye facturas pendientes, cuentas bancarias y todo lo que "
+        "necesitas para pagar."
+    )
+    if meta_bits:
+        lines.append("\n".join(meta_bits))
+
+    lines.append(f"*Descargar:* {pdf_url}")
+
+    footer_bits: list[str] = [
+        "Mismo documento que recibes por correo cada 15 días."
+    ]
+    if expires_at:
+        footer_bits.append(f"_Enlace activo hasta {expires_at}._")
+    lines.append("_" + " ".join(footer_bits).strip("_ ") + "_")
+
+    return "\n\n".join(lines)
+
+
+def format_invoice_pdf(result: dict | None) -> str:
+    """Render ``get_invoice_pdf`` envelope for chat channels."""
+    if not isinstance(result, dict) or not result.get("success"):
+        return "🧾 No pude generar el PDF de la factura."
+    pdf_url = (result.get("pdf_url") or "").strip()
+    if not pdf_url:
+        return "🧾 Generé el PDF pero no tengo URL para enviártelo."
+    name = (result.get("invoice_name") or "").strip()
+    size_str = _fmt_kb(result.get("pdf_size_bytes"))
+
+    title = f"🧾 *RIDE oficial — {name}*" if name else "🧾 *RIDE oficial*"
+    lines: list[str] = [title]
+    if size_str:
+        lines.append(f"_Formato PDF ({size_str})._")
+    lines.append(f"*Descargar:* {pdf_url}")
+    lines.append("_Versión SRI Ecuador con clave de acceso y firma electrónica._")
+    return "\n\n".join(lines)
+
+
+def format_credit_note_pdf(result: dict | None) -> str:
+    """Render ``get_credit_note_pdf`` envelope for chat channels."""
+    if not isinstance(result, dict) or not result.get("success"):
+        return "📋 No pude generar el PDF de la nota de crédito."
+    pdf_url = (result.get("pdf_url") or "").strip()
+    if not pdf_url:
+        return "📋 Generé el PDF pero no tengo URL para enviártelo."
+    name = (result.get("invoice_name") or "").strip()
+    size_str = _fmt_kb(result.get("pdf_size_bytes"))
+
+    title = f"📋 *Nota de crédito — {name}*" if name else "📋 *Nota de crédito*"
+    lines: list[str] = [title]
+    if size_str:
+        lines.append(f"_Formato PDF ({size_str})._")
+    lines.append(f"*Descargar:* {pdf_url}")
+    lines.append("_Versión SRI Ecuador con clave de acceso y firma electrónica._")
+    return "\n\n".join(lines)
+
+
+def format_retention_pdf(result: dict | None) -> str:
+    """Render ``get_retention_pdf`` envelope for chat channels."""
+    if not isinstance(result, dict) or not result.get("success"):
+        return "🧾 No pude generar el PDF de la retención."
+    pdf_url = (result.get("pdf_url") or "").strip()
+    if not pdf_url:
+        return "🧾 Generé el PDF pero no tengo URL para enviártelo."
+    name = (result.get("retention_name") or "").strip()
+    size_str = _fmt_kb(result.get("pdf_size_bytes"))
+
+    title = f"🧾 *Comprobante de retención — {name}*" if name else "🧾 *Comprobante de retención*"
+    lines: list[str] = [title]
+    if size_str:
+        lines.append(f"_Formato PDF ({size_str})._")
+    lines.append(f"*Descargar:* {pdf_url}")
+    lines.append("_Versión SRI Ecuador con clave de acceso y firma electrónica._")
+    return "\n\n".join(lines)
+
+
 __all__ = [
     "format_invoices_list",
     "format_invoice_detail",
     "format_payments_list",
     "format_statement_summary",
+    # ETA iter 81 — PDF download formatters
+    "format_statement_pdf",
+    "format_invoice_pdf",
+    "format_credit_note_pdf",
+    "format_retention_pdf",
 ]
