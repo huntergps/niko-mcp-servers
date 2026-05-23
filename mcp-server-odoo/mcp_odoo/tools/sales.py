@@ -4561,28 +4561,37 @@ def odoo_get_pricelist_price(
     product_code = tpl.get("default_code") or ""
     product_name = tpl.get("name", "")
 
-    # 3. Calcular precio efectivo via product.template.read con context.
-    # Iter 76 fix A: `get_product_price` falla XMLRPC con
-    # AttributeError 'int' object has no attribute 'categ_id' (Odoo
-    # espera browse record). Solución: leer product.template.price con
-    # context={pricelist, partner} — Odoo lo computa server-side y
-    # aplica TODAS las reglas pricelist (incl. formula+disc%+surcharge).
-    # Mismo método que _apply_pricelist_to_live usa.
+    # 3. Calcular precio efectivo via product.product.read (variant)
+    # con context.
+    # Iter 76b fix A: validado server-side 2026-05-22:
+    #   product.product.read(['price'], context={pricelist, partner}) →
+    #     PSU007 (variant=3163) → $19.99 ✅ (cascade pricelist aplicado)
+    #     RAM0043 (variant=20481) → $135.558 ✅
+    # vs product.template.read da SOLO list_price (no cascade).
     pricelist_price = list_price
     if pricelist_id:
         try:
-            ctx = {"pricelist": pricelist_id, "partner": partner_id, "quantity": qty}
-            rows = odoo_call_method(
+            # Resolve template_id → variant_id (default variant)
+            variants = odoo_search(
                 tenant_id, url, db, user, password,
-                "product.template", "read",
-                [template_id],
-                [["id", "price"]],
-                {"context": ctx},
+                "product.product",
+                [["product_tmpl_id", "=", template_id], ["active", "=", True]],
+                ["id"], 1,
             )
-            if rows and isinstance(rows, list) and rows[0].get("price") is not None:
-                pricelist_price = float(rows[0]["price"])
+            if variants:
+                variant_id = variants[0]["id"]
+                ctx = {"pricelist": pricelist_id, "partner": partner_id, "quantity": qty}
+                rows = odoo_call_method(
+                    tenant_id, url, db, user, password,
+                    "product.product", "read",
+                    [variant_id],
+                    [["id", "lst_price", "price"]],
+                    {"context": ctx},
+                )
+                if rows and isinstance(rows, list) and rows[0].get("price") is not None:
+                    pricelist_price = float(rows[0]["price"])
         except Exception as e:
-            logger.warning("get_pricelist_price: template.read with context "
+            logger.warning("get_pricelist_price: product.product.read with context "
                            "failed pricelist=%s template=%s err=%s",
                            pricelist_id, template_id, e)
 

@@ -3847,32 +3847,60 @@ async def _apply_pricelist_to_live(
         else:
             misses.append(tid)
 
-    # Batch-read the misses with pricelist context applied
+    # Batch-read the misses with pricelist context applied.
+    # Iter 76b: usar product.product (variants) en lugar de
+    # product.template — el cascade pricelist (base_pricelist_id) solo
+    # se computa correctamente sobre variant.price, no template.price.
+    # Tecnosmart pricelist 33 PVP tiene 25+ rules con base_pricelist_id
+    # por categoría que solo aplican en variant level.
     fresh_prices: dict[int, float] = {}
     if misses:
         try:
+            # Resolve template_ids → variant_ids (mantener mapping)
+            variant_rows = odoo_call_method(
+                tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
+                "product.product", "search_read",
+                [[["product_tmpl_id", "in", misses], ["active", "=", True]]],
+                {"fields": ["id", "product_tmpl_id"], "limit": len(misses) * 4},
+            )
+            tmpl_to_variant: dict[int, int] = {}
+            for vr in variant_rows or []:
+                tmpl_field = vr.get("product_tmpl_id")
+                if isinstance(tmpl_field, list) and tmpl_field:
+                    tmpl_id = tmpl_field[0]
+                elif isinstance(tmpl_field, int):
+                    tmpl_id = tmpl_field
+                else:
+                    continue
+                # First variant wins (default). Skip if already mapped.
+                if tmpl_id not in tmpl_to_variant:
+                    tmpl_to_variant[tmpl_id] = vr["id"]
+
+            variant_ids = list(tmpl_to_variant.values())
+            if not variant_ids:
+                raise ValueError("no variants resolved")
+
             rows = odoo_call_method(
                 tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
-                "product.template", "read",
-                misses,
+                "product.product", "read",
+                variant_ids,
                 [["id", "price"]],
                 {"context": {"pricelist": pricelist_id, "partner": partner_id}},
             )
-            for row in rows or []:
-                tid = row.get("id")
-                price_val = row.get("price")
-                if not isinstance(tid, int) or price_val is None:
+            variant_to_price = {r["id"]: r.get("price")
+                                for r in (rows or []) if isinstance(r, dict)}
+            for tmpl_id, var_id in tmpl_to_variant.items():
+                price_val = variant_to_price.get(var_id)
+                if price_val is None:
                     continue
                 try:
                     p = float(price_val)
                 except (TypeError, ValueError):
                     continue
                 if p <= 0:
-                    # Skip 0 — usually means the partner is missing on the
-                    # pricelist's compute path; keep the list_price.
                     continue
-                fresh_prices[tid] = p
-                _pricelist_cache_set(tenant_id, partner_id, tid, p)
+                fresh_prices[tmpl_id] = p
+                _pricelist_cache_set(tenant_id, partner_id, tmpl_id, p)
         except Exception as exc:
             logger.warning(
                 "_apply_pricelist_to_live: batch read failed pricelist=%s n=%d err=%s",
