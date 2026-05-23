@@ -1803,6 +1803,68 @@ async def _handle_mcp_request(request: Request, body: dict) -> dict | None:
     return _make_error(req_id, -32601, f"Unknown method: {method}")
 
 
+# Channels that need plain-text rendering (no markdown tables).
+_CHAT_CHANNELS = {"whatsapp", "telegram"}
+
+
+def _attach_display_text(
+    result: dict | None,
+    channel: str,
+    *,
+    kind: str,
+    **kwargs,
+) -> dict | None:
+    """Add ``display_text`` to a list-tool envelope when channel is chat.
+
+    ``kind`` selects the formatter:
+      * "quotations"           → format_quotations_list(orders=result.orders)
+      * "purchase_history"     → format_purchase_history(history=result)
+      * "pending_quotations"   → format_pending_quotations(quotations=result)
+      * "quotation_detail"     → format_quotation_detail(quotation=result)
+
+    No-op when ``result`` is falsy, when the call failed (success=False
+    with no listable data), or when the channel is not chat. Never
+    raises — formatter errors are swallowed and logged so a render glitch
+    cannot break a successful tool call.
+    """
+    if not isinstance(result, dict):
+        return result
+    if (channel or "").lower() not in _CHAT_CHANNELS:
+        return result
+    try:
+        from mcp_odoo.formatters.whatsapp import (
+            format_pending_quotations,
+            format_purchase_history,
+            format_quotation_detail,
+            format_quotations_list,
+        )
+        if kind == "quotations":
+            orders = result.get("orders") or []
+            result["display_text"] = format_quotations_list(
+                orders,
+                partner_name=kwargs.get("partner_name"),
+                state_filter=kwargs.get("state_filter"),
+            )
+        elif kind == "purchase_history":
+            # Only attach when the call succeeded — error envelopes have
+            # no recent_orders and the formatter would emit a misleading
+            # "no compras" message that would override the real error.
+            if result.get("success") is not False:
+                result["display_text"] = format_purchase_history(result)
+        elif kind == "pending_quotations":
+            if result.get("success") is not False:
+                result["display_text"] = format_pending_quotations(result)
+        elif kind == "quotation_detail":
+            if result.get("success") is not False:
+                result["display_text"] = format_quotation_detail(result)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "display_text formatter failed kind=%s channel=%s: %s",
+            kind, channel, exc,
+        )
+    return result
+
+
 async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
     """Execute a tool and return text result."""
     from mcp_odoo.config import settings
@@ -1822,6 +1884,21 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
     session_active_quotation_id: int | None = (
         int(_aqid_str) if _aqid_str.isdigit() else None
     )
+
+    # Iter 79 (2026-05-22). Channel-aware display formatting for chat
+    # gateways. The orchestrator injects X-Channel (whatsapp / telegram /
+    # web / api / etc.) on every MCP request. List-style tools enrich
+    # their JSON envelope with a ``display_text`` string pre-rendered for
+    # the channel — WhatsApp/Telegram get plain-text bullets, web/api
+    # see no extra field (the dashboard already renders structured rows
+    # in TanStack tables). The LLM is taught (rule iter79) to copy the
+    # ``display_text`` verbatim when present.
+    _channel_header = (
+        request.headers.get("x-channel")
+        or request.headers.get("X-Channel")
+        or ""
+    )
+    request_channel: str = str(_channel_header).strip().lower()
 
     # C1 — Cross-client data leak fix (2026-05-12). The orchestrator pins
     # the expected partner_id for B2C sessions; we use it to reject any
@@ -2226,11 +2303,33 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             args.get("limit", 10),
             args.get("states"),
         )
+        # Iter 79: chat channels need a plain-text render — markdown
+        # tables don't render on WhatsApp/Telegram. We compute a state
+        # label hint from the request when the caller filtered (e.g.
+        # ['draft'] → "borrador"). Web/api callers see no extra field.
+        _states_arg = args.get("states") or []
+        _state_hint = None
+        if isinstance(_states_arg, list) and len(_states_arg) == 1:
+            _state_hint = {
+                "draft": "borrador",
+                "sent": "enviadas",
+                "sale": "confirmadas",
+                "done": "completadas",
+                "cancel": "canceladas",
+            }.get(str(_states_arg[0]).lower())
+        result = _attach_display_text(
+            result, request_channel, kind="quotations",
+            state_filter=_state_hint,
+        )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "get_quotation":
         from mcp_odoo.tools.sales import odoo_get_quotation
         result = odoo_get_quotation(*creds, args["order_id"])
+        # Iter 79: chat-friendly detail block for WhatsApp/Telegram.
+        result = _attach_display_text(
+            result, request_channel, kind="quotation_detail",
+        )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "odoo_lookup_user_by_email":
@@ -2734,6 +2833,10 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             limit=args.get("limit", 10),
             year=args.get("year"),
         )
+        # Iter 79: chat-friendly history summary for WhatsApp/Telegram.
+        result = _attach_display_text(
+            result, request_channel, kind="purchase_history",
+        )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "get_stock_by_warehouse":
@@ -2751,6 +2854,10 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             *creds,
             days_old=args.get("days_old", 7),
             include_expired=args.get("include_expired", True),
+        )
+        # Iter 79: chat-friendly seller follow-up list for WhatsApp/Telegram.
+        result = _attach_display_text(
+            result, request_channel, kind="pending_quotations",
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
