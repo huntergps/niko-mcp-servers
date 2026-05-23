@@ -456,6 +456,17 @@ def format_statement_summary(
         if hidden:
             lines.append(f"_y {hidden} movimiento(s) más._")
 
+    # Iter 81f: ofrecer el PDF oficial al final. Owner-feedback
+    # 2026-05-23: "Debe mostrar los mismos valores pendientes y ofrecer
+    # el pdf de estado de cuenta oficial". El bot puede dispatchear
+    # get_customer_statement_pdf si el cliente lo pide en el siguiente
+    # turn — la sugerencia abre ese camino sin forzar la generación.
+    if total_due_now and float(total_due_now or 0) > 0:
+        lines.append(
+            "_¿Quieres el PDF oficial con detalle por factura y cuentas "
+            "bancarias para pagar? Dime 'mándame el PDF'._"
+        )
+
     return "\n\n".join(lines)
 
 

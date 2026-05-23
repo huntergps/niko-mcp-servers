@@ -783,35 +783,65 @@ def odoo_get_customer_statement(
         payments = []
 
     # ----- Current open receivables (snapshot, NOT period-bound) -------
-    # Reuse the proven logic from odoo_check_balance.
+    # Iter 81f: usar account.move (facturas reales) NO account.move.line.
+    # Owner-evidencia (PDF oficial 2026-05-23 partner=62):
+    #   PDF: 10 facturas pendientes, total $1,797.07
+    #   account.move.line check_balance: 52 lineas, $4,898.35
+    # La diferencia eran lineas contables huerfanas (recibos sin
+    # facturar, ajustes, pagos parciales sin reconciliacion final). El
+    # reporte oficial tecno_l10n_ec_payment.report_account_balance lista
+    # solo account.move con amount_residual > 0. Esa es la fuente de
+    # verdad — matchea exactamente lo que el cliente ve en su email
+    # de cobranza y en el PDF descargable.
     try:
-        open_lines = odoo_search(
+        open_invoices = odoo_search(
             tenant_id, url, db, user, password,
-            "account.move.line",
+            "account.move",
             [
                 ["partner_id", "=", partner_id],
-                ["account_id.user_type_id.type", "=", "receivable"],
-                ["full_reconcile_id", "=", False],
-                ["parent_state", "=", "posted"],
+                ["type", "in", ["out_invoice", "out_refund"]],
+                ["state", "=", "posted"],
+                ["amount_residual", ">", 0],
             ],
-            fields=["move_id", "date_maturity", "amount_residual"],
+            fields=["id", "name", "invoice_date_due", "amount_residual"],
             limit=500,
+            order="invoice_date desc",
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "get_customer_statement: open lines failed: %s", exc,
+            "get_customer_statement: open_invoices failed: %s", exc,
         )
-        open_lines = []
+        open_invoices = []
 
-    total_due_now = sum(float(l.get("amount_residual") or 0) for l in open_lines)
-    overdue_lines = [
-        l for l in open_lines
-        if _parse_date(l.get("date_maturity")) and
-        _parse_date(l.get("date_maturity")) < today_d
+    total_due_now = sum(
+        float(i.get("amount_residual") or 0) for i in open_invoices
+    )
+    overdue_invoices = [
+        i for i in open_invoices
+        if _parse_date(i.get("invoice_date_due")) and
+        _parse_date(i.get("invoice_date_due")) < today_d
     ]
     total_overdue_now = sum(
-        float(l.get("amount_residual") or 0) for l in overdue_lines
+        float(i.get("amount_residual") or 0) for i in overdue_invoices
     )
+    # Maintain open_lines alias for downstream code (recent_movements
+    # uses move_id refs) — but built from invoices now.
+    open_lines = [
+        {
+            "move_id": [i["id"], i.get("name", "")],
+            "date_maturity": i.get("invoice_date_due"),
+            "amount_residual": i.get("amount_residual"),
+        }
+        for i in open_invoices
+    ]
+    overdue_lines = [
+        {
+            "move_id": [i["id"], i.get("name", "")],
+            "date_maturity": i.get("invoice_date_due"),
+            "amount_residual": i.get("amount_residual"),
+        }
+        for i in overdue_invoices
+    ]
 
     # ----- Aggregates --------------------------------------------------
     total_billed = sum(float(i.get("amount_total") or 0) for i in invoices)
