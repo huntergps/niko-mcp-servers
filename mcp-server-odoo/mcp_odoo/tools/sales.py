@@ -3449,18 +3449,40 @@ def odoo_get_customer_credit_status(
         return {"success": False, "error_code": "invalid_partner_id",
                 "error_detail": "partner_id debe ser entero positivo"}
 
-    # 1. Leer datos del partner (nombre + campos de credito)
+    # 1. Leer datos del partner (nombre + campos custom Tecnosmart l10n_ec_sri).
+    # Iter 77: agregar campos del módulo l10n_ec_sri (Tecnosmart):
+    # - blocking_stage = "Crédito Otorgado" (campo principal, NO credit_limit
+    #   que es Odoo standard. MEPRIGA: $25,000.00)
+    # - temp_credit_amount = "Crédito Temporal"
+    # - temp_credit_validity_date = fecha de expiración del crédito temporal
+    # - total_credit_availible_sales = computed (disponible con ventas)
+    # - terminos_pagos_ids = M2M con account.payment.term ("Terms autorizados")
+    # - no_considerar_deudas_vencidas = "Vender con deudas vencidas"
+    # - partner_sale_discount = descuento per-partner
     try:
         partners = odoo_read(
             tenant_id, url, db, user, password,
             "res.partner", [partner_id],
-            ["id", "name", "credit", "credit_limit"],
+            ["id", "name", "credit", "credit_limit",
+             "blocking_stage", "temp_credit_amount", "temp_credit_validity_date",
+             "total_credit_availible", "total_credit_availible_sales",
+             "terminos_pagos_ids", "no_considerar_deudas_vencidas",
+             "partner_sale_discount", "acepta_cheques"],
         )
     except Exception as e:
-        err = f"Error leyendo partner {partner_id}: {e}"
-        _log_call("get_customer_credit_status", tenant_id, log_args, None, err,
-                  int((time.time() - started) * 1000))
-        return {"success": False, "error_code": "partner_read_failed", "error_detail": err}
+        # Fallback to Odoo standard fields only (en caso que custom fields
+        # no existan en este tenant)
+        try:
+            partners = odoo_read(
+                tenant_id, url, db, user, password,
+                "res.partner", [partner_id],
+                ["id", "name", "credit", "credit_limit"],
+            )
+        except Exception as e2:
+            err = f"Error leyendo partner {partner_id}: {e2}"
+            _log_call("get_customer_credit_status", tenant_id, log_args, None, err,
+                      int((time.time() - started) * 1000))
+            return {"success": False, "error_code": "partner_read_failed", "error_detail": err}
 
     if not partners:
         err = f"Partner id={partner_id} no encontrado"
@@ -3471,9 +3493,42 @@ def odoo_get_customer_credit_status(
 
     partner = partners[0]
     partner_name = partner.get("name", "")
-    # credit_limit puede ser False (campo no instalado) o un float
+    # credit_limit standard Odoo
     credit_limit_raw = partner.get("credit_limit")
     credit_limit = float(credit_limit_raw) if credit_limit_raw else None
+
+    # blocking_stage (Crédito Otorgado real de Tecnosmart, l10n_ec_sri)
+    blocking_stage_raw = partner.get("blocking_stage")
+    credito_otorgado = float(blocking_stage_raw) if blocking_stage_raw else 0.0
+
+    # Crédito temporal + expiración
+    temp_credit_amount = float(partner.get("temp_credit_amount") or 0)
+    temp_credit_validity = partner.get("temp_credit_validity_date") or None
+
+    # Crédito disponible computed por Odoo (descuenta deudas vencidas y ventas)
+    credito_disponible = partner.get("total_credit_availible")
+    credito_disponible_sales = partner.get("total_credit_availible_sales")
+
+    # Términos de pago autorizados (M2M devuelve list de IDs)
+    terminos_ids = partner.get("terminos_pagos_ids") or []
+    terminos_autorizados: list[dict] = []
+    if terminos_ids:
+        try:
+            term_rows = odoo_read(
+                tenant_id, url, db, user, password,
+                "account.payment.term", terminos_ids,
+                ["id", "name"],
+            )
+            terminos_autorizados = [
+                {"id": t["id"], "name": t.get("name", "")}
+                for t in (term_rows or [])
+            ]
+        except Exception as e:
+            logger.warning("get_customer_credit_status: term names read failed: %s", e)
+
+    vender_con_deudas_vencidas = bool(partner.get("no_considerar_deudas_vencidas"))
+    descuento_partner = float(partner.get("partner_sale_discount") or 0)
+    acepta_cheques = bool(partner.get("acepta_cheques"))
 
     # 2. Buscar facturas pendientes (account.move, Odoo 13)
     try:
@@ -3533,6 +3588,34 @@ def odoo_get_customer_credit_status(
     if credit_limit is not None:
         result["credit_limit"] = credit_limit
         result["credit_available"] = round(max(credit_limit - credit_used, 0), 2)
+
+    # Iter 77: agregar campos custom Tecnosmart (l10n_ec_sri)
+    # Estos son los que el agente realmente debe consultar para clientes
+    # con crédito pre-aprobado (e.g. MEPRIGA: $25,000 Crédito Otorgado,
+    # terms autorizados: Pago inmediato + 30 días + 1 día + 21 días).
+    if credito_otorgado > 0:
+        result["credito_otorgado"] = round(credito_otorgado, 2)
+    if temp_credit_amount > 0:
+        result["credito_temporal"] = round(temp_credit_amount, 2)
+        result["credito_temporal_expiracion"] = str(temp_credit_validity) if temp_credit_validity else None
+    if credito_disponible is not None:
+        try:
+            result["credito_disponible"] = round(float(credito_disponible), 2)
+        except (TypeError, ValueError):
+            pass
+    if credito_disponible_sales is not None:
+        try:
+            result["credito_disponible_con_ventas"] = round(float(credito_disponible_sales), 2)
+        except (TypeError, ValueError):
+            pass
+    if terminos_autorizados:
+        result["terminos_pago_autorizados"] = terminos_autorizados
+    if vender_con_deudas_vencidas:
+        result["vender_con_deudas_vencidas"] = True
+    if descuento_partner > 0:
+        result["descuento_partner_pct"] = round(descuento_partner, 2)
+    if acepta_cheques:
+        result["acepta_cheques"] = True
 
     _log_call("get_customer_credit_status", tenant_id, log_args, result, None,
               int((time.time() - started) * 1000))
