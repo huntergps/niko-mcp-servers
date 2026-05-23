@@ -501,6 +501,39 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "get_partner_profile",
+        "description": (
+            "Leer datos del cliente actual cuando ya tienes su `partner_id` en sesion "
+            "(por identify_customer / search_partner / contexto). Devuelve nombre, "
+            "email, telefono/movil, RUC/cedula, direccion. "
+            "Usala cuando el cliente pregunte cosas como '¿que sabes de mi?', "
+            "'¿que datos tienes mios?', '¿cual es mi correo registrado?', o cuando "
+            "necesites personalizar el saludo con el nombre del cliente. "
+            "TAMBIEN usala como fallback cuando honcho_peer_chat / "
+            "honcho_peer_representation devuelvan vacio o poca informacion. "
+            "Diferente de search_partner: search_partner busca por TEXTO (nombre), "
+            "esta lee por ID exacto."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {"type": "integer", "description": "ID numerico del cliente (res.partner.id) en Odoo"},
+                "fields": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "(Opcional) Campos especificos a leer. Default incluye: "
+                        "name, email, phone, mobile, vat, street, city, state_id, "
+                        "country_id, lang, customer_rank, supplier_rank. "
+                        "Pide solo lo que necesites para evitar leaks de PII."
+                    ),
+                    "default": [],
+                },
+            },
+            "required": ["partner_id"],
+        },
+    },
+    {
         "name": "identify_customer",
         "description": (
             "Identificar un cliente por su cedula (10 digitos) o RUC (13 digitos). "
@@ -2213,6 +2246,84 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
 
     if tool_name == "search_partner":
         return await _rag_search_partners(args["query"], args.get("top_k", 5), tc["tenant_id"])
+
+    if tool_name == "get_partner_profile":
+        from mcp_odoo.tools.generic import odoo_read
+        # Iter 79: dado un partner_id, leer datos del res.partner desde Odoo.
+        # Cubre el gap entre search_partner (texto → id) y los flujos que
+        # ya tienen id pero no datos. Evidencia (WhatsApp 2026-05-23): el
+        # bot tenia partner_id=62 en sesion pero pregunta "que sabes de mi"
+        # → llamo solo honcho_peer_representation que devolvio 31 chars y
+        # respondio "no tengo info previa". Esta tool da fallback directo.
+        try:
+            partner_id = int(args["partner_id"])
+        except (KeyError, TypeError, ValueError):
+            return json.dumps({
+                "success": False,
+                "error_code": "invalid_partner_id",
+                "error": "partner_id debe ser un entero positivo.",
+            }, ensure_ascii=False)
+        if partner_id <= 0:
+            return json.dumps({
+                "success": False,
+                "error_code": "invalid_partner_id",
+                "error": "partner_id debe ser > 0.",
+            }, ensure_ascii=False)
+        # Default fields — names + contact + identificacion fiscal +
+        # location. Si el LLM pide subset, lo respetamos. Evitamos campos
+        # con datos sensibles que no son utiles para conversacion (ej:
+        # property_payment_term_id, credit, credit_limit — esos viven en
+        # get_customer_credit_status que requiere OTP).
+        default_fields = [
+            "id", "name", "display_name",
+            "email", "email_normalized",
+            "phone", "mobile",
+            "vat",
+            "street", "street2", "city", "zip",
+            "state_id", "country_id",
+            "lang", "tz",
+            "customer_rank", "supplier_rank",
+            "is_company", "parent_id",
+            "comment",
+        ]
+        req_fields = args.get("fields") or default_fields
+        if not isinstance(req_fields, list) or not req_fields:
+            req_fields = default_fields
+        try:
+            rows = odoo_read(*creds, "res.partner", [partner_id], req_fields)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "get_partner_profile: odoo_read failed tenant=%s id=%s: %s",
+                tc["tenant_id"], partner_id, exc,
+            )
+            return json.dumps({
+                "success": False,
+                "error_code": "odoo_read_failed",
+                "error": f"No pude leer el partner {partner_id}: {exc}",
+            }, ensure_ascii=False)
+        if not rows:
+            return json.dumps({
+                "success": False,
+                "error_code": "partner_not_found",
+                "error": f"No existe un partner con id={partner_id}.",
+            }, ensure_ascii=False)
+        partner = rows[0]
+        # Many2one fields llegan como [id, name] — flatten a {id, name}.
+        for fk in ("state_id", "country_id", "parent_id"):
+            v = partner.get(fk)
+            if isinstance(v, (list, tuple)) and len(v) == 2:
+                partner[fk] = {"id": v[0], "name": v[1]}
+            elif v is False:
+                partner[fk] = None
+        # Normalizar Falses booleanos de XMLRPC a None para campos texto.
+        for k, v in list(partner.items()):
+            if v is False and k not in ("is_company",):
+                partner[k] = None
+        return json.dumps({
+            "success": True,
+            "partner": partner,
+            "partner_id": partner_id,
+        }, ensure_ascii=False, indent=2, default=str)
 
     if tool_name == "identify_customer":
         return await _identify_customer(creds, args["cedula_ruc"])
