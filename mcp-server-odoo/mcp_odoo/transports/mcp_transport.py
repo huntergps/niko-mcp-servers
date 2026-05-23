@@ -1205,18 +1205,21 @@ MCP_TOOLS = [
             "Enviar codigo de verificacion OTP al correo electronico del cliente. "
             "OBLIGATORIO antes de mostrar datos financieros (saldos, deudas, facturas). "
             "Primero identifica al cliente con identify_customer, luego llama request_otp. "
-            "El cliente recibira un codigo de 6 digitos en su correo. "
-            "Pidele que te lo escriba en el chat y luego usa verify_otp."
+            "Solo necesitas pasar `partner_id` — el backend resuelve email desde Odoo "
+            "(res.partner.email) y canal/destinatario desde el contexto del chat "
+            "automaticamente. NO preguntes al cliente por su email, NO pidas channel ni "
+            "channel_user_id. El cliente recibira un codigo de 6 digitos en su correo "
+            "registrado. Pidele que te lo escriba en el chat y luego usa verify_otp."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "partner_id": {"type": "integer", "description": "ID del cliente en Odoo"},
-                "email": {"type": "string", "description": "Email del cliente (de identify_customer)"},
-                "channel": {"type": "string", "description": "Canal actual (telegram, whatsapp, etc)"},
-                "channel_user_id": {"type": "string", "description": "ID del usuario en el canal"},
+                "email": {"type": "string", "description": "(Opcional) Email del cliente. Si se omite, el backend lo lee desde res.partner.email."},
+                "channel": {"type": "string", "description": "(Opcional) Canal — el backend lo resuelve desde el contexto del chat."},
+                "channel_user_id": {"type": "string", "description": "(Opcional) ID del usuario en el canal — el backend lo resuelve."},
             },
-            "required": ["partner_id", "email", "channel", "channel_user_id"],
+            "required": ["partner_id"],
         },
     },
     {
@@ -1224,16 +1227,18 @@ MCP_TOOLS = [
         "description": (
             "Verificar el codigo OTP de 6 digitos que el cliente proporciona. "
             "Si es correcto, se desbloquea el acceso a datos financieros por 24 horas. "
+            "Solo necesitas pasar `partner_id` y `code` — el backend resuelve el canal "
+            "desde el contexto del chat automaticamente. "
             "Despues de verificar, puedes llamar check_balance para obtener los datos."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "partner_id": {"type": "integer", "description": "ID del cliente en Odoo"},
-                "channel": {"type": "string", "description": "Canal (telegram, whatsapp, etc)"},
+                "channel": {"type": "string", "description": "(Opcional) Canal — el backend lo resuelve desde el contexto."},
                 "code": {"type": "string", "description": "Codigo de 6 digitos proporcionado por el cliente"},
             },
-            "required": ["partner_id", "channel", "code"],
+            "required": ["partner_id", "code"],
         },
     },
     {
@@ -2546,12 +2551,62 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         _supa_key = _s.supabase_service_key or _s.supabase_jwt_secret
         _tenant = tc["tenant_id"]
         partner_id = args["partner_id"]
-        email = args["email"]
-        channel = args["channel"]
-        channel_user_id = args["channel_user_id"]
+        # Iter 78c: resolver email/channel/channel_user_id sin pedirlos al
+        # LLM. Bug previo (trace d414f8ca→543e4765 2026-05-22): el LLM no
+        # tenia el email del cliente y, en lugar de leerlo desde Odoo,
+        # PEDIA AL CLIENTE su email manual. Pero el partner_id ya estaba
+        # identificado y res.partner.email existe. Fix: fallback en cadena
+        # args -> Odoo (para email) / args -> X-Channel header (para canal).
+        email = (args.get("email") or "").strip()
+        if not email:
+            try:
+                rows = odoo_read(
+                    tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
+                    "res.partner", [int(partner_id)], ["email", "email_normalized"],
+                )
+                if rows:
+                    email = (rows[0].get("email") or rows[0].get("email_normalized") or "").strip()
+            except Exception as _e_lookup:
+                logger.warning(
+                    "request_otp: failed to read email for partner=%s tenant=%s: %s",
+                    partner_id, tc["tenant_id"], _e_lookup,
+                )
+        channel = (
+            args.get("channel")
+            or request.headers.get("x-channel")
+            or request.headers.get("X-Channel")
+            or ""
+        ).strip().lower()
+        channel_user_id = (
+            args.get("channel_user_id")
+            or request.headers.get("x-channel-user-id")
+            or request.headers.get("X-Channel-User-Id")
+            or ""
+        ).strip()
+
+        if not channel or not channel_user_id:
+            return json.dumps({
+                "success": False,
+                "error_code": "missing_channel_context",
+                "error": (
+                    "No pude resolver el canal del chat actual. Asegurate "
+                    "de que el orchestrator envie los headers X-Channel y "
+                    "X-Channel-User-Id."
+                ),
+            }, ensure_ascii=False)
 
         if not email or "@" not in email:
-            return json.dumps({"success": False, "error": "El cliente no tiene correo electronico registrado."}, ensure_ascii=False)
+            return json.dumps({
+                "success": False,
+                "error_code": "no_email_on_file",
+                "error": (
+                    "El cliente no tiene correo electronico registrado en "
+                    "Odoo (res.partner.email vacio). Pidele al cliente que "
+                    "te indique un email valido y luego registralo en su "
+                    "ficha — o llama otra tool de OTP que use un canal "
+                    "alternativo."
+                ),
+            }, ensure_ascii=False)
 
         code, error = await _otp_generate(_supa_url, _supa_key, _tenant, partner_id, channel, channel_user_id)
         if error:
@@ -2582,7 +2637,24 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         _supa_url = _s.supabase_url or "http://localhost:8000"
         _supa_key = _s.supabase_service_key or _s.supabase_jwt_secret
         _tenant = tc["tenant_id"]
-        success, msg = await _otp_verify(_supa_url, _supa_key, _tenant, args["partner_id"], args["channel"], args["code"])
+        # Iter 78c: channel desde args O X-Channel header (mismo patron que
+        # request_otp / niko_send_sign_request).
+        _channel_v = (
+            args.get("channel")
+            or request.headers.get("x-channel")
+            or request.headers.get("X-Channel")
+            or ""
+        ).strip().lower()
+        if not _channel_v:
+            return json.dumps({
+                "success": False,
+                "error_code": "missing_channel_context",
+                "message": "No pude resolver el canal del chat actual.",
+            }, ensure_ascii=False)
+        success, msg = await _otp_verify(
+            _supa_url, _supa_key, _tenant,
+            args["partner_id"], _channel_v, args["code"],
+        )
         return json.dumps({"success": success, "message": msg}, ensure_ascii=False, indent=2)
 
     if tool_name == "check_balance":
