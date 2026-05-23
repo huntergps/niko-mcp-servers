@@ -3854,20 +3854,92 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             xmlid = "l10n_ec_sri_ece.report_retencion_electronica"
             kind_label = "retention"
 
+        # Iter 81c: el RIDE PDF ya existe como ir.attachment en Odoo
+        # Tecnosmart — se genera tras la autorizacion SRI (no via el
+        # template QWEB l10n_ec_sri_ece.report_factura_electronica, que
+        # tiene un bug latente con `date_due` vs `invoice_date_due` y
+        # devuelve HTTP 500 al renderizar on-the-fly). Owner-evidencia
+        # (2026-05-23): la factura 404936 tiene attachment 487786
+        # 'FACV_2025_4897.pdf' (40 KB, application/pdf) + el XML SRI
+        # firmado. Estrategia: leer el attachment existente PRIMERO, si
+        # no hay caer al render QWEB como fallback. Esto entrega siempre
+        # el RIDE oficial firmado por el SRI.
+        pdf_bytes: bytes | None = None
+        attachment_source: str | None = None
         try:
-            pdf_bytes, _ = fetch_odoo_report_pdf(
-                tenant_id=_tenant,
-                odoo_url=_odoo_url, odoo_db=_odoo_db,
-                odoo_user=_odoo_user, odoo_password=_odoo_password,
-                report_xmlid=xmlid,
-                res_ids=[_id_arg_value],
+            from mcp_odoo.tools.generic import (
+                odoo_search as _odoo_search_att,
+                odoo_read as _odoo_read_att,
             )
-        except OdooReportError as exc:
-            return json.dumps({
-                "success": False,
-                "error_code": exc.code,
-                "error_detail": exc.detail,
-            }, ensure_ascii=False)
+            atts = _odoo_search_att(
+                *creds, "ir.attachment",
+                [
+                    ["res_model", "=", "account.move"],
+                    ["res_id", "=", _id_arg_value],
+                    ["mimetype", "=", "application/pdf"],
+                ],
+                fields=["id", "name", "file_size"],
+                limit=10,
+                order="create_date desc",
+            )
+            if atts:
+                # Preferir el que matchee el `name` del move (FACV...)
+                # sobre cualquier otro PDF (ej. attachments de respaldo).
+                expected_stem = (move_name or "").replace("/", "_").lower()
+                best = None
+                for a in atts:
+                    n = (a.get("name") or "").lower()
+                    if expected_stem and expected_stem in n and n.endswith(".pdf"):
+                        best = a
+                        break
+                if best is None:
+                    best = atts[0]
+                full = _odoo_read_att(
+                    *creds, "ir.attachment", [int(best["id"])], ["datas", "name"],
+                )
+                if full and full[0].get("datas"):
+                    import base64 as _b64_att
+                    raw_b64 = full[0]["datas"]
+                    if isinstance(raw_b64, bytes):
+                        raw_b64 = raw_b64.decode("ascii", errors="ignore")
+                    pdf_bytes = _b64_att.b64decode(raw_b64)
+                    attachment_source = f"ir.attachment[{best['id']}]"
+                    logger.info(
+                        "%s: using ir.attachment id=%s name=%s (%d bytes) "
+                        "instead of QWEB render",
+                        tool_name, best["id"], full[0].get("name"),
+                        len(pdf_bytes),
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "%s: attachment lookup failed for move=%s: %s",
+                tool_name, _id_arg_value, exc,
+            )
+
+        if pdf_bytes is None:
+            # Fallback al QWEB render (puede fallar con date_due bug en
+            # el template Tecnosmart — el error se propaga al cliente).
+            try:
+                pdf_bytes, _ = fetch_odoo_report_pdf(
+                    tenant_id=_tenant,
+                    odoo_url=_odoo_url, odoo_db=_odoo_db,
+                    odoo_user=_odoo_user, odoo_password=_odoo_password,
+                    report_xmlid=xmlid,
+                    res_ids=[_id_arg_value],
+                )
+                attachment_source = f"qweb:{xmlid}"
+            except OdooReportError as exc:
+                return json.dumps({
+                    "success": False,
+                    "error_code": exc.code,
+                    "error_detail": (
+                        f"{exc.detail} (Tip: la factura {move_name or _id_arg_value} "
+                        f"no tiene PDF guardado como ir.attachment y el "
+                        f"template QWEB falla. Esto pasa cuando la factura "
+                        f"aun no fue autorizada por el SRI. Verifica el "
+                        f"estado SRI en Odoo.)"
+                    ),
+                }, ensure_ascii=False)
 
         out_dir = "/files/rides"
         try:
@@ -3910,6 +3982,11 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             "pdf_size_bytes": len(pdf_bytes),
             "pdf_url": pdf_url,
             "expires_at": expires_at,
+            # Iter 81c: source = ir.attachment[id] cuando viene del PDF
+            # ya guardado tras autorizacion SRI, qweb:<xmlid> cuando se
+            # tuvo que renderizar (fallback). Util para debug y para que
+            # el LLM sepa si el PDF es el RIDE oficial firmado SRI o no.
+            "source": attachment_source,
         }
         if kind_label == "retention":
             result["retention_id"] = _id_arg_value
