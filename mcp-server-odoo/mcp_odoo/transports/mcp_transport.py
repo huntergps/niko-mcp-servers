@@ -4424,10 +4424,39 @@ async def _rag_search(
     # ``_fetch_products_live`` returns references to the per-product
     # cache; mutating in place would leak B2B prices into anonymous
     # callers. We clone the dicts before rewriting.
-    if partner_id:
+    # Iter 76 fix B: si NO hay partner_id identificado, usar el
+    # consumidor_final_partner_id como fallback para que el catálogo
+    # SIEMPRE muestre el precio PVP real (no list_price base).
+    # Carlos-LLM v9 reveló: search devolvía $15.30 (list_price) cuando
+    # la cotización Odoo creaba con $19.99 (pricelist 33 PVP regla 147
+    # formula). Owner confirmó $19.99 = PRECIO CORRECTO para PVP.
+    # Fix: aplicar pricelist siempre (con default consumer_final partner)
+    # para que el cliente vea desde el inicio el precio al que cotizará.
+    _effective_partner_id = partner_id
+    if not _effective_partner_id:
+        try:
+            from mcp_odoo.tools.generic import odoo_search
+            tc_for_default = await _get_tenant_config_by_id(tenant_id)
+            if tc_for_default:
+                params = odoo_search(
+                    tc_for_default["tenant_id"], tc_for_default["url"],
+                    tc_for_default["db"], tc_for_default["user"],
+                    tc_for_default["password"],
+                    "ir.config_parameter",
+                    [["key", "=", "sale.end_customer_default_id"]],
+                    ["value"], 1,
+                )
+                if params:
+                    try:
+                        _effective_partner_id = int(params[0]["value"])
+                    except (ValueError, TypeError, KeyError):
+                        pass
+        except Exception as exc:
+            logger.warning("search_products default partner lookup failed: %s", exc)
+    if _effective_partner_id:
         live = {pid: dict(data) if isinstance(data, dict) else data
                 for pid, data in live.items()}
-        await _apply_pricelist_to_live(tenant_id, partner_id, live)
+        await _apply_pricelist_to_live(tenant_id, _effective_partner_id, live)
 
     # ── Re-rank: in-stock first, out-of-stock second ─────────────────
     # The RAG returned candidate_k products by semantic relevance.

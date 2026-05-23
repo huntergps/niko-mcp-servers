@@ -4561,22 +4561,29 @@ def odoo_get_pricelist_price(
     product_code = tpl.get("default_code") or ""
     product_name = tpl.get("name", "")
 
-    # 3. Calcular precio efectivo
+    # 3. Calcular precio efectivo via product.template.read con context.
+    # Iter 76 fix A: `get_product_price` falla XMLRPC con
+    # AttributeError 'int' object has no attribute 'categ_id' (Odoo
+    # espera browse record). Solución: leer product.template.price con
+    # context={pricelist, partner} — Odoo lo computa server-side y
+    # aplica TODAS las reglas pricelist (incl. formula+disc%+surcharge).
+    # Mismo método que _apply_pricelist_to_live usa.
     pricelist_price = list_price
     if pricelist_id:
         try:
-            raw_price = odoo_call_method(
+            ctx = {"pricelist": pricelist_id, "partner": partner_id, "quantity": qty}
+            rows = odoo_call_method(
                 tenant_id, url, db, user, password,
-                "product.pricelist", "get_product_price",
-                [pricelist_id],
-                [template_id, qty, partner_id],
+                "product.template", "read",
+                [template_id],
+                [["id", "price"]],
+                {"context": ctx},
             )
-            if raw_price is not None:
-                pricelist_price = float(raw_price)
+            if rows and isinstance(rows, list) and rows[0].get("price") is not None:
+                pricelist_price = float(rows[0]["price"])
         except Exception as e:
-            # No bloquear: dejar el list_price si pricelist falla, pero loguear
-            logger.warning("get_pricelist_price: get_product_price failed "
-                           "pricelist=%s template=%s err=%s",
+            logger.warning("get_pricelist_price: template.read with context "
+                           "failed pricelist=%s template=%s err=%s",
                            pricelist_id, template_id, e)
 
     discount_applied = 0.0
