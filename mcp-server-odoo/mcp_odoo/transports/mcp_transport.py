@@ -2439,14 +2439,45 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             }, ensure_ascii=False)
 
         order_id = int(args["order_id"])
+        # Iter 78b: channel + channel_user_id se resuelven desde headers
+        # X-Channel / X-Channel-User-Id inyectados por el orchestrator de
+        # niko. El inputSchema de esta tool declara que solo `order_id` es
+        # requerido (descripción: "el backend resuelve el canal y
+        # destinatario automáticamente desde el contexto del chat") — leer
+        # args["channel"] crudo provocaba KeyError → LLM retry → recursion
+        # limit 25 (trace efeb5032 WhatsApp 2026-05-22 "Quiero firmar").
+        # args[] sigue siendo fallback para callers que sí los manden.
+        _ch = (args.get("channel")
+               or request.headers.get("x-channel")
+               or request.headers.get("X-Channel")
+               or "")
+        _cuid = (args.get("channel_user_id")
+                 or request.headers.get("x-channel-user-id")
+                 or request.headers.get("X-Channel-User-Id")
+                 or "")
+        if not _ch or not _cuid:
+            return json.dumps({
+                "success": False,
+                "error_code": "missing_channel_context",
+                "error_detail": (
+                    "No pude resolver el canal/destinatario del chat "
+                    "actual desde el contexto. Verifica que la request "
+                    "incluya headers X-Channel y X-Channel-User-Id."
+                ),
+            }, ensure_ascii=False)
         body = {
-            "channel": str(args["channel"]).strip().lower(),
-            "channel_user_id": str(args["channel_user_id"]).strip(),
+            "channel": str(_ch).strip().lower(),
+            "channel_user_id": str(_cuid).strip(),
             "message_prefix": str(args.get("message_prefix", "") or ""),
             "tenant_id": tc["tenant_id"],
             # Forward agent_slug so the backend picks the right Telegram
             # bot when the tenant has multiple (Niko B2C + Yarvis B2B).
-            "agent_slug": str(args.get("agent_slug", "") or "").strip(),
+            "agent_slug": (
+                args.get("agent_slug")
+                or request.headers.get("x-agent-slug")
+                or request.headers.get("X-Agent-Slug")
+                or ""
+            ).strip(),
         }
 
         try:
