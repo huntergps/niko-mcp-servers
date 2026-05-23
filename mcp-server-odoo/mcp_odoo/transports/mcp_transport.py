@@ -1529,23 +1529,28 @@ MCP_TOOLS = [
             "(type=out_refund), automaticamente usa el reporte de NC. "
             "Usala cuando el cliente pide 'mandame el RIDE', 'envia el "
             "PDF de la factura', 'el archivo oficial de la factura', "
-            "'el comprobante autorizado por el SRI'. Para listar facturas "
-            "primero usa get_customer_invoices y luego pasa el invoice_id "
-            "elegido."
+            "'el comprobante autorizado por el SRI'. "
+            "Acepta invoice_id (entero) O invoice_name (string tipo "
+            "'FACV/2025/4897'): si pasas el name, el backend resuelve "
+            "el id por busqueda. Si listaste facturas previamente con "
+            "get_customer_invoices, prefiere usar el invoice_id."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "invoice_id": {
                     "type": "integer",
-                    "description": "ID numerico de la factura (account.move.id).",
+                    "description": "ID numerico de la factura (account.move.id). Si solo tienes el name, usa invoice_name.",
+                },
+                "invoice_name": {
+                    "type": "string",
+                    "description": "Nombre/numero de la factura (ej 'FACV/2025/4897'). Alternativa a invoice_id — el backend resuelve.",
                 },
                 "channel": {
                     "type": "string",
                     "description": "(Opcional) Canal para validar OTP. Default desde X-Channel.",
                 },
             },
-            "required": ["invoice_id"],
         },
     },
     {
@@ -3653,16 +3658,69 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
                 else ("refund_id" if tool_name == "get_credit_note_pdf"
                       else "retention_id")
             )
+            # Iter 81d: aceptar tambien `invoice_name` / `name` cuando el
+            # cliente nombra el documento ("Mandame el RIDE de FACV/2025/
+            # 4897"). Qwen3 router pasaba el name sin resolver el id →
+            # MCP rechazaba con invalid_arguments. Estrategia: si no hay
+            # entero valido, intentar resolver desde el name con
+            # odoo_search.
+            from mcp_odoo.tools.generic import (
+                odoo_read as _odoo_read_pdf,
+                odoo_search as _odoo_search_pdf,
+            )
+            _id_arg_value = None
             try:
-                _id_arg_value = int(args[_id_arg_name])
-            except (KeyError, TypeError, ValueError):
+                _id_arg_value = int(args.get(_id_arg_name)) if args.get(_id_arg_name) is not None else None
+            except (TypeError, ValueError):
+                _id_arg_value = None
+            if _id_arg_value is None or _id_arg_value <= 0:
+                # Try resolving by name (also support 'invoice_name' for
+                # get_invoice_pdf since the schema documents it).
+                name_arg = (
+                    args.get("invoice_name")
+                    or args.get("refund_name")
+                    or args.get("retention_name")
+                    or args.get("name")
+                    or args.get(_id_arg_name)  # LLM puede pasar el name como invoice_id (string)
+                )
+                if isinstance(name_arg, str) and name_arg.strip():
+                    name_clean = name_arg.strip()
+                    # Build domain — scope to current partner when available
+                    # to avoid cross-partner resolution.
+                    _name_domain = [["name", "=", name_clean]]
+                    if expected_partner_id:
+                        _name_domain.append(["partner_id", "=", expected_partner_id])
+                    try:
+                        _hits = _odoo_search_pdf(
+                            *creds, "account.move", _name_domain,
+                            fields=["id"], limit=2,
+                        )
+                        if len(_hits) == 1:
+                            _id_arg_value = int(_hits[0]["id"])
+                        elif len(_hits) > 1:
+                            return json.dumps({
+                                "success": False,
+                                "error_code": "ambiguous_name",
+                                "error_detail": (
+                                    f"Hay varios documentos con name='{name_clean}'. "
+                                    "Pasa el ID exacto."
+                                ),
+                            }, ensure_ascii=False)
+                    except Exception as _exc:  # noqa: BLE001
+                        logger.warning(
+                            "%s: name->id resolve failed name=%r: %s",
+                            tool_name, name_clean, _exc,
+                        )
+            if _id_arg_value is None or _id_arg_value <= 0:
                 return json.dumps({
                     "success": False,
                     "error_code": f"invalid_{_id_arg_name}",
-                    "error_detail": f"{_id_arg_name} requerido (entero).",
+                    "error_detail": (
+                        f"{_id_arg_name} requerido (entero positivo) o "
+                        f"name resoluble (ej 'FACV/2025/4897')."
+                    ),
                 }, ensure_ascii=False)
             try:
-                from mcp_odoo.tools.generic import odoo_read as _odoo_read_pdf
                 _rows = _odoo_read_pdf(
                     *creds, "account.move", [_id_arg_value],
                     ["id", "name", "type", "partner_id"],
