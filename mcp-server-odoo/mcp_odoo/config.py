@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     # override with the public URL for out-of-cluster callers.
     niko_api_url: str = "http://niko:8080"
 
+    # ETA iter 81 — public base URL for niko-served PDFs (statements +
+    # RIDEs). The MCP returns absolute URLs in the tool response so the
+    # LLM can hand them off to the channel (WhatsApp / Telegram / web).
+    # Defaults match the Caddy public hostname; override per-environment
+    # via the ``NIKO_PUBLIC_URL`` env var (also used by other niko code).
+    niko_public_url: str = "https://niko.galapagos.tech"
+
     model_config = {"env_prefix": "", "case_sensitive": False}
 
 
