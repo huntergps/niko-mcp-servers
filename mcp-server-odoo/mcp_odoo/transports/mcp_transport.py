@@ -524,11 +524,14 @@ MCP_TOOLS = [
                 "include_activity": {
                     "type": "boolean",
                     "description": (
-                        "Si true, anade ultimas cotizaciones, facturas y top "
-                        "productos. Default false. SIEMPRE true para preguntas "
-                        "tipo '¿que sabes de mi?'."
+                        "Si true (default), anade ultimas cotizaciones, "
+                        "facturas, top productos y ticket promedio. Pasa "
+                        "false EXPLICITAMENTE si solo necesitas datos de "
+                        "contacto y quieres ahorrar latencia/tokens (caso "
+                        "raro). Para preguntas '¿que sabes de mi?' deja el "
+                        "default true."
                     ),
-                    "default": False,
+                    "default": True,
                 },
                 "fields": {
                     "type": "array",
@@ -2446,10 +2449,14 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
                 partner[k] = None
 
         # Iter 79b: include_activity → enriquecer con purchase history +
-        # facturas. Owner-feedback (WhatsApp 2026-05-23): cuando el cliente
-        # pregunta "que sabes de mi", debe ver perfil + ultimas cotizaciones
-        # + facturas + top productos, no solo datos de contacto.
-        include_activity = bool(args.get("include_activity", False))
+        # facturas. Owner-feedback (WhatsApp 2026-05-23 trace 85e7fa65):
+        # Qwen3 router llamaba get_partner_profile({partner_id: 62}) sin
+        # el flag → handler devolvia solo contacto → bot decia "no tengo
+        # historial de compras en memoria" pese a haber compras reales.
+        # Default ahora TRUE para que el caso mas comun ("que sabes de
+        # mi") devuelva todo sin que el LLM tenga que recordarlo. El LLM
+        # puede pasar false explicito si solo quiere contacto.
+        include_activity = bool(args.get("include_activity", True))
         activity = None
         if include_activity:
             from mcp_odoo.tools.sales import (
