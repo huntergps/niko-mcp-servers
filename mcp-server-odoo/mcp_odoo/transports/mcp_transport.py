@@ -231,7 +231,14 @@ async def _otp_verify(supabase_url: str, supabase_key: str, tenant_id: str,
                 f"{supabase_url}/rest/v1/verification_tokens?id=eq.{token_id}",
                 headers=headers, json={"used": True},
             )
-            # Create a verification session (valid 24h)
+            # Iter 80b: verified_session debe durar 24h (era 15 min por
+            # bug — el comentario decia 24h pero la insercion no setea
+            # expires_at y la columna tiene DEFAULT now()+15min). Owner-
+            # evidencia (WhatsApp 2026-05-23): cliente verifico OTP a las
+            # 01:15, a las 01:17 le pidio estado de cuenta y el bot le
+            # volvio a pedir OTP — porque expires_at=01:30 era de 15min.
+            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+            _expires_24h = (_dt.now(_tz.utc) + _td(hours=24)).isoformat()
             session_resp = await client.post(
                 f"{supabase_url}/rest/v1/verification_tokens",
                 headers=headers,
@@ -243,9 +250,10 @@ async def _otp_verify(supabase_url: str, supabase_key: str, tenant_id: str,
                     "token_hash": _hash_otp(f"session-{partner_id}-{channel}"),
                     "purpose": "verified_session",
                     "used": False,
+                    "expires_at": _expires_24h,
                 },
             )
-            return True, "Codigo verificado correctamente. Ahora puede consultar datos financieros."
+            return True, "Codigo verificado correctamente. Acceso a datos financieros valido por 24 horas."
 
         remaining = max_attempts - attempts - 1
         if remaining <= 0:
@@ -1301,6 +1309,171 @@ MCP_TOOLS = [
         },
     },
     {
+        # ZETA iter 80 — listar facturas detalladas del cliente (gap iter
+        # 79: check_balance solo devolvia el agregado).
+        "name": "get_customer_invoices",
+        "description": (
+            "Listar las facturas (account.move type=out_invoice / "
+            "out_refund) emitidas a un cliente. Devuelve detalle por "
+            "factura: numero, fecha emision, fecha vencimiento, dias de "
+            "vencimiento, total, saldo pendiente, estado de pago, "
+            "referencia a la venta origen, y URL del PDF (RIDE) del "
+            "portal. Filtra por estado con state='paid' | 'not_paid' | "
+            "'overdue' | 'all'. REQUIERE verificacion OTP previa. "
+            "Usa esta tool cuando el cliente pregunte 'dame mis "
+            "facturas', '¿que facturas vencidas tengo?', '¿estoy al "
+            "dia?', '¿que me falta pagar?', '¿facturas del 2025?'. NO "
+            "uses list_quotations para esto — las cotizaciones son "
+            "proformas, NO facturas."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {
+                    "type": "integer",
+                    "description": "ID del cliente en Odoo (res.partner.id)",
+                },
+                "state": {
+                    "type": "string",
+                    "description": (
+                        "Filtro: 'all' (default), 'paid' (pagadas), "
+                        "'not_paid' (pendientes), 'overdue' (vencidas: "
+                        "no pagadas + fecha vencimiento pasada)."
+                    ),
+                    "enum": ["all", "paid", "not_paid", "overdue"],
+                    "default": "all",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Numero de facturas a devolver (default 10, max 50).",
+                    "default": 10,
+                },
+                "year": {
+                    "type": "integer",
+                    "description": "(Opcional) restringir al anio indicado por fecha de emision.",
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "Canal actual para verificar sesion OTP (opcional, lo resuelve el backend desde X-Channel).",
+                },
+            },
+            "required": ["partner_id"],
+        },
+    },
+    {
+        # ZETA iter 80 — detalle completo de UNA factura (lineas + tax).
+        "name": "get_invoice_detail",
+        "description": (
+            "Obtener el detalle completo de una factura: cabecera, "
+            "lineas (producto, cantidad, precio unitario, descuento, "
+            "subtotal), desglose de impuestos (IVA + retenciones SRI), "
+            "y URL del PDF/RIDE del portal. REQUIERE verificacion OTP "
+            "previa (es informacion financiera). "
+            "Usala cuando el cliente pida el detalle de una factura "
+            "especifica (ej: '¿que esta incluido en la FACV/2025/4897?', "
+            "'mandame el detalle de la factura X', 'mandame el PDF del "
+            "RIDE'). Para listar varias facturas usa "
+            "get_customer_invoices."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "invoice_id": {
+                    "type": "integer",
+                    "description": "ID numerico de la factura (account.move.id).",
+                },
+                "include_lines": {
+                    "type": "boolean",
+                    "description": "Incluir las lineas de producto (default true).",
+                    "default": True,
+                },
+                "include_taxes": {
+                    "type": "boolean",
+                    "description": "Incluir desglose de impuestos y retenciones (default true).",
+                    "default": True,
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "(Opcional) Canal actual para validar OTP. El backend lo resuelve desde X-Channel.",
+                },
+            },
+            "required": ["invoice_id"],
+        },
+    },
+    {
+        # ZETA iter 80 — pagos hechos por el cliente.
+        "name": "get_customer_payments",
+        "description": (
+            "Listar los pagos recibidos del cliente (account.payment "
+            "inbound posted). Devuelve cada pago con numero, fecha, "
+            "monto, diario contable (banco / efectivo), referencia y "
+            "las facturas a las que se aplico. REQUIERE verificacion "
+            "OTP previa. "
+            "Usala cuando el cliente pregunte '¿que pagos he hecho?', "
+            "'¿cuanto he pagado este mes?', 'mandame mis ultimos pagos', "
+            "'¿en que banco pague tal factura?'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {
+                    "type": "integer",
+                    "description": "ID del cliente en Odoo (res.partner.id)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Numero de pagos a devolver (default 10, max 50).",
+                    "default": 10,
+                },
+                "year": {
+                    "type": "integer",
+                    "description": "(Opcional) restringir al anio indicado por fecha de pago.",
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "(Opcional) Canal para validar OTP. Default desde X-Channel.",
+                },
+            },
+            "required": ["partner_id"],
+        },
+    },
+    {
+        # ZETA iter 80 — resumen agregado del estado de cuenta.
+        "name": "get_customer_statement",
+        "description": (
+            "Generar un estado de cuenta resumido del cliente para los "
+            "ultimos N dias: total facturado, total pagado, saldo "
+            "pendiente actual, monto vencido, conteo de facturas en el "
+            "periodo, conteo de facturas vencidas, dias promedio de "
+            "pago, y un listado de los ultimos 10 movimientos "
+            "(facturas + pagos) ordenados por fecha. REQUIERE "
+            "verificacion OTP previa. "
+            "Usala cuando el cliente pida '¿como estoy en cuenta?', "
+            "'mandame mi estado de cuenta', 'resumen financiero', "
+            "'¿cuanto debo en total?'. Para detalle factura por factura "
+            "usa get_customer_invoices."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {
+                    "type": "integer",
+                    "description": "ID del cliente en Odoo (res.partner.id)",
+                },
+                "days_back": {
+                    "type": "integer",
+                    "description": "Dias hacia atras a considerar (default 90, max 730).",
+                    "default": 90,
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "(Opcional) Canal para validar OTP. Default desde X-Channel.",
+                },
+            },
+            "required": ["partner_id"],
+        },
+    },
+    {
         "name": "lookup_sri",
         "description": (
             "Consultar datos de una persona o empresa en el SRI (Servicio de Rentas Internas) "
@@ -1885,6 +2058,13 @@ def _attach_display_text(
             format_quotation_detail,
             format_quotations_list,
         )
+        # ZETA iter 80 — invoice / payment / statement formatters.
+        from mcp_odoo.formatters.whatsapp_invoices import (
+            format_invoice_detail,
+            format_invoices_list,
+            format_payments_list,
+            format_statement_summary,
+        )
         if kind == "quotations":
             orders = result.get("orders") or []
             result["display_text"] = format_quotations_list(
@@ -1904,6 +2084,31 @@ def _attach_display_text(
         elif kind == "quotation_detail":
             if result.get("success") is not False:
                 result["display_text"] = format_quotation_detail(result)
+        elif kind == "invoices":
+            if result.get("success") is not False:
+                result["display_text"] = format_invoices_list(
+                    result.get("invoices") or [],
+                    total_amount=result.get("total_amount"),
+                    total_residual=result.get("total_residual"),
+                    state_filter=result.get("state_filter"),
+                )
+        elif kind == "invoice_detail":
+            if result.get("success") is not False:
+                result["display_text"] = format_invoice_detail(
+                    result.get("invoice") or {},
+                    lines=result.get("lines") or [],
+                    taxes=result.get("taxes") or [],
+                )
+        elif kind == "payments":
+            if result.get("success") is not False:
+                result["display_text"] = format_payments_list(result)
+        elif kind == "statement":
+            if result.get("success") is not False:
+                result["display_text"] = format_statement_summary(
+                    result.get("summary") or {},
+                    recent_movements=result.get("recent_movements") or [],
+                    period=result.get("period") or {},
+                )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "display_text formatter failed kind=%s channel=%s: %s",
@@ -3098,6 +3303,141 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         from mcp_odoo.tools.sales import odoo_check_balance
         result = odoo_check_balance(*creds, partner_id)
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    # ----- ZETA iter 80: invoice / payment / statement tools -------------
+    # All four require an OTP session because they expose financial data
+    # (invoice amounts, payment records, statement totals). The OTP guard
+    # follows the same pattern as ``check_balance`` above. ``channel`` is
+    # resolved with the iter78 priority chain (args → X-Channel header)
+    # so the LLM never has to pass it.
+    if tool_name in (
+        "get_customer_invoices",
+        "get_invoice_detail",
+        "get_customer_payments",
+        "get_customer_statement",
+    ):
+        from mcp_odoo.config import settings as _settings
+        _supa_url = _settings.supabase_url or "http://localhost:8000"
+        _supa_key = _settings.supabase_service_key or _settings.supabase_jwt_secret
+        _tenant = tc["tenant_id"]
+        _channel = (
+            args.get("channel")
+            or request.headers.get("x-channel")
+            or request.headers.get("X-Channel")
+            or "unknown"
+        ).strip().lower() or "unknown"
+
+        # OTP gate. For get_invoice_detail we don't have partner_id in args;
+        # resolve it from the invoice itself BEFORE the OTP check so we can
+        # gate against the right partner.
+        _otp_partner_id: int | None = None
+        if tool_name == "get_invoice_detail":
+            try:
+                _inv_id = int(args["invoice_id"])
+            except (KeyError, TypeError, ValueError):
+                return json.dumps({
+                    "success": False,
+                    "error_code": "invalid_invoice_id",
+                    "error_detail": "invoice_id requerido (entero).",
+                }, ensure_ascii=False)
+            try:
+                from mcp_odoo.tools.generic import odoo_read as _odoo_read
+                _rows = _odoo_read(
+                    *creds, "account.move", [_inv_id], ["partner_id"],
+                )
+                if _rows:
+                    _pid = _rows[0].get("partner_id")
+                    if isinstance(_pid, (list, tuple)) and _pid:
+                        _otp_partner_id = int(_pid[0])
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning(
+                    "get_invoice_detail: partner lookup failed inv=%s: %s",
+                    _inv_id, _exc,
+                )
+        else:
+            try:
+                _otp_partner_id = int(args["partner_id"])
+            except (KeyError, TypeError, ValueError):
+                return json.dumps({
+                    "success": False,
+                    "error_code": "invalid_partner_id",
+                    "error_detail": "partner_id requerido (entero).",
+                }, ensure_ascii=False)
+
+        # Cross-partner enforcement (defence in depth — orchestrator also
+        # checks). When the gateway pinned X-Expected-Partner-Id, the
+        # invoice/partner_id requested MUST match it.
+        if (
+            expected_partner_id
+            and _otp_partner_id
+            and expected_partner_id != _otp_partner_id
+        ):
+            return json.dumps({
+                "success": False,
+                "error_code": "cross_partner_invoice",
+                "error_detail": (
+                    "El recurso pertenece a otro cliente. Identifica al "
+                    "cliente correcto antes de consultar sus facturas."
+                ),
+            }, ensure_ascii=False)
+
+        if _otp_partner_id:
+            has_session = await _otp_check_session(
+                _supa_url, _supa_key, _tenant, _otp_partner_id, _channel,
+            )
+            if not has_session:
+                return (
+                    "VERIFICACION REQUERIDA: El cliente no ha verificado su identidad. "
+                    "Para mostrar facturas, pagos o estado de cuenta, primero usa "
+                    "request_otp para enviar un codigo al correo del cliente y luego "
+                    "verify_otp cuando te de el codigo."
+                )
+
+        from mcp_odoo.tools.invoices import (
+            odoo_get_customer_invoices,
+            odoo_get_customer_payments,
+            odoo_get_customer_statement,
+            odoo_get_invoice_detail,
+        )
+        if tool_name == "get_customer_invoices":
+            result = odoo_get_customer_invoices(
+                *creds,
+                partner_id=int(args["partner_id"]),
+                state=args.get("state", "all"),
+                limit=args.get("limit", 10),
+                year=args.get("year"),
+            )
+            result = _attach_display_text(result, request_channel, kind="invoices")
+            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+        if tool_name == "get_invoice_detail":
+            result = odoo_get_invoice_detail(
+                *creds,
+                invoice_id=int(args["invoice_id"]),
+                include_lines=bool(args.get("include_lines", True)),
+                include_taxes=bool(args.get("include_taxes", True)),
+            )
+            result = _attach_display_text(result, request_channel, kind="invoice_detail")
+            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+        if tool_name == "get_customer_payments":
+            result = odoo_get_customer_payments(
+                *creds,
+                partner_id=int(args["partner_id"]),
+                limit=args.get("limit", 10),
+                year=args.get("year"),
+            )
+            result = _attach_display_text(result, request_channel, kind="payments")
+            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+        if tool_name == "get_customer_statement":
+            result = odoo_get_customer_statement(
+                *creds,
+                partner_id=int(args["partner_id"]),
+                days_back=args.get("days_back", 90),
+            )
+            result = _attach_display_text(result, request_channel, kind="statement")
+            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "lookup_sri":
         return await _lookup_sri(args["cedula_ruc"])
