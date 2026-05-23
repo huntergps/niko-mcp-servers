@@ -3531,6 +3531,9 @@ def odoo_get_customer_credit_status(
     acepta_cheques = bool(partner.get("acepta_cheques"))
 
     # 2. Buscar facturas pendientes (account.move, Odoo 13)
+    # Iter 77b: Odoo 13 estándar usa `invoice_payment_state`, no
+    # `payment_state` (ese campo solo aparece en Odoo 14+). Fallback
+    # silencioso al campo correcto sin romper la tool.
     try:
         invoices = odoo_search(
             tenant_id, url, db, user, password,
@@ -3539,9 +3542,9 @@ def odoo_get_customer_credit_status(
                 ["partner_id", "child_of", partner_id],
                 ["type", "=", "out_invoice"],
                 ["state", "=", "posted"],
-                ["payment_state", "in", ["not_paid", "partial"]],
+                ["invoice_payment_state", "in", ["not_paid", "in_payment"]],
             ],
-            ["name", "invoice_date_due", "amount_total", "amount_residual", "payment_state"],
+            ["name", "invoice_date_due", "amount_total", "amount_residual", "invoice_payment_state"],
             limit=100,
             order="invoice_date_due asc",
         )
@@ -3571,7 +3574,7 @@ def odoo_get_customer_credit_status(
             "due_date": due_date,
             "amount_total": float(inv.get("amount_total", 0)),
             "amount_residual": residual,
-            "payment_state": inv.get("payment_state", ""),
+            "payment_state": inv.get("invoice_payment_state", ""),
             "overdue": is_overdue,
         })
 
