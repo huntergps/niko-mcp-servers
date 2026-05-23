@@ -3856,12 +3856,15 @@ async def _apply_pricelist_to_live(
     fresh_prices: dict[int, float] = {}
     if misses:
         try:
-            # Resolve template_ids → variant_ids (mantener mapping)
-            variant_rows = odoo_call_method(
+            # Resolve template_ids → variant_ids via odoo_search (no
+            # odoo_call_method search_read — signature confusion).
+            from mcp_odoo.tools.generic import odoo_search as _osr
+            variant_rows = _osr(
                 tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
-                "product.product", "search_read",
-                [[["product_tmpl_id", "in", misses], ["active", "=", True]]],
-                {"fields": ["id", "product_tmpl_id"], "limit": len(misses) * 4},
+                "product.product",
+                [["product_tmpl_id", "in", misses], ["active", "=", True]],
+                ["id", "product_tmpl_id"],
+                len(misses) * 4,
             )
             tmpl_to_variant: dict[int, int] = {}
             for vr in variant_rows or []:
