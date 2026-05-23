@@ -48,72 +48,15 @@ def _postgrest_headers(supabase_key: str, *, schema: str = "public",
 # ---------------------------------------------------------------------------
 # Ecuador cedula / RUC validation
 # ---------------------------------------------------------------------------
+# Implementation lives in ``mcp_odoo.tools.ec_id`` so it can be imported and
+# unit-tested in isolation. The thin wrappers below preserve the legacy names
+# used elsewhere in this module.
 
-def _validate_cedula_ecuador(cedula: str) -> tuple[bool, str]:
-    """Validate Ecuadorian cedula (10 digits, modulo-10 check)."""
-    if not cedula or not cedula.isdigit() or len(cedula) != 10:
-        return False, "La cedula debe tener exactamente 10 digitos numericos."
+from mcp_odoo.tools import ec_id as _ec_id
 
-    province = int(cedula[:2])
-    if province < 1 or province > 24:
-        return False, f"Codigo de provincia invalido: {province}."
-
-    third = int(cedula[2])
-    if third >= 6:
-        return False, "Tercer digito invalido para cedula de persona natural."
-
-    coefficients = [2, 1, 2, 1, 2, 1, 2, 1, 2]
-    total = 0
-    for i in range(9):
-        val = int(cedula[i]) * coefficients[i]
-        if val >= 10:
-            val -= 9
-        total += val
-
-    check = (10 - (total % 10)) % 10
-    if check != int(cedula[9]):
-        return False, "Digito verificador invalido."
-
-    return True, "OK"
-
-
-def _validate_ruc_ecuador(ruc: str) -> tuple[bool, str]:
-    """Validate Ecuadorian RUC (13 digits, starts with valid cedula or entity code)."""
-    if not ruc or not ruc.isdigit() or len(ruc) != 13:
-        return False, "El RUC debe tener exactamente 13 digitos numericos."
-
-    if not ruc.endswith("001"):
-        return False, "El RUC debe terminar en 001."
-
-    third = int(ruc[2])
-    if third < 6:
-        # Natural person RUC — validate cedula portion
-        valid, msg = _validate_cedula_ecuador(ruc[:10])
-        if not valid:
-            return False, f"RUC de persona natural invalido: {msg}"
-    elif third == 6:
-        # Public entity
-        pass
-    elif third == 9:
-        # Private entity (sociedad)
-        pass
-    else:
-        return False, f"Tercer digito invalido: {third}."
-
-    return True, "OK"
-
-
-def _validate_cedula_or_ruc(value: str) -> tuple[bool, str, str]:
-    """Validate and classify a cedula or RUC. Returns (valid, message, type)."""
-    clean = value.strip().replace("-", "").replace(" ", "")
-    if len(clean) == 10:
-        valid, msg = _validate_cedula_ecuador(clean)
-        return valid, msg, "cedula"
-    elif len(clean) == 13:
-        valid, msg = _validate_ruc_ecuador(clean)
-        return valid, msg, "ruc"
-    else:
-        return False, "Debe ser una cedula (10 digitos) o RUC (13 digitos).", "unknown"
+_validate_cedula_ecuador = _ec_id.validate_cedula_ecuador
+_validate_ruc_ecuador = _ec_id.validate_ruc_ecuador
+_validate_cedula_or_ruc = _ec_id.validate_cedula_or_ruc
 
 
 # ---------------------------------------------------------------------------
