@@ -51,10 +51,13 @@ _INVOICE_TYPE_LABEL_ES = {
 
 # Default fields read from ``account.move``. The list is small on purpose:
 # we surface only the columns the chat formatter / LLM actually needs.
+# Iter 81e: NO incluir 'number' aquí. Bug en módulo l10n_ec_sri
+# (account_invoice.py:186 _compute_number) hace `self.number = self.name`
+# sin iterar el recordset → falla con "Expected singleton" cuando se
+# leen >1 facturas a la vez. El field `name` ya es único y suficiente.
 _INVOICE_HEADER_FIELDS = [
     "id",
     "name",
-    "number",
     "type",
     "state",
     "partner_id",
@@ -336,7 +339,7 @@ def odoo_get_customer_invoices(
         invoices.append({
             "invoice_id": inv_id,
             "name": r.get("name") or "",
-            "number": r.get("number") or None,
+            # iter81e: `number` removido — bug en l10n_ec_sri compute.
             "invoice_date": str(r.get("invoice_date") or "") or None,
             "invoice_date_due": str(r.get("invoice_date_due") or "") or None,
             "days_overdue": d_over,
@@ -439,7 +442,7 @@ def odoo_get_invoice_detail(
     invoice: dict[str, Any] = {
         "invoice_id": inv_id_int,
         "name": r.get("name") or "",
-        "number": r.get("number") or None,
+        # iter81e: `number` removido — bug en l10n_ec_sri compute.
         "type": type_v,
         "type_label": _INVOICE_TYPE_LABEL_ES.get(type_v, type_v),
         "state": r.get("state") or "",
