@@ -717,6 +717,11 @@ def odoo_create_quotation(
 
     partner_name = order["partner_id"][1] if isinstance(order.get("partner_id"), list) else str(order.get("partner_id", ""))
 
+    # Iter88 2026-05-25: amount_total ya incluye IVA (pricelist
+    # tecno_l10n_ec_sri price_include=True). El campo "tax" se mantiene
+    # por compat pero ``note`` lo aclara al LLM para evitar el bug
+    # observado en megachat T21 (bot recitó "subtotal 152.95 + IVA
+    # 22.94 = 175.89" inventando matemáticas).
     result = {
         "success": True,
         "order_id": order_id,
@@ -725,9 +730,16 @@ def odoo_create_quotation(
         "partner": partner_name,
         "partner_id": partner_id,  # int — used by orchestrator security validator
         "lines": order_lines_detail,
-        "subtotal": order["amount_untaxed"],
-        "tax": order["amount_tax"],
         "total": order["amount_total"],
+        "subtotal_excl_iva": order["amount_untaxed"],
+        "iva_15_amount": order["amount_tax"],
+        "iva_already_included_in_total": True,
+        "note": (
+            "El campo 'total' YA incluye IVA 15%. NO sumes "
+            "'iva_15_amount' al 'total' — es desglose informativo, "
+            "no un cargo adicional. Al cliente muéstrale SOLO el "
+            "'total' con la frase 'incluye IVA 15%'."
+        ),
         "share_link": _absolutize_share_link(order.get("share_link_so"), url),
     }
     result["_card"] = _build_card(result)
@@ -1121,6 +1133,7 @@ def odoo_add_to_quotation(
         return {"success": False, "error_code": "read_after_write_failed", "error_detail": err, "order_id": order_id}
 
     partner_name = order["partner_id"][1] if isinstance(order.get("partner_id"), list) else ""
+    # Iter88: ver odoo_create_quotation — mismo fix de IVA-already-included.
     result = {
         "success": True,
         "order_id": order_id,
@@ -1129,9 +1142,14 @@ def odoo_add_to_quotation(
         "partner": partner_name,
         "lines": order_lines_detail,
         "lines_added": len(new_line_cmds),
-        "subtotal": order["amount_untaxed"],
-        "tax": order["amount_tax"],
         "total": order["amount_total"],
+        "subtotal_excl_iva": order["amount_untaxed"],
+        "iva_15_amount": order["amount_tax"],
+        "iva_already_included_in_total": True,
+        "note": (
+            "El 'total' YA incluye IVA 15%. NO sumes 'iva_15_amount' al "
+            "'total'. Al cliente muestra solo el 'total' con 'incluye IVA 15%'."
+        ),
         "share_link": _absolutize_share_link(order.get("share_link_so"), url),
     }
     result["_card"] = _build_card(result)
@@ -1209,6 +1227,10 @@ def odoo_get_active_quotation(
         "name": order["name"],
         "state": order["state"],
         "total": order["amount_total"],
+        "iva_already_included_in_total": True,
+        "note": (
+            "El 'total' YA incluye IVA 15%. No agregues impuesto adicional."
+        ),
         "lines": lines_detail,
     }
     _log_call("get_active_quotation", tenant_id, log_args, result, None, int((time.time() - started) * 1000))
@@ -1290,7 +1312,8 @@ def odoo_list_quotations(
             "state": r["state"],
             "state_label": _STATE_LABEL.get(r["state"], r["state"]),
             "total": r["amount_total"],
-            "subtotal": r["amount_untaxed"],
+            "subtotal_excl_iva": r["amount_untaxed"],
+            "iva_already_included_in_total": True,
             "date_order": r.get("date_order") or r.get("create_date"),
             "lines_count": len(line_ids),
             "share_link": _absolutize_share_link(r.get("share_link_so"), url),
