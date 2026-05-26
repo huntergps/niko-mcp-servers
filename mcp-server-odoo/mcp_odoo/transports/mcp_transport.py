@@ -1752,11 +1752,16 @@ MCP_TOOLS = [
     {
         "name": "get_company_settings",
         "description": (
-            "Obtener configuraciones de la empresa relevantes para ventas: "
-            "partner_id del consumidor final (RUC 9999999999999), "
-            "si se requieren datos del consumidor final (pedir_end_customer_data), "
-            "y el monto maximo SRI para facturas de consumidor final (sri_invoice_limit). "
-            "Llamar esto ANTES de crear una cotizacion de consumidor final."
+            "Settings INTERNOS del flow consumidor final SOLAMENTE — NO es "
+            "informacion publica de la empresa. Devuelve: partner_id del "
+            "consumidor final generico (RUC 9999999999999), si se requieren "
+            "datos del consumidor final (pedir_end_customer_data), monto "
+            "maximo SRI para facturas de consumidor final "
+            "(sri_invoice_limit). Llamar ANTES de create_quotation cuando el "
+            "cliente NO se identifica con cedula/RUC. "
+            "NO usar cuando el cliente pregunta direccion, telefono, "
+            "horarios, email, RUC fiscal, formas de pago, IVA o "
+            "actividad de la empresa — para esos datos usa get_business_info."
         ),
         "inputSchema": {
             "type": "object",
