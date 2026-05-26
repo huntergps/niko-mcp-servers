@@ -1838,12 +1838,20 @@ MCP_TOOLS = [
     {
         "name": "get_customer_purchase_history",
         "description": (
-            "Historial de compras de un cliente: ordenes pasadas, productos mas "
-            "comprados (top 10 por cantidad acumulada) y ticket promedio del "
-            "periodo. Considera solo ordenes confirmadas (state in sale|done) "
-            "en el anio indicado (default: anio actual). Devuelve orders_count, "
-            "total_amount, avg_ticket, top_products y recent_orders (las "
-            "ultimas N ordenes). "
+            "Historial de compras de un cliente. Distingue dos categorias:\n"
+            "  - top_products (FACTURADOS): productos que el cliente sí compró "
+            "    realmente (qty_invoiced > 0). Estos son los que aparecieron en "
+            "    facturas posted no canceladas (Odoo ya neta refunds). Usa este "
+            "    campo cuando digas al cliente 'compraste X'.\n"
+            "  - top_products_quoted_only: productos que estan en cotizaciones "
+            "    pero NO se han facturado. Cada item incluye `quotations` con "
+            "    los nombres VENTAxxx donde aparece. NUNCA digas 'compraste' "
+            "    sobre estos — di 'cotizaste' o 'tienes pendiente'.\n"
+            "  - total_amount (cotizado en sale.order) vs total_invoiced "
+            "    (facturado real) — siempre prefiere mostrar total_invoiced "
+            "    cuando hables de 'compraste'.\n"
+            "Considera solo ordenes confirmadas (state in sale|done) en el "
+            "anio indicado (default: actual). "
             "Usar cuando el vendedor pregunte 'que compra este cliente', "
             "'cuanto ha comprado este anio', 'cual es su ticket promedio', "
             "'que productos se lleva', o para preparar una visita comercial."
@@ -2310,23 +2318,60 @@ def _format_partner_profile_chat(
         return "\n".join(lines)
 
     # ── Actividad reciente ─────────────────────────────────────────
+    # Iter89 owner-audit 2026-05-25: distinguir COMPRADO (facturado) vs
+    # COTIZADO_NO_FACTURADO. Antes el bot decía "Top productos comprados"
+    # cuando solo había sale.order confirmadas — mentira al cliente.
     ph_data = (activity or {}).get("purchase_history") or {}
     if ph_data.get("success") and ph_data.get("orders_count"):
         lines.append("")
-        lines.append("🛒 *Historial de compras (este año):*")
         oc = ph_data.get("orders_count", 0)
-        total = ph_data.get("total_amount", 0)
+        total_quoted = ph_data.get("total_amount", 0)
+        total_invoiced = ph_data.get("total_invoiced", 0)
         avg = ph_data.get("avg_ticket", 0)
-        lines.append(f"• {oc} órdenes · USD {total:,.2f} total · ticket promedio USD {avg:,.2f}")
-        top = ph_data.get("top_products") or []
-        if top:
-            lines.append("• *Top productos comprados:*")
-            for p in top[:3]:
+        top_purchased = ph_data.get("top_products") or []
+        top_quoted_only = ph_data.get("top_products_quoted_only") or []
+
+        # Bloque "Compras facturadas" — solo si hay algo facturado real.
+        if top_purchased or total_invoiced > 0:
+            lines.append("🛒 *Compras facturadas (este año):*")
+            lines.append(
+                f"• USD {total_invoiced:,.2f} facturado "
+                f"(de USD {total_quoted:,.2f} cotizado en {oc} órdenes)"
+            )
+            if top_purchased:
+                lines.append("• *Productos que compraste (facturados):*")
+                for p in top_purchased[:3]:
+                    code = p.get("code") or ""
+                    pname = (p.get("name") or "").strip()
+                    qty = p.get("total_qty") or 0
+                    qty_q = p.get("total_qty_quoted") or qty
+                    tag = f" ({code})" if code else ""
+                    # Si la qty facturada < qty cotizada → mostrar parcial
+                    if qty_q > qty:
+                        lines.append(
+                            f"   ▪ {pname}{tag} — {qty:g} u (facturadas de {qty_q:g} cotizadas)"
+                        )
+                    else:
+                        lines.append(f"   ▪ {pname}{tag} — {qty:g} u")
+        else:
+            # No hay nada facturado todavía — honesto.
+            lines.append("🛒 *Aún no tienes compras facturadas este año.*")
+            lines.append(f"• Tienes {oc} cotizaciones por USD {total_quoted:,.2f}.")
+
+        # Bloque "Cotizados pero no facturados" — separado del de compras.
+        if top_quoted_only:
+            lines.append("")
+            lines.append("📋 *Productos que cotizaste pero aún no compraste:*")
+            for p in top_quoted_only[:3]:
                 code = p.get("code") or ""
                 pname = (p.get("name") or "").strip()
                 qty = p.get("total_qty") or 0
                 tag = f" ({code})" if code else ""
-                lines.append(f"   ▪ {pname}{tag} — {qty:g} u")
+                quots = p.get("quotations") or []
+                quot_tag = f" — cotización {quots[0]}" if quots else ""
+                if len(quots) > 1:
+                    quot_tag = f" — cotizaciones {', '.join(quots[:3])}"
+                lines.append(f"   ▪ {pname}{tag} — {qty:g} u{quot_tag}")
 
     rq_data = (activity or {}).get("recent_quotations") or {}
     if rq_data.get("success") and rq_data.get("orders"):

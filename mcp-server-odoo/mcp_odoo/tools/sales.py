@@ -5047,29 +5047,63 @@ def odoo_get_customer_purchase_history(
 
     orders = orders or []
     orders_count = len(orders)
-    total_amount = 0.0
+    total_amount = 0.0  # total cotizado (sale.order.amount_total)
     line_ids: list[int] = []
     for o in orders:
         total_amount += float(o.get("amount_total", 0) or 0)
         line_ids.extend(o.get("order_line") or [])
 
     avg_ticket = round(total_amount / orders_count, 2) if orders_count else 0.0
+    # Iter89 owner-audit 2026-05-25: agregar también `total_invoiced` =
+    # suma real facturada (untaxed_amount_invoiced de todas las líneas).
+    # Esto se computa dentro del bloque siguiente cuando leemos las
+    # líneas con qty_invoiced; arrancamos en 0 acá.
+    total_invoiced = 0.0
 
-    # 3. Top productos por cantidad — leer todas las lineas y agrupar
+    # 3. Top productos — separar PURCHASED (qty_invoiced > 0) vs
+    #    QUOTED_ONLY (cotizado pero no facturado).
+    #
+    # Lógica honesta para el cliente:
+    #   - Una sale.order.line con qty_invoiced > 0 representa COMPRA real
+    #     (Odoo ya neta refunds/cancelaciones automáticamente).
+    #   - Una línea con qty_invoiced < product_uom_qty tiene una parte que
+    #     todavía solo está cotizada (no facturada).
+    #   - El cliente debe ver claramente: "compraste X" vs "cotizaste Y".
+    #
+    # Audit 2026-05-25 (owner feedback): el bot decía "Top productos
+    # comprados" cuando solo había sale.order confirmadas. Owner aclaró:
+    # "que esté en sale.order.line no significa que lo haya comprado;
+    # si está en account.move.line confirmada, sí lo ha comprado". Usamos
+    # qty_invoiced (computado por Odoo sumando account.move.line linked
+    # menos refunds) como fuente de verdad de "compró".
     top_products: list[dict] = []
+    top_products_quoted_only: list[dict] = []
+    # Tracking de las orders donde aparece cada producto quoted_only —
+    # para que el formatter pueda decir "cotización VENTA xxx".
+    quoted_only_orders: dict[int, set[str]] = {}
     if line_ids:
         try:
             lines = odoo_read(
                 tenant_id, url, db, user, password,
                 "sale.order.line", line_ids,
-                ["product_id", "product_uom_qty", "price_subtotal"],
+                ["product_id", "product_uom_qty", "qty_invoiced",
+                 "price_subtotal", "untaxed_amount_invoiced", "order_id"],
             ) or []
         except Exception as e:
             # No bloquear: si falla, devolvemos sin top_products
             logger.warning("get_customer_purchase_history: lines read failed: %s", e)
             lines = []
 
-        agg: dict[int, dict] = {}
+        # Map order_id → order_name para tagging de quoted_only
+        order_name_by_id: dict[int, str] = {}
+        for o in orders:
+            try:
+                order_name_by_id[int(o.get("id"))] = o.get("name", "") or ""
+            except (TypeError, ValueError):
+                continue
+
+        agg_purchased: dict[int, dict] = {}
+        agg_quoted_only: dict[int, dict] = {}
         for ln in lines:
             pid_raw = ln.get("product_id")
             if isinstance(pid_raw, list) and pid_raw:
@@ -5080,23 +5114,62 @@ def odoo_get_customer_purchase_history(
                 pname = ""
             else:
                 continue
-            entry = agg.setdefault(pid, {
-                "product_id": pid, "name": pname,
-                "total_qty": 0.0, "total_amount": 0.0,
-            })
-            entry["total_qty"] += float(ln.get("product_uom_qty", 0) or 0)
-            entry["total_amount"] += float(ln.get("price_subtotal", 0) or 0)
 
-        # Resolver default_code para los top productos (max 10)
-        ranked = sorted(
-            agg.values(), key=lambda x: x["total_qty"], reverse=True,
+            qty_quoted = float(ln.get("product_uom_qty", 0) or 0)
+            qty_invoiced = float(ln.get("qty_invoiced", 0) or 0)
+            amount_invoiced = float(ln.get("untaxed_amount_invoiced", 0) or 0)
+            qty_pending = max(0.0, qty_quoted - qty_invoiced)
+            total_invoiced += amount_invoiced
+
+            if qty_invoiced > 0:
+                entry = agg_purchased.setdefault(pid, {
+                    "product_id": pid, "name": pname,
+                    "total_qty": 0.0, "total_amount": 0.0,
+                    "total_qty_quoted": 0.0,  # cuánto se cotizó para esa misma compra
+                })
+                entry["total_qty"] += qty_invoiced
+                entry["total_amount"] += amount_invoiced
+                entry["total_qty_quoted"] += qty_quoted
+
+            if qty_pending > 0:
+                entry_q = agg_quoted_only.setdefault(pid, {
+                    "product_id": pid, "name": pname,
+                    "total_qty": 0.0, "total_amount": 0.0,
+                })
+                entry_q["total_qty"] += qty_pending
+                # Usar precio_subtotal proporcional cuando parcialmente facturada
+                price_subtotal = float(ln.get("price_subtotal", 0) or 0)
+                if qty_quoted > 0:
+                    entry_q["total_amount"] += price_subtotal * (qty_pending / qty_quoted)
+                # Tagging de orden
+                oid_raw = ln.get("order_id")
+                if isinstance(oid_raw, list) and oid_raw:
+                    oname = order_name_by_id.get(oid_raw[0], "")
+                elif isinstance(oid_raw, int):
+                    oname = order_name_by_id.get(oid_raw, "")
+                else:
+                    oname = ""
+                if oname:
+                    quoted_only_orders.setdefault(pid, set()).add(oname)
+
+        # Resolver default_code para TODOS los productos involucrados (top 10 each).
+        ranked_purchased = sorted(
+            agg_purchased.values(), key=lambda x: x["total_qty"], reverse=True,
         )[:10]
-        if ranked:
+        ranked_quoted_only = sorted(
+            agg_quoted_only.values(), key=lambda x: x["total_qty"], reverse=True,
+        )[:10]
+        all_ranked_pids = list({
+            r["product_id"] for r in ranked_purchased + ranked_quoted_only
+        })
+        code_by_id: dict[int, str] = {}
+        name_by_id: dict[int, str] = {}
+        if all_ranked_pids:
             try:
                 prods = odoo_read(
                     tenant_id, url, db, user, password,
                     "product.product",
-                    [r["product_id"] for r in ranked],
+                    all_ranked_pids,
                     ["id", "default_code", "name"],
                 )
                 code_by_id = {
@@ -5107,18 +5180,30 @@ def odoo_get_customer_purchase_history(
                 }
             except Exception as e:
                 logger.warning("get_customer_purchase_history: product read failed: %s", e)
-                code_by_id, name_by_id = {}, {}
-        else:
-            code_by_id, name_by_id = {}, {}
 
-        for r in ranked:
+        for r in ranked_purchased:
             top_products.append({
                 "product_id": r["product_id"],
                 "code": code_by_id.get(r["product_id"], ""),
                 "name": name_by_id.get(r["product_id"], r["name"]),
-                "total_qty": round(r["total_qty"], 2),
-                "total_amount": round(r["total_amount"], 2),
+                "total_qty": round(r["total_qty"], 2),  # cantidad facturada (real)
+                "total_amount": round(r["total_amount"], 2),  # monto facturado neto
+                "total_qty_quoted": round(r["total_qty_quoted"], 2),  # contexto
             })
+
+        for r in ranked_quoted_only:
+            entry = {
+                "product_id": r["product_id"],
+                "code": code_by_id.get(r["product_id"], ""),
+                "name": name_by_id.get(r["product_id"], r["name"]),
+                "total_qty": round(r["total_qty"], 2),  # pendiente de facturar
+                "total_amount": round(r["total_amount"], 2),
+            }
+            # Lista de cotizaciones donde aparece (ej. ["VENTA123598", "VENTA123599"])
+            orders_for_pid = sorted(quoted_only_orders.get(r["product_id"], []))
+            if orders_for_pid:
+                entry["quotations"] = orders_for_pid[:5]
+            top_products_quoted_only.append(entry)
 
     # 4. Recent orders (limit_int mas recientes)
     recent_orders = []
@@ -5130,21 +5215,35 @@ def odoo_get_customer_purchase_history(
             "state": o.get("state", ""),
         })
 
+    # Iter89 owner-audit: response shape ampliado para distinguir
+    # 'comprado' (facturado) de 'cotizado pero no facturado'.
+    # Backward compat: el viejo `top_products` ahora SOLO contiene
+    # productos realmente facturados (no más mentir al cliente).
     result = {
         "success": True,
         "partner_id": partner_id,
         "partner_name": partner_name,
         "period": str(target_year),
         "orders_count": orders_count,
-        "total_amount": round(total_amount, 2),
+        "total_amount": round(total_amount, 2),      # total cotizado (sale.order.amount_total)
+        "total_invoiced": round(total_invoiced, 2),  # total facturado neto (sum untaxed_amount_invoiced)
         "avg_ticket": avg_ticket,
-        "top_products": top_products,
+        "top_products": top_products,                # FACTURADOS (qty_invoiced)
+        "top_products_quoted_only": top_products_quoted_only,  # NO facturados (qty - qty_invoiced)
         "recent_orders": recent_orders,
+        "note": (
+            "`top_products` son productos FACTURADOS (cliente sí los compró). "
+            "`top_products_quoted_only` son productos en cotizaciones que aún "
+            "NO se han facturado — NO afirmes que el cliente los compró."
+        ),
     }
     _log_call("get_customer_purchase_history", tenant_id, log_args,
               {"period": str(target_year),
                "orders_count": orders_count,
-               "total_amount": result["total_amount"]},
+               "total_amount": result["total_amount"],
+               "total_invoiced": result["total_invoiced"],
+               "purchased_count": len(top_products),
+               "quoted_only_count": len(top_products_quoted_only)},
               None, int((time.time() - started) * 1000))
     return result
 
