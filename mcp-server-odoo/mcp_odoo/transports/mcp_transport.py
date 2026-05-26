@@ -3397,7 +3397,8 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         email = (args.get("email") or "").strip()
         if not email:
             try:
-                rows = odoo_read(
+                from mcp_odoo.tools.generic import odoo_read as _odoo_read_otp
+                rows = _odoo_read_otp(
                     tc["tenant_id"], tc["url"], tc["db"], tc["user"], tc["password"],
                     "res.partner", [int(partner_id)], ["email", "email_normalized"],
                 )
