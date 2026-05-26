@@ -5875,6 +5875,7 @@ async def _rag_search(
                     _direct, top_k=1, offset=0,
                     price_min=price_min, price_max=price_max,
                     category_path=category_path,
+                    query=query,
                 )
         except Exception as _direct_exc:
             print(f"[RAG] code-direct lookup failed: {_direct_exc}", flush=True)
@@ -5891,6 +5892,7 @@ async def _rag_search(
             cached_ranked, top_k, offset,
             price_min=price_min, price_max=price_max,
             category_path=category_path,
+            query=query,
         )
 
     # Cache miss — fetch a wide candidate pool. We aim for at least
@@ -6128,6 +6130,7 @@ async def _rag_search(
         price_min=price_min, price_max=price_max,
         category_path=category_path,
         intent_kind=intent_kind,
+        query=query,
     )
 
 
@@ -6139,6 +6142,7 @@ def _format_ranked_page(
     price_max: float | None = None,
     category_path: str | None = None,
     intent_kind: str | None = None,
+    query: str | None = None,
 ) -> str:
     """Render a slice [offset:offset+top_k] of a pre-ranked product list.
 
@@ -6420,6 +6424,12 @@ def _format_ranked_page(
         "header": header,
         "rows": rows,
         "footer": footer,
+        # Iter 89: echo the original query back so the orchestrator's
+        # last_list extractor (niko/agent/orchestrator.py:_extract_
+        # last_list_from_messages) can label items by category when a
+        # turn issues multiple search_products calls (e.g. "dame
+        # teclado, mouse y memoria").
+        "query": query or "",
         "intent_kind": intent_kind,  # informational; LLM may use it for copy
         "filter_applied": {
             "price_min": price_min,
