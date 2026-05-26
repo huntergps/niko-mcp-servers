@@ -265,6 +265,74 @@ async def _otp_verify(supabase_url: str, supabase_key: str, tenant_id: str,
         return False, f"Codigo incorrecto. Quedan {remaining} intento(s)."
 
 
+def _assert_quotation_editable_by_order(
+    creds: tuple, order_id: int,
+) -> dict | None:
+    """Return None when the target sale.order is editable (draft/sent),
+    else a dict-shaped error envelope the dispatch can return verbatim.
+
+    Iter 89 (owner audit 2026-05-25 trace bb582877): the orchestrator
+    persisted approved/sale/done/cancel quotes as "active", and the LLM
+    happily called add_quotation_line on a 3-day-old VENTA123456 that
+    was already approved in Odoo. add/update/remove now refuses to
+    touch a locked sale.order BEFORE we hit Odoo's xmlrpc write so the
+    customer sees a useful error instead of an opaque server failure.
+    """
+    try:
+        from mcp_odoo.tools.generic import odoo_read
+        rows = odoo_read(*creds, "sale.order", [int(order_id)], ["name", "state"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("editable check: odoo_read failed id=%s: %s", order_id, exc)
+        return None  # let the underlying tool report the real failure
+    if not rows:
+        return {
+            "success": False,
+            "error_code": "quote_not_found",
+            "error_detail": f"sale.order id={order_id} no existe.",
+        }
+    state = (rows[0].get("state") or "").strip().lower()
+    name = rows[0].get("name") or f"VENTA{order_id}"
+    if state in {"draft", "sent"}:
+        return None
+    return {
+        "success": False,
+        "error_code": "quote_locked",
+        "error_detail": (
+            f"La cotización {name} (id={order_id}) está en estado "
+            f"'{state}' y NO se puede modificar. Si el cliente quiere "
+            f"agregar/cambiar productos, ofrece duplicarla con "
+            f"duplicate_quotation o crear una nueva con create_quotation."
+        ),
+        "order_id": int(order_id),
+        "name": name,
+        "state": state,
+    }
+
+
+def _assert_quotation_editable_by_line(
+    creds: tuple, line_id: int,
+) -> dict | None:
+    """Same as _by_order, but resolves the order from a line_id first."""
+    try:
+        from mcp_odoo.tools.generic import odoo_read
+        line_rows = odoo_read(
+            *creds, "sale.order.line", [int(line_id)], ["order_id"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("editable check by_line: odoo_read failed: %s", exc)
+        return None
+    if not line_rows:
+        return {
+            "success": False,
+            "error_code": "line_not_found",
+            "error_detail": f"sale.order.line id={line_id} no existe.",
+        }
+    order_link = line_rows[0].get("order_id")
+    if isinstance(order_link, (list, tuple)) and order_link:
+        return _assert_quotation_editable_by_order(creds, int(order_link[0]))
+    return None
+
+
 async def _otp_check_session(supabase_url: str, supabase_key: str, tenant_id: str,
                               partner_id: int, channel: str) -> bool:
     """Check if there is a valid verified session (24h window)."""
@@ -3093,6 +3161,9 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
     # --- Sprint C: edition tools (full sale.order coverage) ---
 
     if tool_name == "update_quotation_line":
+        _guard = _assert_quotation_editable_by_line(creds, int(args["line_id"]))
+        if _guard is not None:
+            return json.dumps(_guard, indent=2, ensure_ascii=False)
         from mcp_odoo.tools.sales import odoo_update_quotation_line
         result = odoo_update_quotation_line(
             *creds,
@@ -3108,6 +3179,9 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "remove_quotation_line":
+        _guard = _assert_quotation_editable_by_line(creds, int(args["line_id"]))
+        if _guard is not None:
+            return json.dumps(_guard, indent=2, ensure_ascii=False)
         from mcp_odoo.tools.sales import odoo_remove_quotation_line
         result = odoo_remove_quotation_line(
             *creds,
@@ -3118,6 +3192,9 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "change_quotation_customer":
+        _guard = _assert_quotation_editable_by_order(creds, int(args["order_id"]))
+        if _guard is not None:
+            return json.dumps(_guard, indent=2, ensure_ascii=False)
         from mcp_odoo.tools.sales import odoo_change_quotation_customer
         result = odoo_change_quotation_customer(
             *creds,
@@ -3132,6 +3209,9 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "apply_global_discount":
+        _guard = _assert_quotation_editable_by_order(creds, int(args["order_id"]))
+        if _guard is not None:
+            return json.dumps(_guard, indent=2, ensure_ascii=False)
         from mcp_odoo.tools.sales import odoo_apply_global_discount
         result = odoo_apply_global_discount(
             *creds,
@@ -3143,6 +3223,9 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "set_quotation_header":
+        _guard = _assert_quotation_editable_by_order(creds, int(args["order_id"]))
+        if _guard is not None:
+            return json.dumps(_guard, indent=2, ensure_ascii=False)
         from mcp_odoo.tools.sales import odoo_set_quotation_header
         # Forward only known header fields, drop everything else.
         header_fields = (
@@ -3160,6 +3243,9 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     if tool_name == "add_quotation_line":
+        _guard = _assert_quotation_editable_by_order(creds, int(args["order_id"]))
+        if _guard is not None:
+            return json.dumps(_guard, indent=2, ensure_ascii=False)
         from mcp_odoo.tools.sales import odoo_add_quotation_line
         result = odoo_add_quotation_line(
             *creds,
