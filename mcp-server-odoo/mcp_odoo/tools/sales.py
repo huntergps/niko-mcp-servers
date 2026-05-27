@@ -30,6 +30,40 @@ logger = logging.getLogger("mcp_odoo.sales")
 _NAME_SUFFIX_RANGE = (110_000, 130_000)
 
 
+# Tenant 2026-05-27 (Ferretería Solís csolish): el módulo de Tecnosmart
+# que añade ``share_link_so`` a sale.order NO está instalado en csolish.
+# Filtramos el campo si no existe en el target Odoo. Cache por tenant +
+# url para no introspect cada read.
+_FIELD_EXISTS_CACHE: dict[tuple[str, str, str], set[str]] = {}
+
+
+def _odoo_fields_present(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    model: str, candidate_fields: list[str],
+) -> list[str]:
+    """Return only the fields that actually exist on ``model`` in the
+    target Odoo. Cached per (tenant, url, model). Fail-open: on any
+    introspection error return ``candidate_fields`` as-is (the caller's
+    read will fail loudly, which is preferable to silently dropping).
+    """
+    key = (tenant_id, url, model)
+    cached = _FIELD_EXISTS_CACHE.get(key)
+    if cached is None:
+        from mcp_odoo.tools.generic import odoo_call_method
+        try:
+            fields_info = odoo_call_method(
+                tenant_id, url, db, user, password,
+                model, "fields_get", [], {"attributes": ["string"]},
+            )
+            cached = set(fields_info.keys()) if isinstance(fields_info, dict) else set()
+        except Exception:
+            cached = set()
+        _FIELD_EXISTS_CACHE[key] = cached
+    if not cached:
+        return candidate_fields  # fail-open
+    return [f for f in candidate_fields if f in cached]
+
+
 def _absolutize_share_link(share_link: str | None, base_url: str | None) -> str:
     """Return an absolute URL for an Odoo ``share_link_so`` value.
 
@@ -672,11 +706,14 @@ def odoo_create_quotation(
 
     # Read-after-write: order header
     try:
-        orders = odoo_read(
-            tenant_id, url, db, user, password,
-            "sale.order", [order_id],
+        _fields_so = _odoo_fields_present(
+            tenant_id, url, db, user, password, "sale.order",
             ["name", "state", "partner_id", "amount_untaxed", "amount_tax",
              "amount_total", "order_line", "date_order", "share_link_so"],
+        )
+        orders = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id], _fields_so,
         )
     except Exception as e:
         err = f"Order created (id={order_id}) but read-after-write failed: {e}"
@@ -1103,11 +1140,14 @@ def odoo_add_to_quotation(
 
     # Read-after-write the updated order
     try:
-        orders = odoo_read(
-            tenant_id, url, db, user, password,
-            "sale.order", [order_id],
+        _fields_so = _odoo_fields_present(
+            tenant_id, url, db, user, password, "sale.order",
             ["name", "state", "partner_id", "amount_untaxed", "amount_tax",
              "amount_total", "order_line", "share_link_so"],
+        )
+        orders = odoo_read(
+            tenant_id, url, db, user, password,
+            "sale.order", [order_id], _fields_so,
         )
         order = orders[0]
         line_ids = order.get("order_line", [])
