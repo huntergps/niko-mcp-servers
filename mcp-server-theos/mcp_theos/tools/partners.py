@@ -96,12 +96,28 @@ async def identify_customer(
             merged["has_erp_cli"] = False
         matches.append(merged)
 
-    return {
+    # The niko orchestrator persists the partner_id by scanning the
+    # ToolMessage payload for ``partner_id`` / ``id`` at the top level
+    # (mcp-odoo's shape). Mirror that contract so the LLM doesn't have
+    # to re-identify next turn (which would also be blocked by the
+    # ``tried_identify_before`` loop-breaker that removes
+    # identify_customer once it has been called this session).
+    out: dict[str, Any] = {
         "success": True,
+        "found": bool(matches),
         "lookup": used,
         "count": len(matches),
         "matches": matches,
     }
+    if len(matches) == 1:
+        m = matches[0]
+        out["partner_id"] = m.get("ID")
+        out["id"] = m.get("ID")
+        out["name"] = m.get("NAME") or ""
+        out["vat"] = m.get("CIF") or ""
+        out["email"] = m.get("MAIL_PRINCIPAL") or ""
+        out["has_erp_cli"] = m.get("has_erp_cli", False)
+    return out
 
 
 async def create_partner(
@@ -172,7 +188,15 @@ async def create_partner(
 
     return {
         "success": True,
+        "found": True,
+        # ``partner_id`` / ``id`` at the top level so the niko
+        # orchestrator persists the new partner immediately (see
+        # _extract_partner_id_from_messages in orchestrator.py).
         "partner_id": ent_id,
+        "id": ent_id,
+        "name": (ent_row.get("NAME") or name or "").strip(),
+        "vat": (ent_row.get("CIF") or cif or "").strip(),
+        "email": (ent_row.get("MAIL_PRINCIPAL") or email or "").strip(),
         "ent": ent_row,
         "ent_erp_cli": cli_row,
     }
