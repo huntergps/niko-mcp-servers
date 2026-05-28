@@ -174,8 +174,46 @@ async def _read_ent_erp_cli(client: VelneoClient, ent_id: int) -> dict[str, Any]
     return resp.rows[0] if resp.rows else None
 
 
+def _partner_disambig_flags(row: dict[str, Any]) -> list[str]:
+    """Compute short disambiguation flags for a partner row (A7).
+
+    Surfaces the differences that matter when 2+ matches come back
+    from a fuzzy search — the LLM should highlight these to the user
+    so they pick the right customer ("encontré dos con nombre similar:
+    el primero está marcado sin crédito y debe $300, el segundo está
+    al día — ¿cuál?").
+    """
+    flags: list[str] = []
+    if row.get("OFF"):
+        flags.append("inactive")  # row logically deleted
+    if not (row.get("MAIL_PRINCIPAL") or "").strip():
+        flags.append("no_email")
+    if not (row.get("TFN_PRI") or "").strip():
+        flags.append("no_phone")
+    if row.get("SIN_CREDITO"):
+        flags.append("sin_credito")
+    if row.get("NO_VENDER"):
+        flags.append("no_vender")
+    try:
+        if float(row.get("SALDO") or 0) > 0.01:
+            flags.append("has_saldo")
+    except (TypeError, ValueError):
+        pass
+    try:
+        if int(row.get("DIAS_VENCIDOS") or 0) > 0:
+            flags.append("dias_vencidos")
+    except (TypeError, ValueError):
+        pass
+    try:
+        if int(row.get("FACTVENCIDAS") or 0) > 0:
+            flags.append("facturas_vencidas")
+    except (TypeError, ValueError):
+        pass
+    return flags
+
+
 async def _enrich_row(client: VelneoClient, row: dict[str, Any]) -> dict[str, Any]:
-    """Merge an ENT row with its ENT_ERP_CLI extension."""
+    """Merge an ENT row with its ENT_ERP_CLI extension + tag disambig flags."""
     ent_id = row.get("ID")
     ext = await _read_ent_erp_cli(client, ent_id) if ent_id is not None else None
     merged = dict(row)
@@ -187,6 +225,7 @@ async def _enrich_row(client: VelneoClient, row: dict[str, Any]) -> dict[str, An
         merged["has_erp_cli"] = True
     else:
         merged["has_erp_cli"] = False
+    merged["_flags"] = _partner_disambig_flags(merged)
     return merged
 
 

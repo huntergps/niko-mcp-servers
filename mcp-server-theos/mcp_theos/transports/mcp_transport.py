@@ -467,6 +467,110 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "find_invoice",
+        "description": (
+            "Flexible invoice lookup. Pass ONE of: ``invoice_id`` "
+            "(VENT_FACT_VENT.ID), ``nro_fac`` (SRI document number "
+            "\"001-001-565825\"), or free-text ``query``. The query "
+            "path auto-detects SRI shape, then numeric secuencia, then "
+            "falls back to ``filter[words]=`` over NAME so the same "
+            "tool can find by partial customer name, partial SRI "
+            "access key, or REFERENCIA. Each invoice row comes back "
+            "with the derived NRO_FAC + the SRI/Datil block "
+            "(LAST_STATUS, VCACCESOSRI, AUTORIZACION, KEY)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": "SRI number, secuencia, or free text"},
+                "invoice_id": {"type": "integer"},
+                "nro_fac": {"type": "string",
+                            "description": "canonical \"001-001-565825\""},
+                "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 50},
+            },
+        },
+    },
+    {
+        "name": "list_documents_window",
+        "description": (
+            "Multi-document cross-section in a date window. Pulls in "
+            "parallel a customer's recent activity across types: "
+            "invoices, orders, debts, payments, credit notes (NC), "
+            "withholdings (RE). Filter by ``customer_query`` "
+            "(WORDS index — \"klein\" matches the customer's invoices "
+            "via the denormalized NAME), or ``client_id``, or both. "
+            "Pass ``types=[...]`` to narrow the doc types pulled. "
+            "Returns ``{documents: {invoices: {count, items}, ...}}``."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_query": {"type": "string"},
+                "client_id": {"type": "integer"},
+                "date_from": {"type": "string"},
+                "date_to": {"type": "string"},
+                "types": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["invoices", "orders", "debts",
+                                 "payments", "credit_notes", "withholdings"],
+                    },
+                },
+                "limit_per_type": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
+            },
+        },
+    },
+    {
+        "name": "search_by_amount",
+        "description": (
+            "Find docs whose TOTAL (invoices/credit notes) or VALOR "
+            "(payments) sits in ``[amount_min, amount_max]``. Velneo "
+            "has no range operator; we apply the amount filter "
+            "in-memory after pulling a wide window. PASS a "
+            "``customer_query`` or a date window — without narrowing, "
+            "the result is limited to the first page of the table and "
+            "may miss your target. ``doc_type`` is one of "
+            "\"invoices\", \"payments\", \"credit_notes\"."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "doc_type": {"type": "string",
+                              "enum": ["invoices", "payments", "credit_notes"],
+                              "default": "invoices"},
+                "amount_min": {"type": "number"},
+                "amount_max": {"type": "number"},
+                "customer_query": {"type": "string"},
+                "date_from": {"type": "string"},
+                "date_to": {"type": "string"},
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+            },
+        },
+    },
+    {
+        "name": "search_invoice_lines_by_product",
+        "description": (
+            "INV_MOVIMIENTOS rows belonging to a sales invoice "
+            "(VENT_FACT_VENT != 0) and a specific PRODUCTOS.ID. Used "
+            "for return / claim research: \"en qué facturas vendimos "
+            "este producto\". Each line carries its parent "
+            "VENT_FACT_VENT id so the agent can chain "
+            "``get_invoice_detail`` to enrich."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "product_id": {"type": "integer"},
+                "date_from": {"type": "string"},
+                "date_to": {"type": "string"},
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+            },
+            "required": ["product_id"],
+        },
+    },
+    {
         "name": "list_invoices_pending_dispatch",
         "description": (
             "Facturas con líneas pendientes de despacho "
@@ -637,6 +741,10 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "list_recent_invoices": ("admin_ops.list_recent_invoices", admin_ops.list_recent_invoices),
     "get_invoice_detail": ("admin_ops.get_invoice_detail", admin_ops.get_invoice_detail),
     "list_invoices_pending_dispatch": ("admin_ops.list_invoices_pending_dispatch", admin_ops.list_invoices_pending_dispatch),
+    "find_invoice": ("admin_ops.find_invoice", admin_ops.find_invoice),
+    "list_documents_window": ("admin_ops.list_documents_window", admin_ops.list_documents_window),
+    "search_by_amount": ("admin_ops.search_by_amount", admin_ops.search_by_amount),
+    "search_invoice_lines_by_product": ("admin_ops.search_invoice_lines_by_product", admin_ops.search_invoice_lines_by_product),
     "list_recent_stock_movements": ("admin_ops.list_recent_stock_movements", admin_ops.list_recent_stock_movements),
     "check_stock": ("products.check_stock", products.check_stock),
     "search_velneo": ("admin_search.search_velneo", admin_search.search_velneo),

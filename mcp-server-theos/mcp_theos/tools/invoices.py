@@ -4,6 +4,7 @@ customer statement (VENT_DEUD_CLIE list + per-row PDF rendering).
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -66,6 +67,51 @@ def build_sri_number(serie: Any, secuencia: Any, *, pad_secuencia: int = 9) -> s
     except (TypeError, ValueError):
         return s
     return f"{s}-{n:0{pad_secuencia}d}" if s else f"{n:0{pad_secuencia}d}"
+
+
+def parse_sri_number(value: str) -> dict[str, Any] | None:
+    """Decompose an SRI document number ("001-001-565825") into parts.
+
+    Accepts the canonical Ecuadorian SRI format:
+
+        establecimiento-puntoemision-secuencia
+        (3 digits)-(3 digits)-(N digits, usually 9)
+
+    Returns ``None`` if the input does not match. Successful return:
+
+        {
+            "establecimiento": "001",
+            "puntoemision":    "001",
+            "secuencia":       "565825",
+            "secuencia_int":   565825,
+            "serie":           "001-001",
+            "padded":          "001-001-000565825",  # SRI canonical 9-digit
+        }
+    """
+    if not value:
+        return None
+    s = str(value).strip()
+    # Tolerate whitespace and accidental extra dashes/spaces.
+    parts = [p for p in re.split(r"[-\s]+", s) if p]
+    if len(parts) != 3:
+        return None
+    est, pe, seq = parts
+    if not (est.isdigit() and pe.isdigit() and seq.isdigit()):
+        return None
+    if len(est) > 3 or len(pe) > 3:
+        return None
+    try:
+        seq_int = int(seq)
+    except ValueError:
+        return None
+    return {
+        "establecimiento": est.zfill(3),
+        "puntoemision":    pe.zfill(3),
+        "secuencia":       seq,
+        "secuencia_int":   seq_int,
+        "serie":           f"{est.zfill(3)}-{pe.zfill(3)}",
+        "padded":          f"{est.zfill(3)}-{pe.zfill(3)}-{seq_int:09d}",
+    }
 
 _DEUD_FIELDS = [
     "ID", "NAME", "FECHA", "VENCIMIENTO",

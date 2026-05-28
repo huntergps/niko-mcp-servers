@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mcp_theos.tools.invoices import build_sri_number
+from mcp_theos.tools.invoices import build_sri_number, parse_sri_number
 from mcp_theos.velneo_http import VelneoClient, VelneoError, call_proceso_or_message
 
 # ---------------------------------------------------------------------------
@@ -863,3 +863,409 @@ async def list_recent_stock_movements(
 # denormalized EXS_BOD1..12 / INV_BODEGA1..12 columns on the PRODUCTOS
 # master row — the Theos-native pattern). Audit-trail forensics on
 # stock movements stays here under ``list_recent_stock_movements``.
+
+
+# ---------------------------------------------------------------------------
+# B1 find_invoice — flexible lookup by ID, SRI number, or text token.
+# ---------------------------------------------------------------------------
+
+
+async def find_invoice(
+    client: VelneoClient,
+    *,
+    query: str | None = None,
+    invoice_id: int | None = None,
+    nro_fac: str | None = None,
+    limit: int = 5,
+) -> dict[str, Any]:
+    """Locate one or more invoices from whatever the user typed.
+
+    Resolution paths (first non-empty wins):
+
+    * ``invoice_id``      → direct ``GET VENT_FACT_VENT/{id}``
+    * ``nro_fac`` (SRI)   → parse "001-001-565825" → SERIE + SECUENCIA
+                            filter (canonical SRI lookup)
+    * ``query``           → tries in order:
+        - looks like SRI ("001-001-565825") → SRI parse path
+        - all-digits, ≤ 9 chars → treat as SECUENCIA
+        - otherwise → ``filter[words]=<query>`` (Velneo WORDS index
+          over NAME — catches "kleinturs", "klein", an SRI access
+          key fragment, or a partial REFERENCIA)
+
+    Returns ``{success, count, invoices: [...]}``. Always sets
+    ``NRO_FAC`` per row via :func:`build_sri_number` so the caller
+    sees the SRI document number regardless of which path matched.
+    """
+    if not (query or invoice_id or nro_fac):
+        return {"success": False, "error": "query, invoice_id or nro_fac required"}
+
+    rows: list[dict[str, Any]] = []
+    used: dict[str, Any] = {}
+
+    # Path 1 — direct by ID.
+    if invoice_id:
+        used["invoice_id"] = invoice_id
+        try:
+            r = await client.get(
+                "VENT_FACT_VENT", record_id=int(invoice_id),
+                fields=_FACT_FIELDS,
+            )
+            rows = r.rows
+        except VelneoError as exc:
+            return _err(exc)
+
+    # Path 2 — explicit SRI number.
+    if not rows and nro_fac:
+        parsed = parse_sri_number(nro_fac)
+        if parsed:
+            used["nro_fac"] = parsed["padded"]
+            try:
+                r = await client.get(
+                    "VENT_FACT_VENT",
+                    params={"SERIE": parsed["serie"],
+                            "SECUENCIA": parsed["secuencia_int"],
+                            "pagesize": limit},
+                    fields=_FACT_FIELDS,
+                )
+                rows = r.rows
+            except VelneoError as exc:
+                return _err(exc)
+        else:
+            used["nro_fac_raw"] = nro_fac
+
+    # Path 3 — free-text query.
+    if not rows and query:
+        q = query.strip()
+        parsed = parse_sri_number(q)
+        if parsed:
+            used["query_parsed_as_sri"] = parsed["padded"]
+            try:
+                r = await client.get(
+                    "VENT_FACT_VENT",
+                    params={"SERIE": parsed["serie"],
+                            "SECUENCIA": parsed["secuencia_int"],
+                            "pagesize": limit},
+                    fields=_FACT_FIELDS,
+                )
+                rows = r.rows
+            except VelneoError as exc:
+                return _err(exc)
+        elif q.isdigit() and len(q) <= 9:
+            used["query_as_secuencia"] = int(q)
+            try:
+                r = await client.get(
+                    "VENT_FACT_VENT",
+                    params={"SECUENCIA": int(q), "pagesize": limit},
+                    fields=_FACT_FIELDS,
+                )
+                rows = r.rows
+            except VelneoError as exc:
+                return _err(exc)
+        else:
+            used["query_as_words"] = q
+            try:
+                r = await client.get(
+                    "VENT_FACT_VENT",
+                    params={"words": q, "pagesize": limit, "sort": "-FECHA"},
+                    fields=_FACT_FIELDS,
+                )
+                rows = r.rows
+            except VelneoError as exc:
+                return _err(exc)
+
+    invoices = [_enrich_fact_row(r) for r in rows[:limit]]
+
+    return {
+        "success": True,
+        "lookup": used,
+        "count": len(invoices),
+        "invoices": invoices,
+    }
+
+
+# ---------------------------------------------------------------------------
+# B3 list_documents_window — multi-doc-type window for a customer.
+# ---------------------------------------------------------------------------
+
+
+# Stable projection per document table — keeps only columns the API
+# key allows AND that the LLM actually uses to summarize.
+_NC_FIELDS = [
+    "ID", "NAME", "FECHA",
+    "SERIE", "SECUENCIA", "ESTABLECIMIENTO", "PUNTOEMISION",
+    "RAZONSOCIALCOMPRADOR", "SRI_IDENTIFICACION",
+    "TOTAL", "PAGADO", "SALDO",
+    "VENDEDOR", "OFF", "OFF_MOTIVO",
+    "TIENE_ELECTRONICA", "LAST_STATUS", "VCACCESOSRI", "AUTORIZACION",
+]
+
+_COMP_RET_FIELDS = [
+    "ID", "NAME", "FECHA", "FECHA_RET",
+    "SERIE", "SECUENCIA",
+    "TOTAL",
+    "VENDEDOR", "OFF", "OFF_MOTIVO",
+]
+
+
+def _doc_summary(doc_type: str) -> dict[str, Any]:
+    """Empty summary scaffold per document type."""
+    return {"type": doc_type, "count": 0, "items": []}
+
+
+async def list_documents_window(
+    client: VelneoClient,
+    *,
+    customer_query: str | None = None,
+    client_id: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    types: list[str] | None = None,
+    limit_per_type: int = 20,
+) -> dict[str, Any]:
+    """Cross-document listing in a date window.
+
+    Pulls (in parallel) the recent activity of a customer across all
+    document types they can have. Defaults to all known types; pass
+    ``types`` to narrow:
+
+      ``"invoices"``     → VENT_FACT_VENT
+      ``"orders"``       → VENT_ORDEN_VENTA
+      ``"debts"``        → VENT_DEUD_CLIE
+      ``"payments"``     → VENT_COBR_DEUD
+      ``"credit_notes"`` → VENT_NOTA_CRED
+      ``"withholdings"`` → COMP_RETENCIONES (compra)
+
+    Either ``customer_query`` (free-text WORDS) or ``client_id``
+    narrows by partner; without either, the window is global.
+    """
+    import asyncio
+
+    nom = (customer_query or "").strip() or None
+    df = _norm_velneo_date(date_from)
+    dt = _norm_velneo_date(date_to)
+    df_short = df or ""
+    dt_short = dt or ""
+    want = set(types or
+               ["invoices", "orders", "debts", "payments",
+                "credit_notes", "withholdings"])
+    page = min(max(limit_per_type * 2, 20), 200)
+
+    def _params(extra: dict[str, Any]) -> dict[str, Any]:
+        p: dict[str, Any] = {"pagesize": page, "sort": "-FECHA"}
+        if client_id is not None:
+            p["ENT_ERP_CLI"] = client_id
+        if nom:
+            p["words"] = nom
+        p.update(extra)
+        return p
+
+    async def _pull(label: str, table: str, fields: list[str]) -> tuple[str, list[dict[str, Any]]]:
+        try:
+            r = await client.get(table, params=_params({}), fields=fields)
+        except VelneoError as exc:
+            return label, [{"_error": f"velneo {exc.status}: {exc.message}"}]
+        rows = r.rows
+        # In-memory date narrowing — REST cannot do > / < operators.
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            f = _short_date(row.get("FECHA"))
+            if df_short and f and f < df_short:
+                continue
+            if dt_short and f and f > dt_short:
+                continue
+            if label in ("invoices", "credit_notes"):
+                _enrich_fact_row(row)
+            out.append(row)
+            if len(out) >= limit_per_type:
+                break
+        return label, out
+
+    plan = []
+    if "invoices" in want:
+        plan.append(_pull("invoices", "VENT_FACT_VENT", _FACT_FIELDS))
+    if "orders" in want:
+        plan.append(_pull("orders", "VENT_ORDEN_VENTA", _ORDEN_FIELDS))
+    if "debts" in want:
+        plan.append(_pull("debts", "VENT_DEUD_CLIE", _DEUD_FIELDS))
+    if "payments" in want:
+        plan.append(_pull("payments", "VENT_COBR_DEUD", _COBR_FIELDS))
+    if "credit_notes" in want:
+        plan.append(_pull("credit_notes", "VENT_NOTA_CRED", _NC_FIELDS))
+    if "withholdings" in want:
+        plan.append(_pull("withholdings", "COMP_RETENCIONES", _COMP_RET_FIELDS))
+
+    results = await asyncio.gather(*plan)
+
+    by_type: dict[str, dict[str, Any]] = {}
+    for label, rows in results:
+        by_type[label] = {
+            "type": label,
+            "count": len(rows),
+            "items": rows,
+        }
+
+    return {
+        "success": True,
+        "filter": {
+            "customer_query": nom,
+            "client_id": client_id,
+            "date_from": df, "date_to": dt,
+            "types": sorted(want),
+        },
+        "documents": by_type,
+        "total_count": sum(v["count"] for v in by_type.values()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# B4 search_by_amount — filter invoices / payments by amount range.
+# ---------------------------------------------------------------------------
+
+
+async def search_by_amount(
+    client: VelneoClient,
+    *,
+    doc_type: str = "invoices",
+    amount_min: float | None = None,
+    amount_max: float | None = None,
+    customer_query: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Find docs whose TOTAL (or VALOR, for cobros) is in ``[min, max]``.
+
+    Velneo's REST has no range operator on numeric columns, so we pull
+    a wide window (filter by NOM / fechas) and apply the amount filter
+    in memory. Use a NOM filter or a narrow date window or both — a
+    naked search without either pulls only the first page of the table
+    and is unlikely to find what the operator is looking for.
+
+    ``doc_type``: "invoices" | "payments" | "credit_notes".
+    """
+    nom = (customer_query or "").strip() or None
+    df = _norm_velneo_date(date_from)
+    dt = _norm_velneo_date(date_to)
+
+    table, amt_field, fields = {
+        "invoices":     ("VENT_FACT_VENT", "TOTAL",   _FACT_FIELDS),
+        "payments":     ("VENT_COBR_DEUD", "VALOR",   _COBR_FIELDS),
+        "credit_notes": ("VENT_NOTA_CRED", "TOTAL",   _NC_FIELDS),
+    }.get(doc_type, (None, None, None))
+    if table is None:
+        return {
+            "success": False,
+            "error": f"doc_type {doc_type!r} not supported "
+                     "(use invoices / payments / credit_notes)",
+        }
+
+    params: dict[str, Any] = {
+        "pagesize": min(max(limit * 4, 50), 500),
+        "sort": "-FECHA",
+    }
+    if nom:
+        params["words"] = nom
+
+    try:
+        resp = await client.get(table, params=params, fields=fields)
+    except VelneoError as exc:
+        return _err(exc)
+
+    lo = float(amount_min) if amount_min is not None else float("-inf")
+    hi = float(amount_max) if amount_max is not None else float("inf")
+    out: list[dict[str, Any]] = []
+    for r in resp.rows:
+        try:
+            amt = float(r.get(amt_field) or 0)
+        except (TypeError, ValueError):
+            continue
+        if amt < lo or amt > hi:
+            continue
+        f = _short_date(r.get("FECHA"))
+        if df and f and f < df:
+            continue
+        if dt and f and f > dt:
+            continue
+        if table in ("VENT_FACT_VENT", "VENT_NOTA_CRED"):
+            _enrich_fact_row(r)
+        out.append(r)
+        if len(out) >= limit:
+            break
+
+    return {
+        "success": True,
+        "doc_type": doc_type,
+        "table": table,
+        "amount_field": amt_field,
+        "count": len(out),
+        "total_scanned": len(resp.rows),
+        "filter": {
+            "amount_min": amount_min, "amount_max": amount_max,
+            "customer_query": nom,
+            "date_from": df, "date_to": dt,
+        },
+        "documents": out,
+    }
+
+
+# ---------------------------------------------------------------------------
+# B5 search_invoice_lines_by_product — INV_MOVIMIENTOS where the line
+# belongs to a sales invoice (VENT_FACT_VENT != 0) AND PRODUCTOS = id.
+# ---------------------------------------------------------------------------
+
+
+async def search_invoice_lines_by_product(
+    client: VelneoClient,
+    *,
+    product_id: int,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Movement lines for a product that sit on sales invoices.
+
+    Useful for returns / claims ("¿en cuáles facturas vendimos este
+    producto el mes pasado?"). Pulls INV_MOVIMIENTOS with
+    ``filter[PRODUCTOS]=<id>`` and keeps only rows where
+    ``VENT_FACT_VENT`` is set — that excludes purchase / transfer /
+    adjustment movements while reusing the same indexed filter.
+    """
+    if not product_id:
+        return {"success": False, "error": "product_id required"}
+
+    try:
+        resp = await client.get(
+            "INV_MOVIMIENTOS",
+            params={"PRODUCTOS": int(product_id),
+                    "pagesize": min(max(limit * 3, 50), 500),
+                    "sort": "-ID"},
+            fields=_INV_MOV_FIELDS,
+        )
+    except VelneoError as exc:
+        return _err(exc)
+
+    df = _norm_velneo_date(date_from)
+    dt = _norm_velneo_date(date_to)
+    out: list[dict[str, Any]] = []
+    for r in resp.rows:
+        if not r.get("VENT_FACT_VENT"):
+            continue  # not a sale line
+        # No FECHA on the movement; date narrowing requires resolving
+        # the parent invoice, which would explode the call. Caller can
+        # pull a fresh invoice header per line with ``get_invoice_detail``
+        # if the date matters.
+        out.append(r)
+        if len(out) >= limit:
+            break
+
+    return {
+        "success": True,
+        "product_id": int(product_id),
+        "count": len(out),
+        "total_scanned": len(resp.rows),
+        "filter": {
+            "product_id": int(product_id),
+            "date_from": df, "date_to": dt,
+        },
+        "lines": out,
+    }
