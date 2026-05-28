@@ -26,7 +26,13 @@ _ENT_ERP_CLI_FIELDS = [
     "ID", "NAME", "CIF",
     "SALDO", "SALDOP", "DEUDASC", "DEUDASCP",
     "CUPOC", "DISPONIBLE_CUPOC",
-    "DEUDAS_VENCIDAS", "DIAS_VENCIDOS",
+    # ``DEUDAS_VENCIDAS`` is intentionally absent — Mepriga's Velneo API
+    # key rejects projection on that column with "No se retornan valores
+    # del campo DEUDAS_VENCIDAS" (returned as an errors[] string), and
+    # Velneo's all-or-nothing field semantics means the whole row would
+    # be dropped. Use ``DIAS_VENCIDOS`` instead — it carries enough
+    # signal for "moroso" detection.
+    "DIAS_VENCIDOS",
     "FACTVENCIDAS", "NO_VENDER",
     "TIPO_CONTRIBUYENTE", "SRI_TIPO_IDENTIFICACION",
     "TIPO_CLIENTE", "DESCUENTOC",

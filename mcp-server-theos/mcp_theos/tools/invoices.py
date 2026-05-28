@@ -90,7 +90,10 @@ async def check_balance(
                 "SALDO", "SALDOP",
                 "DEUDASC", "DEUDASCP",
                 "CUPOC", "DISPONIBLE_CUPOC",
-                "DEUDAS_VENCIDAS", "DIAS_VENCIDOS",
+                # ``DEUDAS_VENCIDAS`` is rejected by Mepriga's Velneo API
+                # key projection — see same note in
+                # mcp_theos.tools.partners._ENT_ERP_CLI_FIELDS.
+                "DIAS_VENCIDOS",
                 "FACTVENCIDAS", "NO_VENDER",
                 "ANTICIPOS_VTAS", "ANTICIPOS_DISPO_VTAS",
             ],
