@@ -57,12 +57,30 @@ def _headers(cfg: TenantVelneoConfig) -> dict[str, str]:
 
 
 def _check_errors(body: dict[str, Any]) -> None:
-    errors = body.get("errors") or []
-    if not errors:
+    """Promote Velneo errors[] to :class:`VelneoError`.
+
+    Velneo's REST is inconsistent about the entry shape: some endpoints
+    return ``errors: [{"status": "...", "message": "..."}]``, others
+    return ``errors: ["File not found"]`` (just a string). The dict
+    form is what the doc shows, but the string form shows up on missing
+    record lookups (e.g. ``GET /ENT_ERP_CLI/<id>`` when the id is in
+    ENT but not in the customer extension). We handle both — anything
+    else gets a generic "unknown" message so callers always know they
+    are looking at an error envelope.
+    """
+    errors = body.get("errors")
+    if not errors or not isinstance(errors, list):
         return
-    first = errors[0] if isinstance(errors, list) else {}
-    status = str(first.get("status") or "??")
-    message = str(first.get("message") or "unknown velneo error")
+    first = errors[0]
+    if isinstance(first, dict):
+        status = str(first.get("status") or "??")
+        message = str(first.get("message") or "unknown velneo error")
+    elif isinstance(first, str):
+        status = "??"
+        message = first
+    else:
+        status = "??"
+        message = f"unknown velneo error shape: {type(first).__name__}"
     raise VelneoError(status, message, body)
 
 
