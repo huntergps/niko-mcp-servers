@@ -120,6 +120,95 @@ async def identify_customer(
     return out
 
 
+async def update_partner(
+    client: VelneoClient,
+    *,
+    partner_id: int,
+    email: str | None = None,
+    phone: str | None = None,
+    address: str | None = None,
+) -> dict[str, Any]:
+    """Update a customer's contact info in ENT.
+
+    Note (2026-05-28): Mepriga's ``niko_saas`` API key currently
+    rejects PATCH / PUT against ENT with
+    ``"405 El método PATCH no es válido para este API Key"``. Until
+    the operator enables write access on Velneo's Seguridad → API
+    key panel, this tool returns ``error_code=not_supported_yet``
+    with a verbose message the LLM can verbalize to the customer
+    ("no puedo actualizar tu email desde aquí, por favor escribe a
+    soporte"). The interface stays in place so the moment write
+    access is enabled, only the inner HTTP call needs to change.
+    """
+    fields: dict[str, Any] = {}
+    if email is not None:
+        fields["MAIL_PRINCIPAL"] = email.strip()
+    if phone is not None:
+        fields["TFN_PRI"] = phone.strip()
+    if address is not None:
+        fields["DIR_PRI"] = address.strip()
+    if not fields:
+        return {"success": False, "error": "nothing to update"}
+
+    if not partner_id:
+        return {"success": False, "error": "partner_id required"}
+
+    # Best-effort attempt — if PATCH ever gets enabled, this works.
+    try:
+        resp = await client._client.patch(  # noqa: SLF001
+            f"ENT/{int(partner_id)}",
+            json=fields,
+        )
+        body = resp.json()
+        errors = body.get("errors") or []
+        first = errors[0] if isinstance(errors, list) and errors else None
+        status = (
+            first.get("status") if isinstance(first, dict)
+            else (str(first) if first else "")
+        )
+        if status == "405" or "no es válido para este API Key" in str(first or ""):
+            return {
+                "success": False,
+                "error_code": "not_supported_yet",
+                "error": (
+                    "Por el momento NO puedo actualizar la ficha del "
+                    "cliente desde el chat (el ERP requiere permisos de "
+                    "escritura que aún no están habilitados para el bot). "
+                    "Dile al cliente: 'No puedo actualizar tus datos de "
+                    "contacto desde aquí; por favor escribe al área de "
+                    "atención al cliente o pásate por la oficina con tu "
+                    "RUC y los nuevos datos.' NO digas 'lo intentaré' "
+                    "porque no se puede."
+                ),
+            }
+        # If Velneo accepts in the future, the row comes back like POST.
+        if errors:
+            return {
+                "success": False,
+                "error": f"velneo {status}: {first}",
+            }
+        # Re-read to confirm.
+        check = await client.get(
+            "ENT", record_id=int(partner_id),
+            fields=["ID", "MAIL_PRINCIPAL", "TFN_PRI", "DIR_PRI"],
+        )
+        if check.rows:
+            return {
+                "success": True,
+                "partner_id": int(partner_id),
+                "updated_fields": list(fields.keys()),
+                "ent": check.rows[0],
+            }
+        return {"success": True, "partner_id": int(partner_id),
+                "updated_fields": list(fields.keys())}
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "success": False,
+            "error_code": "transport_error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 async def create_partner(
     client: VelneoClient,
     *,

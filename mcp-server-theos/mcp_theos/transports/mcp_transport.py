@@ -126,6 +126,46 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "update_partner",
+        "description": (
+            "Update an existing customer's contact info (email, phone, "
+            "address) in ENT. CURRENT LIMITATION: Mepriga's API key has "
+            "PATCH disabled, so this tool returns "
+            "``error_code=not_supported_yet`` with a verbatim message "
+            "the LLM must read to the customer (do NOT promise to do "
+            "it manually). When the operator enables PATCH on the "
+            "Velneo Seguridad panel, the tool starts working without "
+            "code changes."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {"type": "integer"},
+                "email": {"type": "string"},
+                "phone": {"type": "string"},
+                "address": {"type": "string"},
+            },
+            "required": ["partner_id"],
+        },
+    },
+    {
+        "name": "get_product_image",
+        "description": (
+            "Fetch the product image as base64 PNG (one ERP round-trip "
+            "via the visor_datos process with dar_imagen=1). HEAVY "
+            "payload (~400KB per product); only call when the customer "
+            "explicitly asks to see a product photo or the bot is "
+            "about to render a product card with image."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "product code or barcode"},
+            },
+            "required": ["code"],
+        },
+    },
+    {
         "name": "create_quotation",
         "description": (
             "Create a sales quotation with N lines. Each line needs "
@@ -518,6 +558,8 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "get_product_details": ("products.get_product_details", products.get_product_details),
     "identify_customer": ("partners.identify_customer", partners.identify_customer),
     "create_partner": ("partners.create_partner", partners.create_partner),
+    "update_partner": ("partners.update_partner", partners.update_partner),
+    "get_product_image": ("products.get_product_image", products.get_product_image),
     "create_quotation": ("sales.create_quotation", sales.create_quotation),
     "get_quotation": ("sales.get_quotation", sales.get_quotation),
     "list_quotations": ("sales.list_quotations", sales.list_quotations),
@@ -550,6 +592,11 @@ OTP_PROTECTED_TOOLS: frozenset[str] = frozenset({
     "get_customer_statement_pdf",
     "get_customer_payments",
 })
+# Note: get_invoice_detail / inspect_partner / list_pending_invoices /
+# list_recent_invoices / list_recent_stock_movements / search_velneo
+# are admin/staff tools without OTP. They MUST stay out of customer-
+# facing agents' enabled_tools (Anny). Only an internal support agent
+# (not active on Mepriga yet) should have access.
 
 
 def _parse_allowed_tools(request: Request) -> set[str] | None:

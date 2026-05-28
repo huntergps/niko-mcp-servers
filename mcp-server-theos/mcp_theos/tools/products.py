@@ -247,6 +247,56 @@ async def get_product_details(
     }
 
 
+async def get_product_image(
+    client: VelneoClient,
+    *,
+    code: str,
+) -> dict[str, Any]:
+    """Fetch the product image as base64 (PNG).
+
+    Thin wrapper over ``_visor_datos(codbar, dar_imagen=1)``. Returns
+    ``{success, code, name, image_base64, image_filename}`` so the
+    channel layer can attach the image directly to a Telegram /
+    WhatsApp / widget message. Heavy payload (~400KB per product) —
+    use only when the customer explicitly asks to see the product or
+    the bot decides to render a product card with image.
+    """
+    q = (code or "").strip()
+    if not q:
+        return {"success": False, "error": "empty code"}
+
+    raw = await _visor_datos(client, q, include_image=True)
+    if raw is None:
+        return {
+            "success": False,
+            "error_code": "not_found",
+            "error": f"product {q!r} not found (visor_datos returned NO_ENCONTRADO)",
+        }
+
+    img64 = raw.get("imagen64") or ""
+    img_url = raw.get("imagen") or ""
+    if not img64 and not img_url:
+        return {
+            "success": False,
+            "error_code": "no_image",
+            "error": "El producto existe pero no tiene imagen registrada en Theos.",
+            "code": raw.get("codigo"),
+            "name": raw.get("name"),
+        }
+
+    return {
+        "success": True,
+        "id": raw.get("id"),
+        "code": raw.get("codigo"),
+        "name": raw.get("name"),
+        "family": raw.get("familia"),
+        "image_base64": img64 if img64 else None,
+        "image_url": img_url if img_url else None,
+        "image_filename": f"{(raw.get('codigo') or q)}.png",
+        "image_mtime": raw.get("fecha_mod_imagen"),
+    }
+
+
 async def check_stock(
     client: VelneoClient,
     *,
