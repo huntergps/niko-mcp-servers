@@ -40,19 +40,40 @@ MCP_TOOLS: list[dict[str, Any]] = [
     {
         "name": "search_products",
         "description": (
-            "Search products in the catalog by name (also accepts SKU/code). "
-            "Returns up to ``limit`` rows with PVP1 (price with VAT) merged "
-            "from the price table. Use this before any quotation."
+            "Search products in the catalog. If the query is a code or "
+            "barcode (alphanumeric, contains digits, no spaces) it goes "
+            "straight to the ERP's product card. For natural-language "
+            "queries (e.g. 'arroz Gustadina 1kg', 'detergente') it embeds "
+            "the query and pulls top-K nearest products from pgvector, "
+            "then enriches each with live price/presentations/family. "
+            "Use this BEFORE any quotation."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "search term (name, code, or partial)"},
-                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
-                "include_prices": {"type": "boolean", "default": True},
-                "tarifa_id": {"type": "integer", "description": "tariff id to pin pricing"},
+                "query": {"type": "string", "description": "code, barcode, or free text"},
+                "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 20},
+                "include_image": {"type": "boolean", "default": False,
+                                    "description": "include image_base64 — heavy payload, only when the LLM is about to render a card"},
             },
             "required": ["query"],
+        },
+    },
+    {
+        "name": "get_product_details",
+        "description": (
+            "Fetch the full product card by code or barcode (one ERP "
+            "round-trip). Returns the family, every presentation with "
+            "its own price/factor/barcode/discount, IVA description, and "
+            "optionally the image (base64 PNG)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "product code or barcode"},
+                "include_image": {"type": "boolean", "default": False},
+            },
+            "required": ["code"],
         },
     },
     {
@@ -208,6 +229,7 @@ ToolFn = Callable[..., Awaitable[dict[str, Any]]]
 
 _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "search_products": ("products.search_products", products.search_products),
+    "get_product_details": ("products.get_product_details", products.get_product_details),
     "identify_customer": ("partners.identify_customer", partners.identify_customer),
     "create_partner": ("partners.create_partner", partners.create_partner),
     "create_quotation": ("sales.create_quotation", sales.create_quotation),

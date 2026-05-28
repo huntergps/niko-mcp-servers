@@ -1,38 +1,36 @@
-"""Velneo product search."""
+"""Product lookup for tenants on Theos / Velneo.
+
+Three paths:
+
+* :func:`get_product_details` — direct ``_process/visor_datos`` call.
+  One round-trip returns everything a quotation card needs: the
+  product header, its family, every presentation with its own price /
+  factor / barcode / discount, the IVA description, and the image
+  (base64 PNG) when requested.
+
+* :func:`search_products` — dual path. If the query *looks like a
+  code* (alphanumeric with at least one digit) we go straight to
+  ``visor_datos``. Otherwise we embed the query and fan out a top-K
+  pgvector search against ``tenant_<slug>.product_embeddings``; each
+  hit is then enriched with ``visor_datos`` so the LLM sees the same
+  rich payload regardless of which path matched.
+
+The Theos ``visor_datos`` process keeps keys in lowercase (``pvp``,
+``codbar``, ``factor``) — different from the table-generic REST
+endpoints. We pass that shape through unchanged; the LLM sees one
+consistent dictionary per product.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
+from mcp_theos.config import settings
 from mcp_theos.velneo_http import VelneoClient
-
-# Fields we project from PRODUCTOS — keep tight, the table has 60+ cols.
-_PRODUCTOS_FIELDS = [
-    "ID", "CODIGO", "NAME", "NAME_CORTO", "DESCRIPCION",
-    "EXS", "STOCK_MAXIMO", "STOCK_MINIMO",
-    "INV_FAMI", "INV_MARCAS", "MODELO",
-    "IMP_FIS_IMPUESTOS_VTA",
-    "VENDIBLE", "INCLUIR_CATALOGO", "OFF",
-    "URL_IMAGEN",
-]
-
-_PRECIOS_FIELDS = [
-    "ID", "INV_PRODUCTOS", "INV_TARIFAS", "INV_PRESENTACIONES",
-    "PRECIO1", "IVA1", "PVP1", "PRECIO2", "PVP2",
-    "DESCUENTO", "PORCENTAJE_DSCTO",
-]
 
 
 def _looks_like_code(q: str) -> bool:
-    """Heuristic: a Velneo CODIGO is alphanumeric (sometimes with dashes
-    and underscores), no spaces, max ~15 chars, AND must contain at
-    least one digit. The digit requirement is what separates ``"01S1"``
-    or ``"109950"`` from ordinary product names like ``"ARROZ"`` or
-    ``"LECHE"`` — both meet the no-space / short-length test but neither
-    is a SKU. Without this guard the tool would route every short query
-    through ``?filter[CODIGO]=`` and silently return zero for any
-    natural-language search.
-    """
+    """Alphanumeric, no spaces, ≤20 chars, contains at least one digit."""
     if not q or " " in q or len(q) > 20:
         return False
     if not any(ch.isdigit() for ch in q):
@@ -40,93 +38,196 @@ def _looks_like_code(q: str) -> bool:
     return all(ch.isalnum() or ch in "-_" for ch in q)
 
 
+async def _visor_datos(
+    client: VelneoClient,
+    codbar: str,
+    *,
+    include_image: bool = False,
+) -> dict[str, Any] | None:
+    """Single ``visor_datos`` call. Returns ``None`` if not found."""
+    body = await client.process(
+        "visor_datos",
+        params={
+            "codbar": codbar,
+            "dar_imagen": "1" if include_image else "0",
+        },
+    )
+    if not isinstance(body, dict) or not body.get("ok"):
+        return None
+    return body
+
+
+def _shape_product(raw: dict[str, Any]) -> dict[str, Any]:
+    """Project the ``visor_datos`` payload to a stable shape for the LLM.
+
+    Filter the noise (per_efectivo / para_cheque / para_tc are POS
+    discount toggles; the bot does not care) and surface the fields
+    that matter for quoting and answering "do you carry this?".
+    """
+    presentations = []
+    main_price = None
+    main_codbar = None
+    for p in raw.get("precios") or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            pvp = float(p.get("pvp") or 0)
+        except (TypeError, ValueError):
+            pvp = 0.0
+        try:
+            factor = float(p.get("factor") or 0)
+        except (TypeError, ValueError):
+            factor = 0.0
+        try:
+            iva_pct = float(p.get("iva_porcentaje") or 0)
+        except (TypeError, ValueError):
+            iva_pct = 0.0
+        entry = {
+            "id": str(p.get("id") or ""),
+            "name": p.get("name") or "",
+            "factor": factor,
+            "pvp": round(pvp, 4),
+            "codbar": (p.get("codbar") or "").strip() or None,
+            "descuento_pct": float(p.get("descuento") or 0),
+            "descuento_monto": float(p.get("descuento_monto") or 0),
+            "iva": p.get("iva") or "",
+            "iva_pct": iva_pct,
+            "costo_empaque": float(p.get("costo_emapaque") or 0),
+            "utilidad_pct": float(p.get("utilidad") or 0),
+        }
+        presentations.append(entry)
+        # The "main" unit is the one with factor 1 (e.g. LIBRA X 1).
+        if main_price is None and abs(factor - 1.0) < 1e-6:
+            main_price = entry["pvp"]
+            main_codbar = entry["codbar"]
+
+    out = {
+        "success": True,
+        "id": raw.get("id"),
+        "code": raw.get("codigo"),
+        "name": raw.get("name"),
+        "family": raw.get("familia"),
+        "barcode_main": main_codbar,
+        "pvp_main": main_price,
+        "presentations": presentations,
+    }
+    img = raw.get("imagen64")
+    img_url = raw.get("imagen")
+    if img:
+        out["image_base64"] = img
+    if img_url:
+        out["image_url"] = img_url
+    if raw.get("fecha_mod_imagen"):
+        out["image_mtime"] = raw["fecha_mod_imagen"]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
+
+async def get_product_details(
+    client: VelneoClient,
+    *,
+    code: str,
+    include_image: bool = False,
+) -> dict[str, Any]:
+    """Pull the full product card by code or barcode."""
+    q = (code or "").strip()
+    if not q:
+        return {"success": False, "error": "empty code"}
+    raw = await _visor_datos(client, q, include_image=include_image)
+    if raw is None:
+        return {
+            "success": False,
+            "error": f"product {q!r} not found",
+        }
+    return _shape_product(raw)
+
+
 async def search_products(
     client: VelneoClient,
     *,
     query: str,
-    limit: int = 20,
-    include_prices: bool = True,
-    tarifa_id: int | None = None,
+    limit: int = 10,
+    include_image: bool = False,
+    include_prices: bool = True,  # kept for backward-compat
+    tarifa_id: int | None = None,  # accepted but ignored — visor_datos
+                                     # returns the configured tariff
 ) -> dict[str, Any]:
-    """Look products up in PRODUCTOS.
-
-    Velneo's REST API only supports EXACT filtering — there is no LIKE
-    or contains operator. So this tool does two things:
-
-    * If ``query`` looks like a SKU/code (alphanumeric, no spaces),
-      we issue ``?filter[CODIGO]=<query>`` — that is fast and accurate.
-    * Otherwise (natural-language text like "arroz Gustadina 1kg") we
-      try ``?filter[NAME]=<query>`` (which Velneo only matches when the
-      whole name equals the query verbatim) and we annotate the response
-      with ``hint`` so the caller knows to fall back to RAG search
-      against ``tenant_<slug>.product_embeddings``.
-
-    PVP is NOT in PRODUCTOS; when ``include_prices=True`` we fan out a
-    second call to INV_PRECIOS_PRODUCTO filtered by the returned IDs (or
-    tarifa_id when given) and merge ``PVP1`` onto each product row.
-    """
+    """Search products by code (direct) or by natural-language (RAG)."""
     q = (query or "").strip()
     if not q:
         return {"success": False, "error": "empty query", "products": []}
 
+    # Path A — exact code lookup
     if _looks_like_code(q):
-        params: dict[str, Any] = {"CODIGO": q, "pagesize": limit}
-        match_field = "CODIGO"
-    else:
-        params = {"NAME": q, "pagesize": limit}
-        match_field = "NAME"
-
-    resp = await client.get("PRODUCTOS", params=params, fields=_PRODUCTOS_FIELDS)
-    rows = resp.rows[:limit]
-
-    if include_prices and rows:
-        ids = [r["ID"] for r in rows if r.get("ID") is not None]
-        if ids:
-            price_params: dict[str, Any] = {
-                "INV_PRODUCTOS": ",".join(str(i) for i in ids),
-                "pagesize": max(limit * 4, 100),
+        raw = await _visor_datos(client, q, include_image=include_image)
+        if raw is None:
+            return {
+                "success": True,
+                "query": q,
+                "match_field": "code",
+                "count": 0,
+                "products": [],
             }
-            if tarifa_id is not None:
-                price_params["INV_TARIFAS"] = tarifa_id
-            try:
-                price_resp = await client.get(
-                    "INV_PRECIOS_PRODUCTO",
-                    params=price_params,
-                    fields=_PRECIOS_FIELDS,
-                )
-                price_by_product: dict[int, dict[str, Any]] = {}
-                for p in price_resp.rows:
-                    pid = p.get("INV_PRODUCTOS")
-                    if pid is None:
-                        continue
-                    cur = price_by_product.get(pid)
-                    if cur is None or (p.get("INV_TARIFAS") or 0) < (cur.get("INV_TARIFAS") or 99):
-                        price_by_product[pid] = p
-                for r in rows:
-                    pinfo = price_by_product.get(r.get("ID"))
-                    if pinfo:
-                        r["PVP1"] = pinfo.get("PVP1")
-                        r["PRECIO1"] = pinfo.get("PRECIO1")
-                        r["IVA1"] = pinfo.get("IVA1")
-                        r["INV_TARIFAS"] = pinfo.get("INV_TARIFAS")
-            except Exception as exc:
-                # Don't fail the whole search — products still returned without PVP.
-                for r in rows:
-                    r.setdefault("_price_lookup_error", type(exc).__name__)
+        return {
+            "success": True,
+            "query": q,
+            "match_field": "code",
+            "count": 1,
+            "products": [_shape_product(raw)],
+        }
 
-    out: dict[str, Any] = {
+    # Path B — RAG: embed → pgvector top-K → enrich each with visor_datos
+    from mcp_theos.rag import product_codes_by_similarity
+
+    try:
+        hits = await product_codes_by_similarity(
+            client.cfg.slug, q, limit=min(limit, settings.rag_max_enrich),
+        )
+    except Exception as exc:
+        return {
+            "success": False,
+            "query": q,
+            "match_field": "rag",
+            "error": f"RAG search failed: {type(exc).__name__}: {exc}",
+            "products": [],
+        }
+
+    products: list[dict[str, Any]] = []
+    for h in hits:
+        code = (h.get("code") or "").strip()
+        sim = h.get("similarity")
+        if not code:
+            continue
+        try:
+            raw = await _visor_datos(client, code, include_image=include_image)
+        except Exception:
+            raw = None
+        if raw is None:
+            # Fallback: surface just the RAG metadata so the LLM still
+            # has a name to mention.
+            products.append({
+                "success": True,
+                "id": h.get("odoo_id"),
+                "code": code,
+                "name": h.get("name"),
+                "family": None,
+                "presentations": [],
+                "similarity": float(sim) if sim is not None else None,
+                "_note": "enrichment from Theos failed; partial data",
+            })
+            continue
+        shaped = _shape_product(raw)
+        shaped["similarity"] = float(sim) if sim is not None else None
+        products.append(shaped)
+
+    return {
         "success": True,
         "query": q,
-        "match_field": match_field,
-        "count": len(rows),
-        "total_count": resp.total_count,
-        "products": rows,
+        "match_field": "rag",
+        "count": len(products),
+        "products": products,
     }
-    if match_field == "NAME" and not rows:
-        # Velneo only does exact NAME match; the niko backend should
-        # then route the original query through the pgvector RAG.
-        out["hint"] = (
-            "velneo NAME filter is exact-match; for partial / semantic "
-            "search use the RAG index in tenant_<slug>.product_embeddings"
-        )
-    return out
