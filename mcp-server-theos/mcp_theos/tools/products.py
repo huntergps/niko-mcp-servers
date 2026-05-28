@@ -1,19 +1,23 @@
-"""Product lookup for tenants on Theos / Velneo.
+"""Product lookup for tenants on Theos (Velneo platform).
 
-Three paths:
+Three paths, in order of preference:
 
 * :func:`get_product_details` — direct ``_process/visor_datos`` call.
-  One round-trip returns everything a quotation card needs: the
-  product header, its family, every presentation with its own price /
-  factor / barcode / discount, the IVA description, and the image
-  (base64 PNG) when requested.
+  One round-trip returns everything a quotation card needs.
 
-* :func:`search_products` — dual path. If the query *looks like a
-  code* (alphanumeric with at least one digit) we go straight to
-  ``visor_datos``. Otherwise we embed the query and fan out a top-K
-  pgvector search against ``tenant_<slug>.product_embeddings``; each
-  hit is then enriched with ``visor_datos`` so the LLM sees the same
-  rich payload regardless of which path matched.
+* :func:`search_products` — dual path:
+
+  1. If the query *looks like a code* (alphanumeric with ≥1 digit, no
+     spaces) → straight to ``visor_datos``.
+  2. Otherwise → native Velneo ``filter[words]=...`` (the WORDS
+     index that the ERP itself uses for product lookups in its UI).
+     For multi-word queries we pick the most-distinctive token and
+     post-filter in memory by the rest. RAG pgvector is kept as a
+     fallback only when WORDS returns zero rows.
+
+  Each hit is then enriched with ``visor_datos`` (capped by
+  ``RAG_MAX_ENRICH``) so the LLM gets the same rich shape regardless
+  of which path matched.
 
 The Theos ``visor_datos`` process keeps keys in lowercase (``pvp``,
 ``codbar``, ``factor``) — different from the table-generic REST
@@ -27,6 +31,42 @@ from typing import Any
 
 from mcp_theos.config import settings
 from mcp_theos.velneo_http import VelneoClient
+
+
+# Stopwords (Spanish + measurement units) we drop before picking the
+# primary token for a multi-word query. The list intentionally stays
+# tiny — Velneo's WORDS index already tolerates these as full tokens,
+# but they're so common they kill the relevance signal.
+_STOPWORDS = frozenset({
+    "de", "del", "la", "el", "los", "las", "y", "con", "en", "para",
+    "un", "una", "unos", "unas", "al", "lo", "por", "o", "u",
+    "kg", "g", "gr", "ml", "lt", "l", "cm", "mm", "m",
+    "x", "pack", "und", "u", "unidad", "unidades",
+})
+
+
+def _tokenize(q: str) -> list[str]:
+    """Split a free-text query into search-friendly tokens.
+
+    * Uppercases everything (Velneo's WORDS index is case-insensitive
+      either way but consistency helps when we post-filter in Python).
+    * A token is dropped if, after stripping leading digits/punctuation,
+      its lowercase form is in :data:`_STOPWORDS` — that catches both
+      "kg" and "1kg" / "500g".
+    * Tokens shorter than 3 chars are also dropped.
+    * If everything gets filtered we fall back to the raw tokens so the
+      caller still has something to search with.
+    """
+    raw = [t for t in q.upper().split() if t]
+    keep: list[str] = []
+    for t in raw:
+        alpha = t.lstrip("0123456789.,-").lower()
+        if not alpha or alpha in _STOPWORDS:
+            continue
+        if len(t) < 3:
+            continue
+        keep.append(t)
+    return keep or raw
 
 
 def _looks_like_code(q: str) -> bool:
@@ -185,27 +225,75 @@ async def search_products(
             "products": [_shape_product(raw)],
         }
 
-    # Path B — RAG: embed → pgvector top-K → enrich each with visor_datos
-    from mcp_theos.rag import product_codes_by_similarity
+    # Path B — Velneo native WORDS search (same index the ERP UI uses
+    # for product lookup). Vastly cheaper and more accurate than the
+    # pgvector RAG for catalog text matches; that path is kept only
+    # as a fallback when WORDS returns zero rows.
+    tokens = _tokenize(q)
+    if not tokens:
+        return {
+            "success": True, "query": q, "match_field": "words",
+            "count": 0, "products": [],
+        }
+    # Use the longest token as the primary key — usually the most
+    # distinctive one. The rest are applied as post-filters in memory.
+    primary = max(tokens, key=len)
+    other_tokens = [t for t in tokens if t != primary]
+    max_pull = min(max(limit * 4, 20), 200)  # pull extra so the post-filter has headroom
 
-    schema = f"tenant_{client.cfg.slug}"
     try:
-        hits = await product_codes_by_similarity(
-            schema, q, limit=min(limit, settings.rag_max_enrich),
+        resp = await client.get(
+            "PRODUCTOS",
+            params={"words": primary, "pagesize": max_pull},
+            fields=["ID", "CODIGO", "NAME", "OFF"],
         )
+        hits = resp.rows
     except Exception as exc:
         return {
-            "success": False,
-            "query": q,
-            "match_field": "rag",
-            "error": f"RAG search failed: {type(exc).__name__}: {exc}",
+            "success": False, "query": q, "match_field": "words",
+            "error": f"{type(exc).__name__}: {exc}",
             "products": [],
         }
 
+    # In-memory post-filter: drop OFF and require every other token to
+    # appear in NAME (case-insensitive substring).
+    filtered: list[dict[str, Any]] = []
+    for r in hits:
+        if r.get("OFF"):
+            continue
+        name = (r.get("NAME") or "").upper()
+        if other_tokens and not all(t in name for t in other_tokens):
+            continue
+        filtered.append(r)
+        if len(filtered) >= limit:
+            break
+
+    # Path B.2 fallback — pgvector RAG when WORDS came back empty.
+    used_fallback = False
+    if not filtered:
+        try:
+            from mcp_theos.rag import product_codes_by_similarity
+            schema = f"tenant_{client.cfg.slug}"
+            sim_hits = await product_codes_by_similarity(
+                schema, q, limit=min(limit, settings.rag_max_enrich),
+            )
+            for h in sim_hits:
+                filtered.append({
+                    "ID": h.get("odoo_id"),
+                    "CODIGO": (h.get("code") or "").strip(),
+                    "NAME": h.get("name") or "",
+                    "_similarity": h.get("similarity"),
+                })
+            used_fallback = True
+        except Exception:
+            pass  # silent — RAG is best-effort fallback
+
+    # Enrich each hit with visor_datos (cap = rag_max_enrich so we
+    # don't drag the LLM with N round-trips).
     products: list[dict[str, Any]] = []
-    for h in hits:
-        code = (h.get("code") or "").strip()
-        sim = h.get("similarity")
+    enrich_cap = min(len(filtered), settings.rag_max_enrich)
+    for r in filtered[:enrich_cap]:
+        code = (r.get("CODIGO") or "").strip()
         if not code:
             continue
         try:
@@ -213,27 +301,28 @@ async def search_products(
         except Exception:
             raw = None
         if raw is None:
-            # Fallback: surface just the RAG metadata so the LLM still
-            # has a name to mention.
+            # Cannot reach the product card — surface what we have so
+            # the LLM still has the name to mention.
             products.append({
                 "success": True,
-                "id": h.get("odoo_id"),
+                "id": r.get("ID"),
                 "code": code,
-                "name": h.get("name"),
+                "name": r.get("NAME"),
                 "family": None,
                 "presentations": [],
-                "similarity": float(sim) if sim is not None else None,
                 "_note": "enrichment from Theos failed; partial data",
             })
             continue
         shaped = _shape_product(raw)
-        shaped["similarity"] = float(sim) if sim is not None else None
+        if "_similarity" in r:
+            shaped["similarity"] = r["_similarity"]
         products.append(shaped)
 
     return {
         "success": True,
         "query": q,
-        "match_field": "rag",
+        "match_field": "rag" if used_fallback else "words",
         "count": len(products),
+        "total_matched": len(filtered),
         "products": products,
     }
