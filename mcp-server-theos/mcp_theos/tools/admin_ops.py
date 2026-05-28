@@ -511,66 +511,7 @@ async def list_recent_stock_movements(
     }
 
 
-# ---------------------------------------------------------------------------
-# inspect_product_stock — EXISTENCIAS per bodega + recent moves.
-# ---------------------------------------------------------------------------
-
-
-async def inspect_product_stock(
-    client: VelneoClient,
-    *,
-    product_id: int,
-    moves_limit: int = 20,
-) -> dict[str, Any]:
-    """Current stock per bodega plus the latest movements for a product.
-
-    The two views together let the support agent answer "stock says X
-    but yesterday we did Y, what happened" — EXISTENCIAS gives the
-    snapshot, INV_MOVIMIENTOS gives the audit trail.
-    """
-    if not product_id:
-        return {"success": False, "error": "product_id required"}
-
-    existencias: list[dict[str, Any]] = []
-    exist_error: str | None = None
-    try:
-        e = await client.get(
-            "EXISTENCIAS",
-            params={"PRODUCTOS": product_id, "pagesize": 500},
-            fields=[
-                "ID", "PRODUCTOS", "INV_BODEGA",
-                "STOCK", "STOCK_RESERVADO",
-                "STOCK_DISPONIBLE", "STOCK_PEDIDO",
-                "COSTO_PROM",
-            ],
-        )
-        existencias = e.rows
-    except VelneoError as exc:
-        exist_error = f"velneo {exc.status}: {exc.message}"
-
-    moves: list[dict[str, Any]] = []
-    moves_error: str | None = None
-    try:
-        m = await client.get(
-            "INV_MOVIMIENTOS",
-            params={"PRODUCTOS": product_id,
-                    "pagesize": min(max(moves_limit, 1), 200)},
-            fields=_INV_MOV_FIELDS,
-        )
-        moves = m.rows[:moves_limit]
-    except VelneoError as exc:
-        moves_error = f"velneo {exc.status}: {exc.message}"
-
-    out: dict[str, Any] = {
-        "success": True,
-        "product_id": product_id,
-        "existencias": existencias,
-        "existencias_count": len(existencias),
-        "recent_movements": moves,
-        "recent_movement_count": len(moves),
-    }
-    if exist_error:
-        out["existencias_error"] = exist_error
-    if moves_error:
-        out["moves_error"] = moves_error
-    return out
+# Stock-by-bodega lives in ``products.check_stock`` (it reads the
+# denormalized EXS_BOD1..12 / INV_BODEGA1..12 columns on the PRODUCTOS
+# master row — the Theos-native pattern). Audit-trail forensics on
+# stock movements stays here under ``list_recent_stock_movements``.

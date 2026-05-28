@@ -247,6 +247,119 @@ async def get_product_details(
     }
 
 
+async def check_stock(
+    client: VelneoClient,
+    *,
+    product_ids: list[int] | None = None,
+    codes: list[str] | None = None,
+    include_warehouses: bool = False,
+) -> dict[str, Any]:
+    """Stock disponibility for one or many products.
+
+    Reads PRODUCTOS.EXS (total existencia) for each id. When
+    ``include_warehouses=True`` we also project EXS_BOD1..EXS_BOD12
+    and INV_BODEGA1..INV_BODEGA12 so the LLM can answer "¿está
+    en bodega Santa Cruz?". Each entry returns:
+    ``{id, code, name, exs, vendible, off, stock_min, stock_max}``
+    and optionally a ``per_warehouse`` array.
+
+    Either ``product_ids`` (Velneo ids) or ``codes`` (CODIGO strings)
+    may be passed; codes are resolved by a single
+    ``filter[CODIGO]=`` lookup so a list of 10 codes costs 1 round-
+    trip, not 10.
+    """
+    pid_list: list[int] = []
+    if product_ids:
+        for pid in product_ids:
+            try:
+                pid_list.append(int(pid))
+            except (TypeError, ValueError):
+                continue
+
+    fields_base = [
+        "ID", "CODIGO", "NAME", "NAME_CORTO",
+        "EXS", "STOCK_MINIMO", "STOCK_MAXIMO",
+        "VENDIBLE", "OFF",
+    ]
+    if include_warehouses:
+        fields_base += [
+            "INV_BODEGA1", "INV_BODEGA2", "INV_BODEGA3", "INV_BODEGA4",
+            "INV_BODEGA5", "INV_BODEGA6", "INV_BODEGA7", "INV_BODEGA8",
+            "INV_BODEGA9", "INV_BODEGA10", "INV_BODEGA11", "INV_BODEGA12",
+            "EXS_BOD1", "EXS_BOD2", "EXS_BOD3", "EXS_BOD4",
+            "EXS_BOD5", "EXS_BOD6", "EXS_BOD7", "EXS_BOD8",
+            "EXS_BOD9", "EXS_BOD10", "EXS_BOD11", "EXS_BOD12",
+        ]
+
+    # Resolve codes → ids via a single batched filter call.
+    if codes:
+        code_list = [str(c).strip() for c in codes if c]
+        if code_list:
+            try:
+                # Velneo equality filter doesn't accept comma-list values
+                # cleanly; do one call per code (small N expected).
+                for code in code_list:
+                    r = await client.get(
+                        "PRODUCTOS",
+                        params={"CODIGO": code, "pagesize": 1},
+                        fields=["ID"],
+                    )
+                    if r.rows:
+                        pid_list.append(int(r.rows[0]["ID"]))
+            except Exception as exc:
+                return {"success": False, "error": f"code resolve failed: {exc}"}
+
+    if not pid_list:
+        return {"success": False, "error": "product_ids o codes son requeridos"}
+
+    items: list[dict[str, Any]] = []
+    for pid in pid_list:
+        try:
+            r = await client.get("PRODUCTOS", record_id=pid, fields=fields_base)
+        except Exception as exc:
+            items.append({"id": pid, "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        if not r.rows:
+            items.append({"id": pid, "error": "not_found"})
+            continue
+        row = r.rows[0]
+        try:
+            exs = float(row.get("EXS") or 0)
+        except (TypeError, ValueError):
+            exs = 0.0
+        item: dict[str, Any] = {
+            "id": row.get("ID"),
+            "code": (row.get("CODIGO") or "").strip(),
+            "name": (row.get("NAME") or row.get("NAME_CORTO") or "").strip(),
+            "exs": exs,
+            "available": exs > 0 and not row.get("OFF") and row.get("VENDIBLE") is not False,
+            "stock_min": float(row.get("STOCK_MINIMO") or 0),
+            "stock_max": float(row.get("STOCK_MAXIMO") or 0),
+            "vendible": row.get("VENDIBLE") is not False,
+            "off": bool(row.get("OFF")),
+        }
+        if include_warehouses:
+            per: list[dict[str, Any]] = []
+            for i in range(1, 13):
+                bod_id = row.get(f"INV_BODEGA{i}")
+                qty_raw = row.get(f"EXS_BOD{i}")
+                try:
+                    qty = float(qty_raw) if qty_raw not in (None, "") else 0.0
+                except (TypeError, ValueError):
+                    qty = 0.0
+                if not bod_id and qty == 0:
+                    continue
+                per.append({"warehouse_id": bod_id, "qty": qty})
+            item["per_warehouse"] = per
+        items.append(item)
+
+    return {
+        "success": True,
+        "count": len(items),
+        "items": items,
+    }
+
+
 async def search_products(
     client: VelneoClient,
     *,

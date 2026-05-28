@@ -424,19 +424,36 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "inspect_product_stock",
+        "name": "check_stock",
         "description": (
-            "Current stock per bodega (EXISTENCIAS) plus the latest "
-            "movements for a product. Combines the snapshot with the "
-            "audit trail in one call."
+            "Stock disponibility for one or many products in one call. "
+            "Reads PRODUCTOS.EXS (total existencia) for each id. With "
+            "``include_warehouses=true`` also returns per-bodega "
+            "breakdown from the denormalized ``EXS_BOD1..12`` / "
+            "``INV_BODEGA1..12`` columns on the master row (Theos-"
+            "native pattern, no separate EXISTENCIAS join). Identify "
+            "products by ``product_ids`` (Velneo ids) or by ``codes`` "
+            "(CODIGO strings). For *forensics* on a single product "
+            "(stock vs movement history) use "
+            "``list_recent_stock_movements`` after this."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "product_id": {"type": "integer"},
-                "moves_limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 200},
+                "product_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                },
+                "codes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "include_warehouses": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "include per-bodega breakdown",
+                },
             },
-            "required": ["product_id"],
         },
     },
     {
@@ -518,7 +535,7 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "list_recent_invoices": ("admin_ops.list_recent_invoices", admin_ops.list_recent_invoices),
     "get_invoice_detail": ("admin_ops.get_invoice_detail", admin_ops.get_invoice_detail),
     "list_recent_stock_movements": ("admin_ops.list_recent_stock_movements", admin_ops.list_recent_stock_movements),
-    "inspect_product_stock": ("admin_ops.inspect_product_stock", admin_ops.inspect_product_stock),
+    "check_stock": ("products.check_stock", products.check_stock),
     "search_velneo": ("admin_search.search_velneo", admin_search.search_velneo),
 }
 
