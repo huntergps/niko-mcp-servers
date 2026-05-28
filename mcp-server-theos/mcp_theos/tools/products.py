@@ -23,6 +23,17 @@ _PRECIOS_FIELDS = [
 ]
 
 
+def _looks_like_code(q: str) -> bool:
+    """Heuristic: a Velneo CODIGO is alphanumeric (sometimes with dashes
+    and underscores), no spaces, max ~15 chars. Anything longer or with
+    spaces is treated as natural-language text — which Velneo cannot
+    match because its REST filter is EXACT only.
+    """
+    if not q or " " in q or len(q) > 20:
+        return False
+    return all(ch.isalnum() or ch in "-_" for ch in q)
+
+
 async def search_products(
     client: VelneoClient,
     *,
@@ -31,7 +42,18 @@ async def search_products(
     include_prices: bool = True,
     tarifa_id: int | None = None,
 ) -> dict[str, Any]:
-    """Search PRODUCTOS by NAME (LIKE-ish) — Velneo also supports CODIGO and BUSQUEDA.
+    """Look products up in PRODUCTOS.
+
+    Velneo's REST API only supports EXACT filtering — there is no LIKE
+    or contains operator. So this tool does two things:
+
+    * If ``query`` looks like a SKU/code (alphanumeric, no spaces),
+      we issue ``?filter[CODIGO]=<query>`` — that is fast and accurate.
+    * Otherwise (natural-language text like "arroz Gustadina 1kg") we
+      try ``?filter[NAME]=<query>`` (which Velneo only matches when the
+      whole name equals the query verbatim) and we annotate the response
+      with ``hint`` so the caller knows to fall back to RAG search
+      against ``tenant_<slug>.product_embeddings``.
 
     PVP is NOT in PRODUCTOS; when ``include_prices=True`` we fan out a
     second call to INV_PRECIOS_PRODUCTO filtered by the returned IDs (or
@@ -41,7 +63,13 @@ async def search_products(
     if not q:
         return {"success": False, "error": "empty query", "products": []}
 
-    params: dict[str, Any] = {"NAME": q, "pagesize": limit}
+    if _looks_like_code(q):
+        params: dict[str, Any] = {"CODIGO": q, "pagesize": limit}
+        match_field = "CODIGO"
+    else:
+        params = {"NAME": q, "pagesize": limit}
+        match_field = "NAME"
+
     resp = await client.get("PRODUCTOS", params=params, fields=_PRODUCTOS_FIELDS)
     rows = resp.rows[:limit]
 
@@ -80,10 +108,19 @@ async def search_products(
                 for r in rows:
                     r.setdefault("_price_lookup_error", type(exc).__name__)
 
-    return {
+    out: dict[str, Any] = {
         "success": True,
         "query": q,
+        "match_field": match_field,
         "count": len(rows),
         "total_count": resp.total_count,
         "products": rows,
     }
+    if match_field == "NAME" and not rows:
+        # Velneo only does exact NAME match; the niko backend should
+        # then route the original query through the pgvector RAG.
+        out["hint"] = (
+            "velneo NAME filter is exact-match; for partial / semantic "
+            "search use the RAG index in tenant_<slug>.product_embeddings"
+        )
+    return out

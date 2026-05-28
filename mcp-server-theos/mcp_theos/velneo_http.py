@@ -66,23 +66,43 @@ def _check_errors(body: dict[str, Any]) -> None:
     raise VelneoError(status, message, body)
 
 
+def _upper_keys(row: dict[str, Any]) -> dict[str, Any]:
+    """Velneo returns row keys in lowercase (``id``, ``codigo``, ``name``,
+    etc.) even though the table schema documents them as UPPERCASE.
+
+    We normalize to UPPERCASE here so every call site reads the field
+    using the documented name (``ID``, ``CODIGO``, ``NAME``, …) — anything
+    else means we'd be sprinkling case-handling through every tool, and
+    a future Velneo version that flips to uppercase would silently make
+    us miss every row.
+    """
+    if not isinstance(row, dict):
+        return row
+    return {(k.upper() if isinstance(k, str) else k): v for k, v in row.items()}
+
+
 def extract_rows(body: dict[str, Any], *table_keys: str) -> list[dict[str, Any]]:
     """Pull the row list from a Velneo list response.
 
     Tries each ``table_keys`` candidate (in lowercase) and falls back to
     the first list-valued top-level key that isn't ``errors`` /
-    ``count`` / ``total_count``.
+    ``count`` / ``total_count``. Returned rows have their keys upper-
+    cased to match the documented table schema (see :func:`_upper_keys`).
     """
+    rows: list[dict[str, Any]] = []
     for key in table_keys:
         v = body.get(key.lower())
         if isinstance(v, list):
-            return v
-    for k, v in body.items():
-        if k in {"errors", "count", "total_count"}:
-            continue
-        if isinstance(v, list):
-            return v
-    return []
+            rows = v
+            break
+    if not rows:
+        for k, v in body.items():
+            if k in {"errors", "count", "total_count"}:
+                continue
+            if isinstance(v, list):
+                rows = v
+                break
+    return [_upper_keys(r) for r in rows]
 
 
 class VelneoClient:
@@ -111,9 +131,27 @@ class VelneoClient:
         params: dict[str, Any] | None = None,
         fields: list[str] | None = None,
     ) -> VelneoResponse:
-        """GET a list or a single record."""
+        """GET a list or a single record.
+
+        Filter encoding: Velneo uses ``?filter[FIELD]=value`` (NOT the
+        naked ``?FIELD=value`` shown in the doc — that form is silently
+        ignored and returns the unfiltered first page). We auto-wrap
+        every entry in ``params`` into the ``filter[…]`` form except
+        the API's own reserved keys (``page``, ``pagesize``, ``fields``).
+        Filters are EXACT MATCH only — Velneo's REST does not expose a
+        LIKE / contains operator, so semantic search lives outside the
+        MCP (pgvector RAG against ``tenant_<slug>.product_embeddings``).
+        """
         path = table if record_id is None else f"{table}/{quote(str(record_id))}"
-        q: dict[str, Any] = dict(params or {})
+        reserved = {"page", "pagesize", "fields", "limit"}
+        q: dict[str, Any] = {}
+        for k, v in (params or {}).items():
+            if v is None:
+                continue
+            if k in reserved:
+                q[k] = v
+            else:
+                q[f"filter[{k}]"] = v
         if fields:
             q["fields"] = ",".join(fields)
         resp = await self._client.get(path, params=q)
@@ -122,8 +160,14 @@ class VelneoClient:
         _check_errors(body)
 
         if record_id is not None:
-            row = body.get(table.lower()) if isinstance(body.get(table.lower()), dict) else body
-            rows = [row] if isinstance(row, dict) and row else []
+            sub = body.get(table.lower())
+            if isinstance(sub, list) and sub:
+                raw_row: Any = sub[0]
+            elif isinstance(sub, dict):
+                raw_row = sub
+            else:
+                raw_row = body
+            rows = [_upper_keys(raw_row)] if isinstance(raw_row, dict) and raw_row else []
             return VelneoResponse(body=body, rows=rows, count=len(rows), total_count=len(rows))
 
         rows = extract_rows(body, table)
@@ -161,7 +205,9 @@ class VelneoClient:
         return out
 
     async def post(self, table: str, body: dict[str, Any]) -> dict[str, Any]:
-        """POST a single record. Returns the created row (Velneo echoes it)."""
+        """POST a single record. Returns the created row (Velneo echoes
+        it), with keys upper-cased (see :func:`_upper_keys`).
+        """
         resp = await self._client.post(table, json=body)
         resp.raise_for_status()
         data = resp.json()
@@ -171,8 +217,8 @@ class VelneoClient:
             return rows[0]
         sub = data.get(table.lower())
         if isinstance(sub, dict):
-            return sub
-        return data
+            return _upper_keys(sub)
+        return _upper_keys(data)
 
     async def process(
         self,
