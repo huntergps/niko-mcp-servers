@@ -571,6 +571,36 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "list_invoice_lines_window",
+        "description": (
+            "Líneas de venta (INV_MOVIMIENTOS) en una ventana de "
+            "fechas — la herramienta correcta para \"detalle de "
+            "ventas del día / semana / mes\". Delega al proceso "
+            "VENT_FACT_MOV_BUSQ_3P con SUCURSAL + FCH_FACT=1 + "
+            "FCH_DES/HST (filtrado server-side). Filtra por cliente "
+            "vía ``customer_query`` (WORDS sobre NAME, opcional) o "
+            "``branch_id``. ``date_basis='conta'`` cambia a fecha "
+            "contable (FCH_CONTA=1) en vez de fecha emisión. El "
+            "proceso topa en 1000 líneas por llamada — si "
+            "``truncated=true`` en el response, el LLM debe narrow "
+            "la ventana o agregar customer_query."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "ISO YYYY-MM-DD"},
+                "date_to": {"type": "string"},
+                "customer_query": {"type": "string"},
+                "branch_id": {"type": "integer"},
+                "date_basis": {"type": "string",
+                                "enum": ["fact", "conta"],
+                                "default": "fact"},
+                "include_off": {"type": "boolean", "default": False},
+                "limit": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000},
+            },
+        },
+    },
+    {
         "name": "list_credit_notes",
         "description": (
             "Notas de crédito de ventas (VENT_NOTA_CRED), newest "
@@ -839,6 +869,7 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "list_documents_window": ("admin_ops.list_documents_window", admin_ops.list_documents_window),
     "search_by_amount": ("admin_ops.search_by_amount", admin_ops.search_by_amount),
     "search_invoice_lines_by_product": ("admin_ops.search_invoice_lines_by_product", admin_ops.search_invoice_lines_by_product),
+    "list_invoice_lines_window": ("admin_ops.list_invoice_lines_window", admin_ops.list_invoice_lines_window),
     "list_credit_notes": ("admin_ops.list_credit_notes", admin_ops.list_credit_notes),
     "list_withholdings": ("admin_ops.list_withholdings", admin_ops.list_withholdings),
     "list_purchase_invoices": ("admin_ops.list_purchase_invoices", admin_ops.list_purchase_invoices),

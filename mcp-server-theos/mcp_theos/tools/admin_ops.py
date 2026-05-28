@@ -1308,6 +1308,138 @@ async def search_invoice_lines_by_product(
 
 
 # ---------------------------------------------------------------------------
+# list_invoice_lines_window — INV_MOVIMIENTOS rows of sales invoices
+# inside a date window. Uses the proceso VENT_FACT_MOV_BUSQ_3P with the
+# FCH_FACT=1 flag so the date range is honored server-side.
+# ---------------------------------------------------------------------------
+
+
+# Keys we keep from the 130-key proceso movement row. Same project-down
+# discipline as _summarize_proceso_fact.
+_PROCESO_MOV_KEEP = frozenset({
+    "ID", "NAME", "NUM_LINEA",
+    "VENT_FACT_VENT", "VENT_NOTA_CRED", "CONT_COMPRAS",
+    "PRODUCTOS", "INV_PRESENT_PRODUCTO",
+    "CAN", "FACTOR",
+    "PVP", "PVP_LINEA",
+    "PRECIO_BRUTO_LINEA", "PRECIO_NETO_LINEA",
+    "DCTO_VTAS_LINEA", "IVA_LINEA",
+    "INV_BODEGA",
+    "EMP", "SUC",
+    "CONTADO", "FECHA_CONTA",
+    "MOV_TIP", "ENTRADA",
+    "CLI_ENT", "PRV_ENT",
+})
+
+
+def _summarize_proceso_mov(r: dict[str, Any]) -> dict[str, Any]:
+    """Project the 130-key proceso movement row down to ~25 useful keys."""
+    if not isinstance(r, dict):
+        return r
+    return {k: v for k, v in r.items() if k.upper() in _PROCESO_MOV_KEEP}
+
+
+async def list_invoice_lines_window(
+    client: VelneoClient,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    customer_query: str | None = None,
+    branch_id: int | None = None,
+    date_basis: str = "fact",
+    include_off: bool = False,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """All sales-invoice line items in a date window.
+
+    Pattern for "detalle de ventas del día / semana / mes". Uses
+    ``VENT_FACT_MOV_BUSQ_3P`` (the Búsqueda that traverses parent
+    VENT_FACT_VENT → child INV_MOVIMIENTOS via plural relation) with:
+
+      * ``SUCURSAL`` — required gate (from cfg.extra.velneo_sucursal
+        or branch_id override).
+      * ``FCH_FACT=1`` — activates the date filter on FECHA de emisión.
+        Without this flag FCH_DES / FCH_HST are silently ignored and
+        you get the whole 102k-fact dataset (∼1.86k KLEINTURS lines or
+        the equivalent global cap). ``date_basis="conta"`` switches
+        to FCH_CONTA for fecha contable.
+      * ``FCH_DES`` / ``FCH_HST`` — the actual window.
+      * ``NOM`` — optional customer WORDS filter.
+
+    Empirically verified: ``date_range 27..28 May 2026 + FCH_FACT=1``
+    narrowed KLEINTURS movs from 1860 → 92.
+
+    Returns the proceso rows summarized to ~25 useful keys. The
+    proceso caps at 1000 rows; if ``total_count >= 1000`` the response
+    sets ``truncated=true`` so the caller knows to narrow the window.
+    There is no page[number] equivalent — pagination = narrower date
+    range or per-invoice fetch via ``get_invoice_detail``.
+    """
+    nom = (customer_query or "").strip() or None
+    df = _norm_velneo_date(date_from)
+    dt = _norm_velneo_date(date_to)
+    params: dict[str, Any] = {
+        "SUCURSAL": (str(branch_id) if branch_id is not None
+                     else _tenant_sucursal(client)),
+        "OFF": "1" if include_off else "0",
+    }
+    if nom:
+        params["NOM"] = nom
+    if df or dt:
+        if date_basis == "conta":
+            params["FCH_CONTA"] = "1"
+        else:
+            params["FCH_FACT"] = "1"
+        if df:
+            params["FCH_DES"] = df
+        if dt:
+            params["FCH_HST"] = dt
+
+    resp = await call_proceso_or_message(
+        client, "VENT_FACT_MOV_BUSQ_3P",
+        params=params,
+        row_keys=("inv_movimientos",),
+    )
+    if not resp.get("ok"):
+        if resp.get("permission_denied"):
+            return {
+                "success": False,
+                "error_code": "proceso_permission_denied",
+                "error": resp.get("message"),
+            }
+        return {
+            "success": False,
+            "error": resp.get("transport_error") or "proceso call failed",
+        }
+
+    rows = [_summarize_proceso_mov(r) for r in resp["rows"]]
+    total = resp.get("total_count") or len(rows)
+    truncated = total >= 1000
+
+    return {
+        "success": True,
+        "path": "proceso",
+        "count": min(len(rows), limit),
+        "returned": len(rows),
+        "total_count": total,
+        "truncated": truncated,
+        "filter": {
+            "customer_query": nom,
+            "date_from": df, "date_to": dt,
+            "date_basis": date_basis,
+            "branch_id": branch_id,
+            "include_off": include_off,
+        },
+        "lines": rows[:limit],
+        **({"truncated_hint": (
+            "El proceso devolvió >= 1000 líneas; narrow date_from/"
+            "date_to o agrega customer_query para ver el detalle "
+            "completo."
+        )} if truncated else {}),
+    }
+
+
+# ---------------------------------------------------------------------------
 # list_credit_notes (VENT_NOTA_CRED) — sales credit notes
 # ---------------------------------------------------------------------------
 
