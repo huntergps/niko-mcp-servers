@@ -302,6 +302,7 @@ async def _list_via_proceso(
     date_to: str | None,
     branch_id: int | None,
     include_off: bool,
+    date_basis: str = "fact",
     mostrar_por_despachar: bool = False,
     mostrar_solo_pendientes_despachos: bool = False,
 ) -> dict[str, Any]:
@@ -312,29 +313,39 @@ async def _list_via_proceso(
     * ``SUCURSAL`` is REQUIRED — without it the Búsqueda returns 0
       rows. The proper value is the EMP code string ("001"), not the
       numeric SUC. Pulled from ``cfg.extra.velneo_sucursal`` (default
-      "001").
+      "001"). ``branch_id`` overrides per call.
     * ``NOM`` works via WORDS+PARTS index on NAME (carries customer
       RUC + razón social denormalized). "KLEINTURS" → 199 facturas.
-    * ``FCH_DES`` / ``FCH_HST`` are IGNORED by the Búsqueda in every
-      date format we tried (DD/MM/YYYY, YYYY-MM-DD, YYYYMMDD,
-      DD.MM.YYYY). Date-window filtering must happen in-memory or via
-      the REST fallback path. Caller still passes them through so
-      that if Mepriga's admin extends the Búsqueda to honor them,
-      no code change is needed.
+    * Date range is activated by a SEPARATE FLAG variable, not by
+      simply setting FCH_DES / FCH_HST. Without the flag the date
+      vars are silently ignored. The two flags are mutually exclusive:
+        - ``FCH_FACT=1`` → filter by fecha de emisión (FECHA)
+        - ``FCH_CONTA=1`` → filter by fecha contable (FECHA_CONTA)
+      We pick by the ``date_basis`` arg ("fact" default, "conta" for
+      the contable view). Verified: range 2026-05-27..28 narrows
+      KLEINTURS facturas 199 → 7 once FCH_FACT=1 is set.
     """
     params: dict[str, Any] = {
         # SUCURSAL is the gate that lets the Búsqueda return ANYTHING.
-        # Override via branch_id if the agent explicitly passed one.
         "SUCURSAL": (str(branch_id) if branch_id is not None
                      else _tenant_sucursal(client)),
     }
     if nom:
         params["NOM"] = nom
     params["OFF"] = "1" if include_off else "0"
-    if date_from:
-        params["FCH_DES"] = date_from
-    if date_to:
-        params["FCH_HST"] = date_to
+    # Date range — variables are ignored unless the corresponding flag
+    # is set. Only activate the flag when at least one bound was given,
+    # otherwise we pin everything to a default date with no upper bound
+    # and lose results.
+    if date_from or date_to:
+        if date_basis == "conta":
+            params["FCH_CONTA"] = "1"
+        else:
+            params["FCH_FACT"] = "1"
+        if date_from:
+            params["FCH_DES"] = date_from
+        if date_to:
+            params["FCH_HST"] = date_to
     if mostrar_por_despachar:
         params["MOSTRAR_POR_DESPACHAR"] = "1"
     if mostrar_solo_pendientes_despachos:
@@ -719,9 +730,13 @@ async def get_invoice_detail(
     lines: list[dict[str, Any]] = []
     lines_error: str | None = None
     lines_path = "proceso"
+    # VENT_FACT_MOV_BUSQ_3P requires SUCURSAL (same gate as the parent
+    # Búsqueda VENT_FACT_VENT_BUSQ). Without it the proceso returns 0
+    # rows. The header we already loaded has EMP, but the proceso uses
+    # the tenant-default establecimiento code from cfg.extra.
     mov_resp = await call_proceso_or_message(
         client, "VENT_FACT_MOV_BUSQ_3P",
-        params={"ID": inv_id},
+        params={"ID": inv_id, "SUCURSAL": _tenant_sucursal(client)},
         row_keys=("inv_movimientos",),
     )
     if mov_resp.get("ok"):

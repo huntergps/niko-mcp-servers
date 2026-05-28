@@ -410,8 +410,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "description": (
             "Active invoices with SALDO > 0 (unpaid). Delegates to "
             "Velneo proceso ``VENT_FACT_BUSQ_3P`` (newest first, "
-            "WORDS+PARTS index on NAME) with REST fallback. Each row "
-            "comes back with: SERIE+SECUENCIA (combined into NRO_FAC), "
+            "server-side WORDS+PARTS index on NAME, date filter via "
+            "FCH_FACT flag) with REST fallback. Each row comes back "
+            "with: SERIE+SECUENCIA (combined into NRO_FAC), "
             "RAZONSOCIALCOMPRADOR + SRI_IDENTIFICACION (the customer), "
             "TOTAL/PAGADO/SALDO, and the SRI/Datil block: LAST_STATUS "
             "(human-readable: \"AUTORIZADO\", \"DEVUELTA\", \"NO "
@@ -419,8 +420,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "de acceso), AUTORIZACION (autorización SRI number), "
             "TIENE_ELECTRONICA. Filters: ``customer_query`` for the "
             "WORDS index, ``client_id`` for FK filter, "
-            "``salesperson_id``, ``branch_id``, date range, and "
-            "``sri_status`` (substring match against LAST_STATUS — "
+            "``salesperson_id``, ``branch_id``, date range "
+            "(``date_from`` / ``date_to`` are honored server-side), "
+            "and ``sri_status`` (substring match against LAST_STATUS — "
             "case-insensitive)."
         ),
         "inputSchema": {
