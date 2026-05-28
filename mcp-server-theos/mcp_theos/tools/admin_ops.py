@@ -250,6 +250,41 @@ def _enrich_fact_row(r: dict[str, Any]) -> dict[str, Any]:
     return r
 
 
+# Keys we keep from the 165-field proceso response. Everything else
+# is internal Velneo bookkeeping (cesta refs, indexes, sub-relations)
+# that just inflates the token bill without helping the LLM.
+_PROCESO_FACT_KEEP = frozenset({
+    "ID", "NAME", "FECHA",
+    "SERIE", "SECUENCIA", "ESTABLECIMIENTO", "PUNTOEMISION",
+    "RAZONSOCIALCOMPRADOR", "SRI_IDENTIFICACION",
+    "CLIENTE",  # the proceso DOES return the ENT_ERP_CLI fk (REST blocks it)
+    "SUBTOTAL", "BASE_IVA", "BASE0", "IVA", "TOTAL", "PAGADO", "SALDO",
+    "VENDEDOR", "VTA_TIPO_ENT", "SUC", "EMP", "INV_BODEGA",
+    "OFF", "OFF_MOTIVO", "REF", "REF2",
+    "TIENE_ELECTRONICA", "SRI_TIPO_FEAP", "LAST_STATUS",
+    "VCACCESOSRI", "AUTORIZACION", "KEY",
+    "TIPO_AMBIENTE", "VENTA_CREDITO",
+    "FECHA_FACT", "FECHA_CONTA",  # may be available via proceso
+})
+
+
+def _summarize_proceso_fact(r: dict[str, Any]) -> dict[str, Any]:
+    """Project the 165-key proceso row down to ~30 useful keys + NRO_FAC."""
+    if not isinstance(r, dict):
+        return r
+    out = {k: v for k, v in r.items() if k.upper() in _PROCESO_FACT_KEEP}
+    out["NRO_FAC"] = build_sri_number(r.get("SERIE"), r.get("SECUENCIA"))
+    return out
+
+
+def _tenant_sucursal(client: VelneoClient) -> str:
+    """Resolve the SUCURSAL value required by VENT_FACT_BUSQ_3P from the
+    tenant's ``erp_api_extra`` config. Defaults to "001" (Mepriga value).
+    """
+    extra = getattr(client.cfg, "extra", None) or {}
+    return str(extra.get("velneo_sucursal") or "001")
+
+
 def _norm_velneo_date(d: str | None) -> str | None:
     """Caller passes ISO ``YYYY-MM-DD``; Velneo procesos consume that
     same shape (verified with visor_datos's date params). Returned
@@ -270,8 +305,29 @@ async def _list_via_proceso(
     mostrar_por_despachar: bool = False,
     mostrar_solo_pendientes_despachos: bool = False,
 ) -> dict[str, Any]:
-    """Call ``VENT_FACT_BUSQ_3P``. Returns ``{ok, rows, ...}`` shape."""
-    params: dict[str, Any] = {}
+    """Call ``VENT_FACT_BUSQ_3P``. Returns ``{ok, rows, ...}`` shape.
+
+    Empirically verified against Mepriga (2026-05-28):
+
+    * ``SUCURSAL`` is REQUIRED — without it the Búsqueda returns 0
+      rows. The proper value is the EMP code string ("001"), not the
+      numeric SUC. Pulled from ``cfg.extra.velneo_sucursal`` (default
+      "001").
+    * ``NOM`` works via WORDS+PARTS index on NAME (carries customer
+      RUC + razón social denormalized). "KLEINTURS" → 199 facturas.
+    * ``FCH_DES`` / ``FCH_HST`` are IGNORED by the Búsqueda in every
+      date format we tried (DD/MM/YYYY, YYYY-MM-DD, YYYYMMDD,
+      DD.MM.YYYY). Date-window filtering must happen in-memory or via
+      the REST fallback path. Caller still passes them through so
+      that if Mepriga's admin extends the Búsqueda to honor them,
+      no code change is needed.
+    """
+    params: dict[str, Any] = {
+        # SUCURSAL is the gate that lets the Búsqueda return ANYTHING.
+        # Override via branch_id if the agent explicitly passed one.
+        "SUCURSAL": (str(branch_id) if branch_id is not None
+                     else _tenant_sucursal(client)),
+    }
     if nom:
         params["NOM"] = nom
     params["OFF"] = "1" if include_off else "0"
@@ -279,17 +335,18 @@ async def _list_via_proceso(
         params["FCH_DES"] = date_from
     if date_to:
         params["FCH_HST"] = date_to
-    if branch_id is not None:
-        params["SUCURSAL"] = branch_id
     if mostrar_por_despachar:
         params["MOSTRAR_POR_DESPACHAR"] = "1"
     if mostrar_solo_pendientes_despachos:
         params["MOSTRAR_SOLO_PENDIENTES_DESPACHOS"] = "1"
-    return await call_proceso_or_message(
+    resp = await call_proceso_or_message(
         client, "VENT_FACT_BUSQ_3P",
         params=params,
         row_keys=("vent_fact_vent",),
     )
+    if resp.get("ok") and resp.get("rows"):
+        resp["rows"] = [_summarize_proceso_fact(r) for r in resp["rows"]]
+    return resp
 
 
 async def _list_via_rest(
