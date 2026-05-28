@@ -91,7 +91,17 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "description": (
             "Look a customer up by RUC, cédula, email, name or phone and "
             "return a merged profile (master + customer-extension fields "
-            "like SALDO / CUPOC). Pass exactly one identifier."
+            "like SALDO / CUPOC). Pass exactly one identifier. "
+            "When ``name`` is used and the exact-match query returns "
+            "zero rows, the tool automatically falls back to pgvector "
+            "RAG against ``tenant_<slug>.partner_embeddings`` and "
+            "returns the top-5 nearest customers. Those rows carry "
+            "``_match_via='rag'`` and a ``_similarity`` score [0..1]. "
+            "When you see RAG hits, DO NOT pick one silently — ask "
+            "the user to confirm (\"encontré KLEINTURS Y "
+            "REPRESENTACIONES, ¿es éste?\") before billing or quoting "
+            "against that partner_id, because a typo can route to the "
+            "wrong customer."
         ),
         "inputSchema": {
             "type": "object",

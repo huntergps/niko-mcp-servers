@@ -96,6 +96,54 @@ async def identify_customer(
             merged["has_erp_cli"] = False
         matches.append(merged)
 
+    # Path B — pgvector RAG fallback when exact NAME search came back
+    # empty. Velneo's ``filter[NAME]=...`` is EXACT MATCH only — a typed
+    # "klein tours" will never match "KLEINTURS Y REPRESENTACIONES C.
+    # LTDA.", and Velneo's REST has no LIKE / contains operator. Before
+    # giving up we embed the typed query and pull top-K nearest rows
+    # from ``tenant_<slug>.partner_embeddings`` (populated by niko's
+    # reindex_velneo). Each hit is then enriched against ENT /
+    # ENT_ERP_CLI so the LLM sees a homogeneous ``matches`` list.
+    rag_note: str | None = None
+    if not matches and name:
+        try:
+            from mcp_theos.rag import partner_matches_by_similarity
+            schema = f"tenant_{client.cfg.slug}"
+            sim_hits = await partner_matches_by_similarity(
+                schema, name.strip(), limit=5,
+            )
+        except Exception as exc:  # noqa: BLE001 — RAG is best-effort
+            sim_hits = []
+            rag_note = f"RAG fallback failed: {type(exc).__name__}: {exc}"
+        for hit in sim_hits:
+            ent_id = hit.get("odoo_id")
+            if not ent_id:
+                continue
+            try:
+                ent_resp = await client.get(
+                    "ENT", record_id=int(ent_id), fields=_ENT_FIELDS,
+                )
+            except VelneoError:
+                continue
+            if not ent_resp.rows:
+                continue
+            row = ent_resp.rows[0]
+            ext = await _read_ent_erp_cli(client, int(ent_id))
+            merged = dict(row)
+            if ext:
+                for k, v in ext.items():
+                    if k == "ID":
+                        continue
+                    merged.setdefault(k, v) if k in merged else merged.update({k: v})
+                merged["has_erp_cli"] = True
+            else:
+                merged["has_erp_cli"] = False
+            merged["_match_via"] = "rag"
+            merged["_similarity"] = float(hit.get("similarity") or 0)
+            matches.append(merged)
+            if len(matches) >= 5:
+                break
+
     # The niko orchestrator persists the partner_id by scanning the
     # ToolMessage payload for ``partner_id`` / ``id`` at the top level
     # (mcp-odoo's shape). Mirror that contract so the LLM doesn't have
@@ -109,7 +157,16 @@ async def identify_customer(
         "count": len(matches),
         "matches": matches,
     }
-    if len(matches) == 1:
+    if rag_note:
+        out["rag_note"] = rag_note
+    # Only auto-pick partner_id at top level when:
+    #   * one match AND
+    #   * not a RAG fallback (the LLM must confirm a fuzzy match with
+    #     the user before assuming identity — "KLEIN" returning
+    #     "KLEINTURS" is the right hit, but "JOSE PEREZ" returning the
+    #     wrong Pérez would silently mis-bill someone).
+    is_rag = bool(matches) and matches[0].get("_match_via") == "rag"
+    if len(matches) == 1 and not is_rag:
         m = matches[0]
         out["partner_id"] = m.get("ID")
         out["id"] = m.get("ID")
