@@ -571,6 +571,100 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "list_credit_notes",
+        "description": (
+            "Notas de crédito de ventas (VENT_NOTA_CRED), newest "
+            "first. Each row carries VENT_FACT_VENT — the parent "
+            "factura — plus the SRI block (LAST_STATUS, VCACCESOSRI, "
+            "AUTORIZACION, KEY). Filter by customer via "
+            "``customer_query`` (WORDS) or ``client_id`` (FK), plus "
+            "optional date window and ``sri_status`` (substring of "
+            "LAST_STATUS — \"AUTORIZADO\", \"DEVUELTA\", etc.)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_query": {"type": "string"},
+                "client_id": {"type": "integer"},
+                "date_from": {"type": "string"},
+                "date_to": {"type": "string"},
+                "sri_status": {"type": "string"},
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+            },
+        },
+    },
+    {
+        "name": "list_withholdings",
+        "description": (
+            "Comprobantes de retención emitidos a proveedores "
+            "(COMP_RETENCIONES). Devuelve los montos retenidos por "
+            "categoría (RET_FUE1..3 fuente, RET_IVA1..2 IVA) más el "
+            "código SRI (CODE_RET_FUE1 / CODE_RET_IVA1). El número "
+            "del comprobante vive en NAME (SERIE/SECUENCIA están "
+            "bloqueados de proyección para esta tabla). Filtra por "
+            "proveedor via ``supplier_query`` (WORDS sobre NAME) o "
+            "``supplier_id`` (ENT_ERP_PROV)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "supplier_query": {"type": "string"},
+                "supplier_id": {"type": "integer"},
+                "date_from": {"type": "string"},
+                "date_to": {"type": "string"},
+                "sri_status": {"type": "string"},
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+            },
+        },
+    },
+    {
+        "name": "list_purchase_invoices",
+        "description": (
+            "Facturas de compras (CONT_COMPRAS). Espejo de "
+            "``list_recent_invoices`` para el lado proveedor. Filtra "
+            "por proveedor via ``supplier_query`` o ``supplier_id`` "
+            "(ENT_ERP_PROV). ``only_unpaid=true`` retiene rows con "
+            "SALDO > 0 (vista de cuentas por pagar)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "supplier_query": {"type": "string"},
+                "supplier_id": {"type": "integer"},
+                "date_from": {"type": "string"},
+                "date_to": {"type": "string"},
+                "sri_status": {"type": "string"},
+                "only_unpaid": {"type": "boolean", "default": False},
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+            },
+        },
+    },
+    {
+        "name": "customer_full_view",
+        "description": (
+            "Vista panorámica de un cliente en una sola llamada. "
+            "Resuelve la identidad (mismo path order que "
+            "``identify_customer`` — exact / WORDS / RAG) y luego "
+            "trae en PARALELO la actividad de los últimos ``days`` "
+            "(default 90): facturas + órdenes + deudas + cobros + "
+            "notas de crédito, todo del mismo cliente. Devuelve "
+            "totales agregados (saldo abierto, # vencidas) sobre "
+            "los items. Si el match es por WORDS o RAG, retorna "
+            "``error_code=needs_disambiguation`` con los candidatos "
+            "para que el LLM pida confirmación antes de exponer "
+            "datos del cliente equivocado."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_query": {"type": "string"},
+                "client_id": {"type": "integer"},
+                "cif": {"type": "string"},
+                "days": {"type": "integer", "default": 90, "minimum": 7, "maximum": 365},
+            },
+        },
+    },
+    {
         "name": "list_invoices_pending_dispatch",
         "description": (
             "Facturas con líneas pendientes de despacho "
@@ -745,6 +839,10 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "list_documents_window": ("admin_ops.list_documents_window", admin_ops.list_documents_window),
     "search_by_amount": ("admin_ops.search_by_amount", admin_ops.search_by_amount),
     "search_invoice_lines_by_product": ("admin_ops.search_invoice_lines_by_product", admin_ops.search_invoice_lines_by_product),
+    "list_credit_notes": ("admin_ops.list_credit_notes", admin_ops.list_credit_notes),
+    "list_withholdings": ("admin_ops.list_withholdings", admin_ops.list_withholdings),
+    "list_purchase_invoices": ("admin_ops.list_purchase_invoices", admin_ops.list_purchase_invoices),
+    "customer_full_view": ("admin_ops.customer_full_view", admin_ops.customer_full_view),
     "list_recent_stock_movements": ("admin_ops.list_recent_stock_movements", admin_ops.list_recent_stock_movements),
     "check_stock": ("products.check_stock", products.check_stock),
     "search_velneo": ("admin_search.search_velneo", admin_search.search_velneo),

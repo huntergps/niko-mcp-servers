@@ -988,22 +988,58 @@ async def find_invoice(
 # ---------------------------------------------------------------------------
 
 
-# Stable projection per document table — keeps only columns the API
-# key allows AND that the LLM actually uses to summarize.
+# Stable projection per document table — verified against Mepriga
+# 2026-05-28. Each list is the allowed subset under niko_saas.
 _NC_FIELDS = [
-    "ID", "NAME", "FECHA",
+    # Identifiers / dates
+    "ID", "NAME", "FECHA", "FECHA_FACT",
     "SERIE", "SECUENCIA", "ESTABLECIMIENTO", "PUNTOEMISION",
+    # Customer (NC ventas use ENT_ERP_CLI — this column IS allowed on
+    # VENT_NOTA_CRED unlike its sibling on VENT_FACT_VENT)
+    "ENT_ERP_CLI",
     "RAZONSOCIALCOMPRADOR", "SRI_IDENTIFICACION",
-    "TOTAL", "PAGADO", "SALDO",
-    "VENDEDOR", "OFF", "OFF_MOTIVO",
-    "TIENE_ELECTRONICA", "LAST_STATUS", "VCACCESOSRI", "AUTORIZACION",
+    # Amounts (PAGADO blocked here — NC tracks SALDO only)
+    "TOTAL", "SUBTOTAL", "BASE_IVA", "BASE0", "IVA", "SALDO",
+    # Op metadata + SRI block
+    "OFF", "OFF_MOTIVO",
+    "LAST_STATUS", "VCACCESOSRI", "AUTORIZACION", "KEY",
+    "TIENE_ELECTRONICA", "SRI_TIPO_FEAP", "TIPO_AMBIENTE",
+    "EMP", "SUC", "INV_BODEGA",
+    # FK to parent invoice (NCs are issued AGAINST a factura)
+    "VENT_FACT_VENT",
 ]
 
 _COMP_RET_FIELDS = [
+    # SERIE / SECUENCIA are blocked here — NC has its own NRO_RET
+    # but it lives in NAME. ENT_ERP_PROV is the proveedor.
     "ID", "NAME", "FECHA", "FECHA_RET",
-    "SERIE", "SECUENCIA",
-    "TOTAL",
-    "VENDEDOR", "OFF", "OFF_MOTIVO",
+    "ESTABLECIMIENTO", "PUNTOEMISION",
+    "ENT_ERP_PROV",
+    "RAZONSOCIALCOMPRADOR", "SRI_IDENTIFICACION",
+    "TOTAL", "BASE_IVA", "BASE0", "IVA",
+    # Withholding amounts (these are the actual retention values)
+    "RET_FUE1", "RET_FUE2", "RET_FUE3",
+    "RET_IVA1", "RET_IVA2",
+    "CODE_RET_FUE1", "CODE_RET_IVA1",
+    # SRI block (AUTORIZACION blocked on this table — only KEY +
+    # LAST_STATUS + VCACCESOSRI carry the SRI signal)
+    "OFF", "OFF_MOTIVO",
+    "LAST_STATUS", "VCACCESOSRI", "KEY",
+    "TIENE_ELECTRONICA", "TIPO_AMBIENTE",
+    "EMP", "SUC",
+]
+
+_CONT_COMPRAS_FIELDS = [
+    "ID", "NAME", "FECHA", "FECHA_FACT",
+    "SERIE", "SECUENCIA", "ESTABLECIMIENTO", "PUNTOEMISION",
+    "ENT_ERP_PROV",
+    "RAZONSOCIALCOMPRADOR", "SRI_IDENTIFICACION",
+    "TOTAL", "BASE_IVA", "BASE0", "IVA",
+    "PAGADO", "SALDO",
+    "OFF", "OFF_MOTIVO",
+    "LAST_STATUS", "VCACCESOSRI", "AUTORIZACION", "KEY",
+    "TIENE_ELECTRONICA", "TIPO_AMBIENTE",
+    "EMP", "SUC",
 ]
 
 
@@ -1268,4 +1304,329 @@ async def search_invoice_lines_by_product(
             "date_from": df, "date_to": dt,
         },
         "lines": out,
+    }
+
+
+# ---------------------------------------------------------------------------
+# list_credit_notes (VENT_NOTA_CRED) — sales credit notes
+# ---------------------------------------------------------------------------
+
+
+async def list_credit_notes(
+    client: VelneoClient,
+    *,
+    customer_query: str | None = None,
+    client_id: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    sri_status: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Notas de crédito de ventas (VENT_NOTA_CRED), newest first.
+
+    Each NC carries a link to the parent invoice in
+    ``VENT_FACT_VENT`` so the agent can chain ``get_invoice_detail``
+    to see what was being credited. SRI block (LAST_STATUS,
+    VCACCESOSRI, AUTORIZACION, KEY) lives directly on the row — NCs
+    have their own electronic signature lifecycle.
+    """
+    nom = (customer_query or "").strip() or None
+    df = _norm_velneo_date(date_from)
+    dt = _norm_velneo_date(date_to)
+
+    params: dict[str, Any] = {
+        "sort": "-FECHA",
+        "pagesize": min(max(limit * 2, 20), 500),
+    }
+    if client_id is not None:
+        params["ENT_ERP_CLI"] = client_id
+    if nom:
+        params["words"] = nom
+
+    try:
+        resp = await client.get("VENT_NOTA_CRED", params=params, fields=_NC_FIELDS)
+    except VelneoError as exc:
+        return _err(exc)
+
+    out = _apply_inmemory_filters(
+        resp.rows,
+        date_from=df, date_to=dt,
+        saldo_positive=False, sri_status=sri_status, limit=limit,
+    )
+
+    return {
+        "success": True,
+        "count": len(out),
+        "total_scanned": len(resp.rows),
+        "filter": {
+            "customer_query": nom, "client_id": client_id,
+            "date_from": df, "date_to": dt, "sri_status": sri_status,
+        },
+        "credit_notes": out,
+    }
+
+
+# ---------------------------------------------------------------------------
+# list_withholdings (COMP_RETENCIONES) — retenciones en compras
+# ---------------------------------------------------------------------------
+
+
+async def list_withholdings(
+    client: VelneoClient,
+    *,
+    supplier_query: str | None = None,
+    supplier_id: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    sri_status: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Comprobantes de retención emitidos a proveedores (COMP_RETENCIONES).
+
+    Returns the retention amounts split per category: RET_FUE1..3
+    (fuente) + RET_IVA1..2 (IVA). CODE_RET_FUE1 / CODE_RET_IVA1
+    carry the SRI tax code. NAME contains the SRI number (SERIE +
+    SECUENCIA are projection-blocked on this table). Filter by
+    supplier via the NOM WORDS index (``supplier_query``) or by
+    explicit ``supplier_id`` (ENT_ERP_PROV).
+    """
+    nom = (supplier_query or "").strip() or None
+    df = _norm_velneo_date(date_from)
+    dt = _norm_velneo_date(date_to)
+
+    params: dict[str, Any] = {
+        "sort": "-FECHA",
+        "pagesize": min(max(limit * 2, 20), 500),
+    }
+    if supplier_id is not None:
+        params["ENT_ERP_PROV"] = supplier_id
+    if nom:
+        params["words"] = nom
+
+    try:
+        resp = await client.get("COMP_RETENCIONES", params=params, fields=_COMP_RET_FIELDS)
+    except VelneoError as exc:
+        return _err(exc)
+
+    out = _apply_inmemory_filters(
+        resp.rows,
+        date_from=df, date_to=dt,
+        saldo_positive=False, sri_status=sri_status, limit=limit,
+    )
+
+    return {
+        "success": True,
+        "count": len(out),
+        "total_scanned": len(resp.rows),
+        "filter": {
+            "supplier_query": nom, "supplier_id": supplier_id,
+            "date_from": df, "date_to": dt, "sri_status": sri_status,
+        },
+        "withholdings": out,
+    }
+
+
+# ---------------------------------------------------------------------------
+# list_purchase_invoices (CONT_COMPRAS) — facturas de compras
+# ---------------------------------------------------------------------------
+
+
+async def list_purchase_invoices(
+    client: VelneoClient,
+    *,
+    supplier_query: str | None = None,
+    supplier_id: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    sri_status: str | None = None,
+    only_unpaid: bool = False,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Facturas de compras (CONT_COMPRAS), newest first.
+
+    Mirror of ``list_recent_invoices`` for the procurement side.
+    Filter by supplier via NOM WORDS (``supplier_query``) or
+    explicit ENT_ERP_PROV id. ``only_unpaid=true`` keeps rows with
+    SALDO > 0 (accounts-payable view).
+    """
+    nom = (supplier_query or "").strip() or None
+    df = _norm_velneo_date(date_from)
+    dt = _norm_velneo_date(date_to)
+
+    params: dict[str, Any] = {
+        "sort": "-FECHA",
+        "pagesize": min(max(limit * 2, 20), 500),
+    }
+    if supplier_id is not None:
+        params["ENT_ERP_PROV"] = supplier_id
+    if nom:
+        params["words"] = nom
+
+    try:
+        resp = await client.get("CONT_COMPRAS", params=params,
+                                  fields=_CONT_COMPRAS_FIELDS)
+    except VelneoError as exc:
+        return _err(exc)
+
+    out = _apply_inmemory_filters(
+        resp.rows,
+        date_from=df, date_to=dt,
+        saldo_positive=only_unpaid, sri_status=sri_status, limit=limit,
+    )
+    # Same NRO_FAC composition as sales invoices.
+    for r in out:
+        _enrich_fact_row(r)
+
+    return {
+        "success": True,
+        "count": len(out),
+        "total_scanned": len(resp.rows),
+        "filter": {
+            "supplier_query": nom, "supplier_id": supplier_id,
+            "date_from": df, "date_to": dt,
+            "sri_status": sri_status, "only_unpaid": only_unpaid,
+        },
+        "purchase_invoices": out,
+    }
+
+
+# ---------------------------------------------------------------------------
+# F1 customer_full_view — composite tool: identify + activity sweep
+# ---------------------------------------------------------------------------
+
+
+async def customer_full_view(
+    client: VelneoClient,
+    *,
+    customer_query: str | None = None,
+    client_id: int | None = None,
+    cif: str | None = None,
+    days: int = 90,
+) -> dict[str, Any]:
+    """One-call panoramic of a customer.
+
+    Resolves the customer (delegates to identify_customer's path
+    order — exact / WORDS / RAG via the same partner module) and
+    then pulls their last ``days`` of activity across all document
+    types (invoices, orders, debts, payments, credit notes) in
+    PARALLEL. Use this whenever the operator asks "qué pasa con
+    KLEINTURS" or "muéstrame todo de este cliente": it cuts the
+    typical 4-5 follow-up tool calls down to one.
+
+    Returns ``{ partner, snapshot: {invoices: {...}, debts: {...},
+    payments: {...}, ...}, totals: {...} }``. The agent should then
+    summarize in natural language; do NOT dump the raw payload
+    verbatim to the user.
+    """
+    from mcp_theos.tools.partners import identify_customer
+    from datetime import datetime, timedelta, timezone
+
+    # ── Resolve the partner ──────────────────────────────────────────
+    partner_lookup: dict[str, Any] = {}
+    if client_id is not None:
+        # Need to confirm the partner exists + get NAME for the windowed
+        # search. identify_customer accepts ruc/cif so go via the cif
+        # path when we already know the id by reading ENT directly.
+        try:
+            ent = await client.get("ENT", record_id=client_id, fields=[
+                "ID", "NAME", "NOM_COM", "CIF", "MAIL_PRINCIPAL", "TFN_PRI",
+                "SIN_CREDITO", "OFF",
+            ])
+            if not ent.rows:
+                return {"success": False, "error": f"client_id {client_id} not found"}
+            partner_lookup = {
+                "matches": [ent.rows[0]],
+                "found": True, "count": 1,
+                "partner_id": ent.rows[0].get("ID"),
+                "id": ent.rows[0].get("ID"),
+                "name": ent.rows[0].get("NAME") or "",
+                "vat": ent.rows[0].get("CIF") or "",
+            }
+        except VelneoError as exc:
+            return _err(exc)
+    else:
+        partner_lookup = await identify_customer(
+            client, cif=cif, name=customer_query,
+        )
+        if not partner_lookup.get("found"):
+            return {
+                "success": False,
+                "error_code": "partner_not_found",
+                "error": "No pude identificar al cliente con esos datos.",
+                "lookup": partner_lookup,
+            }
+        # When the partner came back as a fuzzy match (WORDS / RAG),
+        # ask the LLM to disambiguate BEFORE pulling activity — the
+        # last thing we want is the agent confidently showing the
+        # wrong customer's account because of a typo.
+        first = partner_lookup["matches"][0]
+        if first.get("_match_via") in ("words", "rag"):
+            return {
+                "success": False,
+                "error_code": "needs_disambiguation",
+                "error": (
+                    "Encontré coincidencias por aproximación. Por favor "
+                    "confirma con el usuario cuál cliente es antes de "
+                    "consultar su actividad."
+                ),
+                "matches": partner_lookup.get("matches", [])[:5],
+            }
+
+    pid = partner_lookup.get("partner_id") or partner_lookup.get("id")
+    if not pid:
+        return {
+            "success": False,
+            "error_code": "needs_disambiguation",
+            "error": "Múltiples clientes coinciden. Confirma con el usuario.",
+            "matches": partner_lookup.get("matches", [])[:5],
+        }
+
+    # ── Compute the date window ──────────────────────────────────────
+    today = datetime.now(timezone.utc).date()
+    from_d = (today - timedelta(days=days)).isoformat()
+    to_d = today.isoformat()
+
+    # ── Pull activity in parallel ────────────────────────────────────
+    docs = await list_documents_window(
+        client,
+        client_id=int(pid),
+        date_from=from_d, date_to=to_d,
+        types=["invoices", "orders", "debts", "payments",
+               "credit_notes"],
+        limit_per_type=15,
+    )
+
+    # ── Totals from open_debts (everything the customer still owes) ──
+    debts = docs["documents"].get("debts", {}).get("items", [])
+    open_debts = [d for d in debts
+                  if not d.get("OFF") and float(d.get("SALDO") or 0) > 0.01]
+    total_saldo = sum(float(d.get("SALDO") or 0) for d in open_debts)
+    overdue = [d for d in open_debts if int(d.get("DIAS") or 0) > 0]
+
+    partner_summary = partner_lookup.get("matches", [{}])[0]
+
+    return {
+        "success": True,
+        "partner": {
+            "id": partner_summary.get("ID"),
+            "name": partner_summary.get("NAME"),
+            "commercial_name": partner_summary.get("NOM_COM"),
+            "cif": partner_summary.get("CIF"),
+            "email": partner_summary.get("MAIL_PRINCIPAL"),
+            "phone": partner_summary.get("TFN_PRI"),
+            "saldo": partner_summary.get("SALDO"),
+            "cupo": partner_summary.get("CUPOC"),
+            "disponible_cupo": partner_summary.get("DISPONIBLE_CUPOC"),
+            "dias_vencidos": partner_summary.get("DIAS_VENCIDOS"),
+            "flags": partner_summary.get("_flags") or [],
+        },
+        "window_days": days,
+        "window": {"from": from_d, "to": to_d},
+        "activity": docs["documents"],
+        "totals": {
+            "total_count": docs.get("total_count"),
+            "open_debt_count": len(open_debts),
+            "open_debt_saldo": round(total_saldo, 2),
+            "overdue_count": len(overdue),
+        },
     }
