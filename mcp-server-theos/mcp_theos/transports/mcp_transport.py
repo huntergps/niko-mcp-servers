@@ -18,7 +18,16 @@ from fastapi.responses import JSONResponse
 
 from mcp_theos.otp import OTP_REQUIRED_MSG, check_session
 from mcp_theos.tenant_resolver import get_tenant_config
-from mcp_theos.tools import invoices, otp_tools, partners, payments, products, sales
+from mcp_theos.tools import (
+    admin_ops,
+    admin_search,
+    invoices,
+    otp_tools,
+    partners,
+    payments,
+    products,
+    sales,
+)
 from mcp_theos.velneo_http import VelneoClient, VelneoError
 
 logger = logging.getLogger(__name__)
@@ -306,6 +315,178 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "required": ["client_id"],
         },
     },
+    # ----------------------------------------------------------------
+    # Internal support tools (admin_ops + admin_search).
+    #
+    # These are NOT OTP-protected: they are meant for the internal
+    # support agent, which is authenticated by the channel layer
+    # (Telegram group + admin allow-list in Lila's chat-id-map), not
+    # by per-customer OTP. The agent's ``enabled_tools`` config decides
+    # which agent gets to see them; the MCP itself exposes them flat.
+    # ----------------------------------------------------------------
+    {
+        "name": "inspect_partner",
+        "description": (
+            "360° view of a customer for support diagnosis: ENT + "
+            "ENT_ERP_CLI extension + flags (SIN_CREDITO, NO_VENDER, "
+            "días vencidos) + a small snapshot of recent invoices, "
+            "orders, open debts and payments. Identify by ``partner_id`` "
+            "(ENT.ID) or by ``cif`` (RUC / cédula). Use this BEFORE "
+            "diving into specific tools — it tells the agent which "
+            "thread to pull."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {"type": "integer", "description": "ENT.ID = ENT_ERP_CLI.ID"},
+                "cif": {"type": "string", "description": "RUC or cédula"},
+            },
+        },
+    },
+    {
+        "name": "list_pending_invoices",
+        "description": (
+            "Active invoices (VENT_FACT_VENT) with SALDO > 0 — i.e. "
+            "unpaid. Collections-oriented. Optional filters: "
+            "``client_id``, ``salesperson_id``, ``date_from`` / "
+            "``date_to`` (ISO YYYY-MM-DD). For SRI-state filtering "
+            "(devuelta, no autorizada) use ``list_recent_invoices`` "
+            "with ``estado=<value>``."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "integer"},
+                "salesperson_id": {"type": "integer"},
+                "date_from": {"type": "string", "description": "ISO YYYY-MM-DD"},
+                "date_to": {"type": "string", "description": "ISO YYYY-MM-DD"},
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+            },
+        },
+    },
+    {
+        "name": "list_recent_invoices",
+        "description": (
+            "Recent invoices (VENT_FACT_VENT) regardless of payment "
+            "status. Useful when the agent needs to find invoices in a "
+            "specific SRI state (devuelta, no autorizada, pendiente) — "
+            "pass the Velneo ``ESTADO`` value via ``estado`` (the "
+            "ESTADO→human mapping is tenant-specific and lives in the "
+            "agent's skill, not on the MCP). Pass ``include_off=true`` "
+            "to also include logically-deleted rows for audit."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "integer"},
+                "salesperson_id": {"type": "integer"},
+                "estado": {"description": "Velneo ESTADO value — tenant-specific"},
+                "date_from": {"type": "string"},
+                "date_to": {"type": "string"},
+                "include_off": {"type": "boolean", "default": False},
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+            },
+        },
+    },
+    {
+        "name": "get_invoice_detail",
+        "description": (
+            "Single invoice with everything bolted on: header + line "
+            "items (INV_MOVIMIENTOS) + debt rows it generated "
+            "(VENT_DEUD_CLIE) + payment applications against those "
+            "debts (DETALLE_COBROS). Identify by ``invoice_id`` "
+            "(VENT_FACT_VENT.ID) or ``nro_fac`` (SRI invoice number "
+            "like ``001-001-581914``)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "invoice_id": {"type": "integer"},
+                "nro_fac": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "list_recent_stock_movements",
+        "description": (
+            "Latest ``INV_MOVIMIENTOS`` rows narrowed by product "
+            "and/or bodega. Used for stock forensics — \"por qué "
+            "el stock dice X cuando ayer hicimos Y\". At least ONE "
+            "of ``product_id``, ``bodega_id`` is required."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "product_id": {"type": "integer"},
+                "bodega_id": {"type": "integer"},
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
+            },
+        },
+    },
+    {
+        "name": "inspect_product_stock",
+        "description": (
+            "Current stock per bodega (EXISTENCIAS) plus the latest "
+            "movements for a product. Combines the snapshot with the "
+            "audit trail in one call."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "product_id": {"type": "integer"},
+                "moves_limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 200},
+            },
+            "required": ["product_id"],
+        },
+    },
+    {
+        "name": "search_velneo",
+        "description": (
+            "Whitelisted lookup against a single Velneo entry-point "
+            "table with optional FK / child-collection expansion. The "
+            "catch-all for support questions the dedicated tools do "
+            "not cover. Allowed tables: PRODUCTOS, VENT_FACT_VENT, "
+            "VENT_ORDEN_VENTA, VENT_DEUD_CLIE, VENT_COBR_DEUD. Allowed "
+            "expansions per table — VENT_FACT_VENT: client / lines / "
+            "debts. VENT_ORDEN_VENTA: client / lines. VENT_DEUD_CLIE: "
+            "client / invoice / payments. VENT_COBR_DEUD: client / "
+            "applications / forms. PRODUCTOS: existencias. Filters are "
+            "exact-match (no LIKE); for free-text product search use "
+            "``search_products`` instead."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "table": {
+                    "type": "string",
+                    "enum": [
+                        "PRODUCTOS",
+                        "VENT_FACT_VENT",
+                        "VENT_ORDEN_VENTA",
+                        "VENT_DEUD_CLIE",
+                        "VENT_COBR_DEUD",
+                    ],
+                },
+                "filters": {
+                    "type": "object",
+                    "description": "FIELD=value pairs (exact match)",
+                    "additionalProperties": True,
+                },
+                "expand": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "FK / child aliases to expand inline",
+                },
+                "fields": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Field projection; omit to use the table's default",
+                },
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 200},
+            },
+            "required": ["table"],
+        },
+    },
 ]
 
 
@@ -330,6 +511,15 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "get_customer_statement": ("invoices.get_customer_statement", invoices.get_customer_statement),
     "get_customer_statement_pdf": ("invoices.get_customer_statement_pdf", invoices.get_customer_statement_pdf),
     "get_customer_payments": ("payments.get_customer_payments", payments.get_customer_payments),
+    # Internal support tools — no OTP gate; the agent's enabled_tools
+    # config (in tenant_<slug>.agents) decides which agent gets them.
+    "inspect_partner": ("admin_ops.inspect_partner", admin_ops.inspect_partner),
+    "list_pending_invoices": ("admin_ops.list_pending_invoices", admin_ops.list_pending_invoices),
+    "list_recent_invoices": ("admin_ops.list_recent_invoices", admin_ops.list_recent_invoices),
+    "get_invoice_detail": ("admin_ops.get_invoice_detail", admin_ops.get_invoice_detail),
+    "list_recent_stock_movements": ("admin_ops.list_recent_stock_movements", admin_ops.list_recent_stock_movements),
+    "inspect_product_stock": ("admin_ops.inspect_product_stock", admin_ops.inspect_product_stock),
+    "search_velneo": ("admin_search.search_velneo", admin_search.search_velneo),
 }
 
 
