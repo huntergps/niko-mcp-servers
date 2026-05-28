@@ -23,6 +23,30 @@ from mcp_theos.otp import (
 from mcp_theos.velneo_http import VelneoClient, VelneoError
 
 
+_EMAIL_SPLIT_CHARS = ",;|"
+
+
+def _pick_first_email(value: str) -> str:
+    """Velneo's ``MAIL_PRINCIPAL`` can hold multiple addresses separated
+    by ``,`` (commonly), ``;`` or ``|``. Return the first one that looks
+    like an email (has ``@`` + a dot in the domain), trimmed.
+    """
+    if not value:
+        return ""
+    raw = str(value).strip()
+    # split on the first matching separator, fallback to single value
+    candidates = [raw]
+    for sep in _EMAIL_SPLIT_CHARS:
+        if sep in raw:
+            candidates = [p.strip() for p in raw.split(sep)]
+            break
+    for c in candidates:
+        c = c.strip().strip("<>").strip()
+        if "@" in c and "." in c.split("@", 1)[1]:
+            return c
+    return ""
+
+
 def _mask_email(email: str) -> str:
     if not email or "@" not in email:
         return "***"
@@ -38,7 +62,10 @@ async def _read_partner_email(
     """Look up ``ENT.MAIL_PRINCIPAL`` (or MAIL_ALTERNO) for a customer.
 
     ``partner_id`` is the shared ``ENT.ID`` / ``ENT_ERP_CLI.ID``.
-    Returns the empty string if Velneo has no email on file.
+    Returns the empty string if Velneo has no email on file. The
+    column can hold multiple addresses joined with ``,``/``;``/``|``;
+    we pick the first one that parses as an email so smtplib doesn't
+    try to deliver to a comma-mangled "address".
     """
     try:
         resp = await client.get(
@@ -51,7 +78,10 @@ async def _read_partner_email(
     if not resp.rows:
         return ""
     row = resp.rows[0]
-    return (row.get("MAIL_PRINCIPAL") or row.get("MAIL_ALTERNO") or "").strip()
+    primary = _pick_first_email(row.get("MAIL_PRINCIPAL") or "")
+    if primary:
+        return primary
+    return _pick_first_email(row.get("MAIL_ALTERNO") or "")
 
 
 async def request_otp(

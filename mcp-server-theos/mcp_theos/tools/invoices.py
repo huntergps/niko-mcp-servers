@@ -331,6 +331,24 @@ async def get_customer_statement_pdf(
     if not data.get("success"):
         return data
 
+    # Short-circuit: if the customer has zero open debts, don't render
+    # a blank PDF — let the LLM tell the customer in plain text.
+    if not data.get("items"):
+        partner = data.get("partner") or {}
+        return {
+            "success": True,
+            "no_debts": True,
+            "partner": partner,
+            "cutoff_date": data.get("cutoff_date"),
+            "totals": data.get("totals") or {"count": 0, "saldo": 0,
+                                              "pagado": 0, "total_deuda": 0},
+            "item_count": 0,
+            "message": (
+                f"{partner.get('name') or 'El cliente'} no tiene deudas "
+                f"pendientes a la fecha. No se genera PDF."
+            ),
+        }
+
     try:
         from mcp_theos.pdf import render_statement_pdf
     except Exception as exc:  # noqa: BLE001
