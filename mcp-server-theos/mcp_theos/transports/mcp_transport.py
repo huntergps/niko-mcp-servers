@@ -91,17 +91,29 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "description": (
             "Look a customer up by RUC, cédula, email, name or phone and "
             "return a merged profile (master + customer-extension fields "
-            "like SALDO / CUPOC). Pass exactly one identifier. "
-            "When ``name`` is used and the exact-match query returns "
-            "zero rows, the tool automatically falls back to pgvector "
-            "RAG against ``tenant_<slug>.partner_embeddings`` and "
-            "returns the top-5 nearest customers. Those rows carry "
-            "``_match_via='rag'`` and a ``_similarity`` score [0..1]. "
-            "When you see RAG hits, DO NOT pick one silently — ask "
-            "the user to confirm (\"encontré KLEINTURS Y "
-            "REPRESENTACIONES, ¿es éste?\") before billing or quoting "
-            "against that partner_id, because a typo can route to the "
-            "wrong customer."
+            "like SALDO / CUPOC). Pass exactly one identifier. The tool "
+            "walks 4 paths in order, falling back only if the prior path "
+            "returned 0 rows:\n"
+            "  1) per-chat cache (5 min TTL) — if you already identified "
+            "this customer in the same conversation, the answer comes "
+            "back instantly with ``from_cache=true``; you do NOT need to "
+            "re-ask the user for their RUC. Pass NO identifier (or the "
+            "same one) to get the cached partner;\n"
+            "  2) exact-match in ENT — CIF tries the typed value, then "
+            "with the SRI \"001\" suffix added or stripped (covers the "
+            "common 10-digit empresa RUC shortcut); phone strips +593, "
+            "spaces, dashes and the leading 0 before lookup; name is "
+            "tried in PARALLEL on NAME and NOM_COM (commercial name);\n"
+            "  3) Velneo WORDS index on ENT — fast token search using "
+            "the same index the ERP UI uses, catches small typos "
+            "(\"KLEIN\" → \"KLEINTURS\"). Hits carry ``_match_via='words'``;\n"
+            "  4) pgvector RAG — last-resort fuzzy via partner_embeddings. "
+            "Hits carry ``_match_via='rag'`` + ``_similarity`` score "
+            "[0..1].\n"
+            "When you see ``_match_via='words'`` or ``'rag'`` matches, "
+            "DO NOT pick one silently — ask the user to confirm "
+            "(\"encontré KLEINTURS Y REPRESENTACIONES, ¿es éste?\") "
+            "before billing or quoting against that partner_id."
         ),
         "inputSchema": {
             "type": "object",
@@ -746,6 +758,13 @@ async def _execute_tool(request: Request, name: str, args: dict[str, Any]) -> st
         args.setdefault("channel", channel)
         if name == "request_otp":
             args.setdefault("channel_user_id", channel_user_id)
+
+    # identify_customer uses channel_user_id for the per-chat partner
+    # cache (skips re-lookup when the agent re-asks about the same
+    # customer within 5 minutes). Hidden from the LLM schema.
+    if name == "identify_customer":
+        args = dict(args)
+        args.setdefault("channel_user_id", channel_user_id)
 
     async with VelneoClient(cfg) as client:
         try:
