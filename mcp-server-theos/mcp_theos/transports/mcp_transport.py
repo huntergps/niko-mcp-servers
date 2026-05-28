@@ -16,8 +16,9 @@ from typing import Any, Awaitable, Callable
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from mcp_theos.otp import OTP_REQUIRED_MSG, check_session
 from mcp_theos.tenant_resolver import get_tenant_config
-from mcp_theos.tools import invoices, partners, payments, products, sales
+from mcp_theos.tools import invoices, otp_tools, partners, payments, products, sales
 from mcp_theos.velneo_http import VelneoClient, VelneoError
 
 logger = logging.getLogger(__name__)
@@ -172,9 +173,48 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "request_otp",
+        "description": (
+            "Send a 6-digit verification code to the customer's email "
+            "(ENT.MAIL_PRINCIPAL). REQUIRED before any financial tool "
+            "(check_balance, get_customer_invoices, get_customer_payments) "
+            "will return data. Only pass ``partner_id`` — channel and "
+            "channel_user_id come from the chat context headers. If the "
+            "customer already has a valid 24h session, this short-circuits "
+            "with ``already_verified=true`` instead of spamming a new email."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {"type": "integer", "description": "ENT.ID (= ENT_ERP_CLI.ID) returned by identify_customer"},
+                "email": {"type": "string", "description": "Optional override; default reads ENT.MAIL_PRINCIPAL"},
+            },
+            "required": ["partner_id"],
+        },
+    },
+    {
+        "name": "verify_otp",
+        "description": (
+            "Verify the 6-digit code the customer typed in the chat. On "
+            "success, a 24h verified session opens for that "
+            "(tenant, partner, channel) tuple so the financial tools "
+            "stop refusing."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {"type": "integer"},
+                "code": {"type": "string", "description": "6-digit code"},
+            },
+            "required": ["partner_id", "code"],
+        },
+    },
+    {
         "name": "get_customer_invoices",
         "description": (
-            "List invoices for a client. Set ``include_lines=true`` to "
+            "List invoices for a client. REQUIRES a verified OTP session "
+            "for the customer — call request_otp + verify_otp first if "
+            "the gate rejects the call. Set ``include_lines=true`` to "
             "also fetch each invoice's line items."
         ),
         "inputSchema": {
@@ -190,7 +230,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
     {
         "name": "check_balance",
         "description": (
-            "Customer balance summary (SALDO, DEUDASC, CUPOC, etc.). Set "
+            "Customer balance summary (SALDO, DEUDASC, CUPOC, etc.). "
+            "REQUIRES a verified OTP session — call request_otp + "
+            "verify_otp first if the gate rejects the call. Set "
             "``detailed=true`` to also pull per-invoice aging."
         ),
         "inputSchema": {
@@ -205,8 +247,10 @@ MCP_TOOLS: list[dict[str, Any]] = [
     {
         "name": "get_customer_payments",
         "description": (
-            "List customer payments. Set ``include_detail=true`` to also "
-            "pull the payment-to-debt allocation."
+            "List customer payments. REQUIRES a verified OTP session — "
+            "call request_otp + verify_otp first if the gate rejects "
+            "the call. Set ``include_detail=true`` to also pull the "
+            "payment-to-debt allocation."
         ),
         "inputSchema": {
             "type": "object",
@@ -235,10 +279,22 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "create_quotation": ("sales.create_quotation", sales.create_quotation),
     "get_quotation": ("sales.get_quotation", sales.get_quotation),
     "list_quotations": ("sales.list_quotations", sales.list_quotations),
+    "request_otp": ("otp_tools.request_otp", otp_tools.request_otp),
+    "verify_otp": ("otp_tools.verify_otp", otp_tools.verify_otp),
     "get_customer_invoices": ("invoices.get_customer_invoices", invoices.get_customer_invoices),
     "check_balance": ("invoices.check_balance", invoices.check_balance),
     "get_customer_payments": ("payments.get_customer_payments", payments.get_customer_payments),
 }
+
+
+# Tools that refuse to return data until the customer's identity has
+# been verified through request_otp + verify_otp. The gate runs in
+# _execute_tool, BEFORE the dispatch hits the underlying function.
+OTP_PROTECTED_TOOLS: frozenset[str] = frozenset({
+    "check_balance",
+    "get_customer_invoices",
+    "get_customer_payments",
+})
 
 
 def _parse_allowed_tools(request: Request) -> set[str] | None:
@@ -256,6 +312,21 @@ def _make_error(req_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
+def _read_channel_ctx(request: Request) -> tuple[str, str]:
+    """Pull X-Channel / X-Channel-User-Id from request headers."""
+    channel = (
+        request.headers.get("x-channel")
+        or request.headers.get("X-Channel")
+        or ""
+    ).strip().lower()
+    cuid = (
+        request.headers.get("x-channel-user-id")
+        or request.headers.get("X-Channel-User-Id")
+        or ""
+    ).strip()
+    return channel, cuid
+
+
 async def _execute_tool(request: Request, name: str, args: dict[str, Any]) -> str:
     entry = _DISPATCH.get(name)
     if entry is None:
@@ -263,6 +334,46 @@ async def _execute_tool(request: Request, name: str, args: dict[str, Any]) -> st
     _label, fn = entry
 
     cfg = await get_tenant_config(request)
+    channel, channel_user_id = _read_channel_ctx(request)
+
+    # OTP gate — refuse financial tools until a verified session exists.
+    if name in OTP_PROTECTED_TOOLS:
+        partner_id = args.get("client_id") or args.get("partner_id")
+        try:
+            partner_id_int = int(partner_id) if partner_id else 0
+        except (TypeError, ValueError):
+            partner_id_int = 0
+        if not partner_id_int:
+            return json.dumps({
+                "success": False,
+                "error_code": "missing_partner_id",
+                "error": "client_id es requerido para datos financieros.",
+            }, ensure_ascii=False)
+        if not channel:
+            return json.dumps({
+                "success": False,
+                "error_code": "missing_channel",
+                "error": (
+                    "El orchestrator no envio X-Channel. Datos financieros "
+                    "no se pueden mostrar sin contexto de canal."
+                ),
+            }, ensure_ascii=False)
+        has_session = await check_session(cfg.tenant_id, partner_id_int, channel)
+        if not has_session:
+            return json.dumps({
+                "success": False,
+                "error_code": "otp_required",
+                "error": OTP_REQUIRED_MSG,
+            }, ensure_ascii=False)
+
+    # OTP tools need channel context injected from headers (the LLM
+    # should NOT have to know how to address the chat session).
+    if name in ("request_otp", "verify_otp"):
+        args = dict(args)
+        args.setdefault("channel", channel)
+        if name == "request_otp":
+            args.setdefault("channel_user_id", channel_user_id)
+
     async with VelneoClient(cfg) as client:
         try:
             result = await fn(client, **args)

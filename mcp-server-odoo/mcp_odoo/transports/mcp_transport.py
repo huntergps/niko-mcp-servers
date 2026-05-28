@@ -379,14 +379,52 @@ def _get_tenant_smtp_config(tenant_id: str | None, supa_url: str | None = None, 
     return None
 
 
-def _send_otp_email(email: str, code: str, company_name: str = "TecnoSmart", tenant_id: str | None = None, supa_url: str | None = None, supa_key: str | None = None) -> tuple[bool, str]:
+def _resolve_tenant_brand(tenant_id: str | None, supa_url: str | None = None, supa_key: str | None = None) -> str:
+    """Read public.tenants.commercial_name (fallback name).
+
+    Never hardcode a brand for OTP emails — this function runs once
+    per send and stays cheap because it only hits public.tenants
+    which is exposed via PostgREST.
+    """
+    if not tenant_id:
+        return ""
+    try:
+        import os as _os
+        _url = supa_url or _os.environ.get("SUPABASE_URL", "http://localhost:8000")
+        _key = supa_key or _os.environ.get("SUPABASE_SERVICE_KEY", "")
+        if not _key:
+            return ""
+        from supabase import create_client
+        sb = create_client(_url, _key)
+        result = (
+            sb.table("tenants")
+              .select("name,commercial_name")
+              .eq("id", tenant_id)
+              .limit(1)
+              .execute()
+        )
+        if result.data:
+            row = result.data[0]
+            return (row.get("commercial_name") or row.get("name") or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to load tenant brand for %s: %s", tenant_id, exc)
+    return ""
+
+
+def _send_otp_email(email: str, code: str, company_name: str | None = None, tenant_id: str | None = None, supa_url: str | None = None, supa_key: str | None = None) -> tuple[bool, str]:
     """Send OTP via SMTP with HTML template. Returns (success, message).
 
     First tries tenant-specific SMTP config from Supabase, falls back to env vars.
+    The ``company_name`` defaults to ``public.tenants.commercial_name`` — never
+    hardcoded to a particular brand. Pass a value explicitly only when an
+    override is genuinely needed.
     """
     import os
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText as _MIMEText
+
+    if not company_name:
+        company_name = _resolve_tenant_brand(tenant_id, supa_url, supa_key) or "Asistencia"
 
     # Try tenant-specific SMTP config first
     tenant_smtp = _get_tenant_smtp_config(tenant_id, supa_url, supa_key)
