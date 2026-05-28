@@ -25,11 +25,17 @@ _PRECIOS_FIELDS = [
 
 def _looks_like_code(q: str) -> bool:
     """Heuristic: a Velneo CODIGO is alphanumeric (sometimes with dashes
-    and underscores), no spaces, max ~15 chars. Anything longer or with
-    spaces is treated as natural-language text — which Velneo cannot
-    match because its REST filter is EXACT only.
+    and underscores), no spaces, max ~15 chars, AND must contain at
+    least one digit. The digit requirement is what separates ``"01S1"``
+    or ``"109950"`` from ordinary product names like ``"ARROZ"`` or
+    ``"LECHE"`` — both meet the no-space / short-length test but neither
+    is a SKU. Without this guard the tool would route every short query
+    through ``?filter[CODIGO]=`` and silently return zero for any
+    natural-language search.
     """
     if not q or " " in q or len(q) > 20:
+        return False
+    if not any(ch.isdigit() for ch in q):
         return False
     return all(ch.isalnum() or ch in "-_" for ch in q)
 
