@@ -9,14 +9,63 @@ from typing import Any
 
 from mcp_theos.velneo_http import VelneoClient, VelneoError
 
+# Field allowlist verified empirically against Mepriga (2026-05-28).
+# The API key niko_saas BLOCKS projection on these columns:
+#
+#   FECHA_FACT, IVA12, ENT_ERP_CLI, ESTADO, NRO_FAC, DIVISIONES,
+#   EMAIL, CIF, MAIL_PRINCIPAL, ESTADO_FEAP, VERSION_SRI, UID_DATIL,
+#   RIDE_IMPORT_ESTADO, WEB_DATIL, ERROR, FECHA_RET, FORMATO_FECHA
+#
+# Velneo drops the WHOLE response when any projected field is blocked
+# (silent zero rows). So we project ONLY allowed columns. Substitutes
+# for the most important blocked ones:
+#
+#   * NRO_FAC → reconstruct from SERIE + SECUENCIA (see build_sri_number)
+#   * ENT_ERP_CLI client name → RAZONSOCIALCOMPRADOR + SRI_IDENTIFICACION
+#     (the SRI-side denormalized customer block, always populated for
+#     facturas con factura electrónica)
+#   * ESTADO / ESTADO_FEAP → LAST_STATUS (the human-readable SRI status
+#     string Datil returns: "AUTORIZADO", "DEVUELTA", "NO AUTORIZADO",
+#     "PENDIENTE", etc.)
 _FACT_FIELDS = [
-    "ID", "NAME", "FECHA", "FECHA_FACT",
-    "ENT_ERP_CLI", "VENDEDOR",
+    # Identifiers and dates
+    "ID", "NAME", "FECHA",
+    "SERIE", "SECUENCIA",
+    "ESTABLECIMIENTO", "PUNTOEMISION",  # alt path to SRI number components
+    # Customer (denormalized — substitutes the blocked ENT_ERP_CLI join)
+    "RAZONSOCIALCOMPRADOR", "SRI_IDENTIFICACION",
+    # Amounts
     "SUBTOTAL", "BASE_IVA", "BASE0", "IVA", "TOTAL",
     "PAGADO", "SALDO",
-    "ESTADO", "OFF",
-    "NRO_FAC",
+    # Op metadata
+    "VENDEDOR", "VTA_TIPO_ENT", "SUC", "EMP", "INV_BODEGA",
+    "OFF", "OFF_MOTIVO", "REF", "REF2",
+    # SRI / Datil status (substitutes for blocked ESTADO / ESTADO_FEAP)
+    "TIENE_ELECTRONICA", "SRI_TIPO_FEAP",
+    "LAST_STATUS",         # human-readable SRI state: "AUTORIZADO" etc.
+    "VCACCESOSRI",         # 49-digit clave de acceso
+    "AUTORIZACION",        # autorización number SRI
+    "KEY",                 # Datil internal UUID
+    "TIPO_AMBIENTE",       # "1"=pruebas, "2"=producción
+    "VENTA_CREDITO",
 ]
+
+
+def build_sri_number(serie: Any, secuencia: Any, *, pad_secuencia: int = 9) -> str:
+    """Compose SRI invoice number "001-001-565825" from SERIE + SECUENCIA.
+
+    Velneo's ``NRO_FAC`` column is projection-blocked under the
+    niko_saas API key, but the two parts that make it up (``SERIE``
+    like "001-001" and ``SECUENCIA`` like 565825) come back fine. We
+    join them with a dash and pad the secuencia to 9 digits (SRI's
+    canonical width for invoice numbers in Ecuador).
+    """
+    s = str(serie or "").strip()
+    try:
+        n = int(secuencia)
+    except (TypeError, ValueError):
+        return s
+    return f"{s}-{n:0{pad_secuencia}d}" if s else f"{n:0{pad_secuencia}d}"
 
 _DEUD_FIELDS = [
     "ID", "NAME", "FECHA", "VENCIMIENTO",
@@ -45,6 +94,10 @@ async def get_customer_invoices(
         return {"success": False, "error": f"velneo {exc.status} {exc.message}"}
 
     invoices = resp.rows[:limit]
+    # Derive nro_fac in every row so callers see the SRI number even
+    # though NRO_FAC itself is projection-blocked.
+    for inv in invoices:
+        inv["NRO_FAC"] = build_sri_number(inv.get("SERIE"), inv.get("SECUENCIA"))
     if include_lines:
         for inv in invoices:
             inv_id = inv.get("ID")

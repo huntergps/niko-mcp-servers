@@ -262,3 +262,89 @@ class VelneoClient:
         resp = await self._client.get(f"_process/{quote(name)}", params=q)
         resp.raise_for_status()
         return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Proceso invocation helper (used by admin tools)
+# ---------------------------------------------------------------------------
+
+
+# Velneo returns 200 OK with a plain string body when the API key
+# is not authorized to execute the proceso. Detect that pattern so we
+# can degrade gracefully into the REST fallback.
+_PROCESO_PERMISSION_MARKERS = (
+    "No es posible ejecutar el proceso",
+    "no es posible ejecutar el proceso",
+)
+
+
+async def call_proceso_or_message(
+    client: "VelneoClient",
+    name: str,
+    params: dict[str, Any] | None = None,
+    *,
+    row_keys: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Invoke a proceso and return ``{"ok": bool, "rows": [...], ...}``.
+
+    Wraps :meth:`VelneoClient.process` with:
+
+    * Detection of the "permission denied" string Velneo returns when
+      the API key cannot execute the proceso (the body is a plain
+      string, not the proceso's normal JSON). When detected we return
+      ``{"ok": False, "permission_denied": True, "message": "..."}``
+      so callers can fall back to a REST-only path.
+    * Row extraction: procesos that build a Cesta of records expose
+      them under a top-level key shaped like the table (``vent_fact_vent``,
+      ``inv_movimientos``, ...). Pass the candidate keys via
+      ``row_keys`` and we will pick the first list-valued match (upper-
+      casing each row's keys to match the documented schema, just like
+      :func:`extract_rows` does for table list responses).
+    """
+    try:
+        body = await client.process(name, params=params)
+    except Exception as exc:  # noqa: BLE001 — surface transport errors as data
+        return {
+            "ok": False,
+            "transport_error": f"{type(exc).__name__}: {exc}",
+        }
+
+    # Permission-denied shape: plain string body or {"errors": [...]}
+    if isinstance(body, dict) and body.get("errors"):
+        first = body["errors"][0] if body["errors"] else ""
+        msg = (
+            first.get("message") if isinstance(first, dict)
+            else str(first)
+        )
+        if any(m in str(msg) for m in _PROCESO_PERMISSION_MARKERS):
+            return {"ok": False, "permission_denied": True, "message": msg}
+    if isinstance(body, str) and any(m in body for m in _PROCESO_PERMISSION_MARKERS):
+        return {"ok": False, "permission_denied": True, "message": body}
+
+    # Extract rows from the cesta key (lowercase = table name).
+    rows: list[dict[str, Any]] = []
+    if isinstance(body, dict):
+        for k in row_keys:
+            v = body.get(k.lower())
+            if isinstance(v, list):
+                rows = [_upper_keys(r) for r in v if isinstance(r, dict)]
+                break
+        if not rows:
+            # Fallback: pick the first list-valued top-level key.
+            for k, v in body.items():
+                if k in {"errors", "count", "total_count"}:
+                    continue
+                if isinstance(v, list):
+                    rows = [_upper_keys(r) for r in v if isinstance(r, dict)]
+                    break
+
+    return {
+        "ok": True,
+        "rows": rows,
+        "count": len(rows),
+        "total_count": (
+            int(body.get("total_count") or len(rows))
+            if isinstance(body, dict) else len(rows)
+        ),
+        "raw": body,
+    }

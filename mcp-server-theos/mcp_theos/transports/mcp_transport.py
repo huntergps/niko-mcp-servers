@@ -396,20 +396,32 @@ MCP_TOOLS: list[dict[str, Any]] = [
     {
         "name": "list_pending_invoices",
         "description": (
-            "Active invoices (VENT_FACT_VENT) with SALDO > 0 — i.e. "
-            "unpaid. Collections-oriented. Optional filters: "
-            "``client_id``, ``salesperson_id``, ``date_from`` / "
-            "``date_to`` (ISO YYYY-MM-DD). For SRI-state filtering "
-            "(devuelta, no autorizada) use ``list_recent_invoices`` "
-            "with ``estado=<value>``."
+            "Active invoices with SALDO > 0 (unpaid). Delegates to "
+            "Velneo proceso ``VENT_FACT_BUSQ_3P`` (newest first, "
+            "WORDS+PARTS index on NAME) with REST fallback. Each row "
+            "comes back with: SERIE+SECUENCIA (combined into NRO_FAC), "
+            "RAZONSOCIALCOMPRADOR + SRI_IDENTIFICACION (the customer), "
+            "TOTAL/PAGADO/SALDO, and the SRI/Datil block: LAST_STATUS "
+            "(human-readable: \"AUTORIZADO\", \"DEVUELTA\", \"NO "
+            "AUTORIZADO\", \"PENDIENTE\"), VCACCESOSRI (49-digit clave "
+            "de acceso), AUTORIZACION (autorización SRI number), "
+            "TIENE_ELECTRONICA. Filters: ``customer_query`` for the "
+            "WORDS index, ``client_id`` for FK filter, "
+            "``salesperson_id``, ``branch_id``, date range, and "
+            "``sri_status`` (substring match against LAST_STATUS — "
+            "case-insensitive)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "customer_query": {"type": "string"},
                 "client_id": {"type": "integer"},
                 "salesperson_id": {"type": "integer"},
+                "branch_id": {"type": "integer"},
                 "date_from": {"type": "string", "description": "ISO YYYY-MM-DD"},
                 "date_to": {"type": "string", "description": "ISO YYYY-MM-DD"},
+                "sri_status": {"type": "string",
+                                "description": "substring of LAST_STATUS, e.g. \"AUTORIZADO\", \"DEVUELTA\""},
                 "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
             },
         },
@@ -417,23 +429,47 @@ MCP_TOOLS: list[dict[str, Any]] = [
     {
         "name": "list_recent_invoices",
         "description": (
-            "Recent invoices (VENT_FACT_VENT) regardless of payment "
-            "status. Useful when the agent needs to find invoices in a "
-            "specific SRI state (devuelta, no autorizada, pendiente) — "
-            "pass the Velneo ``ESTADO`` value via ``estado`` (the "
-            "ESTADO→human mapping is tenant-specific and lives in the "
-            "agent's skill, not on the MCP). Pass ``include_off=true`` "
-            "to also include logically-deleted rows for audit."
+            "Recent invoices, newest first. Same engine as "
+            "``list_pending_invoices`` minus the SALDO > 0 filter — "
+            "use for \"qué pasó hoy con KLEINTURS\" or \"facturas "
+            "devueltas por SRI esta semana\". Filter by SRI state via "
+            "``sri_status`` (substring match against LAST_STATUS, "
+            "e.g. \"DEVUELTA\", \"NO AUTORIZADO\", \"PENDIENTE\", "
+            "\"AUTORIZADO\")."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "customer_query": {"type": "string"},
                 "client_id": {"type": "integer"},
                 "salesperson_id": {"type": "integer"},
-                "estado": {"description": "Velneo ESTADO value — tenant-specific"},
+                "branch_id": {"type": "integer"},
                 "date_from": {"type": "string"},
                 "date_to": {"type": "string"},
+                "sri_status": {"type": "string"},
                 "include_off": {"type": "boolean", "default": False},
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+            },
+        },
+    },
+    {
+        "name": "list_invoices_pending_dispatch",
+        "description": (
+            "Facturas con líneas pendientes de despacho "
+            "(CAN_NO_DESP != 0). Usa el flag ``MOSTRAR_POR_DESPACHAR`` "
+            "del proceso ``ERP_APP/VENT_FACT_BUSQ_3P``; no hay "
+            "equivalente REST. Si el permiso de proceso no está "
+            "habilitado el tool devuelve ``error_code=proceso_permission_denied``."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_query": {"type": "string"},
+                "branch_id": {"type": "integer"},
+                "date_from": {"type": "string"},
+                "date_to": {"type": "string"},
+                "strict": {"type": "boolean", "default": True,
+                           "description": "true = sólo facturas con CAN_NO_DESP > 0"},
                 "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
             },
         },
@@ -586,6 +622,7 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "list_pending_invoices": ("admin_ops.list_pending_invoices", admin_ops.list_pending_invoices),
     "list_recent_invoices": ("admin_ops.list_recent_invoices", admin_ops.list_recent_invoices),
     "get_invoice_detail": ("admin_ops.get_invoice_detail", admin_ops.get_invoice_detail),
+    "list_invoices_pending_dispatch": ("admin_ops.list_invoices_pending_dispatch", admin_ops.list_invoices_pending_dispatch),
     "list_recent_stock_movements": ("admin_ops.list_recent_stock_movements", admin_ops.list_recent_stock_movements),
     "check_stock": ("products.check_stock", products.check_stock),
     "search_velneo": ("admin_search.search_velneo", admin_search.search_velneo),
