@@ -161,13 +161,23 @@ class VelneoClient:
         MCP (pgvector RAG against ``tenant_<slug>.product_embeddings``).
         """
         path = table if record_id is None else f"{table}/{quote(str(record_id))}"
-        reserved = {"page", "pagesize", "fields", "limit"}
+        # Velneo uses JSON:API for pagination (``page[number]`` /
+        # ``page[size]``). The naked ``page=`` / ``pagesize=`` form
+        # the doc shows is silently ignored — exactly the same trap
+        # as ``?FIELD=value`` ignored in favor of ``?filter[FIELD]=``.
+        # We translate the caller-friendly names (``page``,
+        # ``pagesize``, ``limit``) into JSON:API here so call sites
+        # don't have to know.
         q: dict[str, Any] = {}
         for k, v in (params or {}).items():
             if v is None:
                 continue
-            if k in reserved:
-                q[k] = v
+            if k in ("page", "page_number"):
+                q["page[number]"] = v
+            elif k in ("pagesize", "page_size", "limit"):
+                q["page[size]"] = v
+            elif k == "fields":
+                q["fields"] = v if isinstance(v, str) else ",".join(v)
             else:
                 q[f"filter[{k}]"] = v
         if fields:
@@ -212,6 +222,8 @@ class VelneoClient:
         page = 1
         while page <= mp:
             q: dict[str, Any] = dict(params or {})
+            # ``get()`` translates these into ``page[number]`` /
+            # ``page[size]`` — caller-friendly names stay here.
             q.update({"page": page, "pagesize": ps})
             resp = await self.get(table, params=q, fields=fields)
             if not resp.rows:
