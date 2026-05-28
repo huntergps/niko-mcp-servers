@@ -15,9 +15,13 @@ from typing import Any
 from fastapi import FastAPI, Request
 
 from mcp_theos.config import settings
+from mcp_theos.logging_setup import setup_structured_logging
 from mcp_theos.tenant_resolver import clear_cache, get_tenant_config
 from mcp_theos.transports.mcp_transport import router as mcp_router
 from mcp_theos.velneo_http import VelneoClient
+
+
+setup_structured_logging()
 
 
 @asynccontextmanager

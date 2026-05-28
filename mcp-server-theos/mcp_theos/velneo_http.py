@@ -141,13 +141,14 @@ class VelneoClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def get(
+    async def get(  # noqa: C901 — single hot path
         self,
         table: str,
         *,
         record_id: int | str | None = None,
         params: dict[str, Any] | None = None,
         fields: list[str] | None = None,
+        use_cache: bool = True,
     ) -> VelneoResponse:
         """GET a list or a single record.
 
@@ -182,9 +183,24 @@ class VelneoClient:
                 q[f"filter[{k}]"] = v
         if fields:
             q["fields"] = ",".join(fields)
-        resp = await self._client.get(path, params=q)
-        resp.raise_for_status()
-        body = resp.json()
+
+        # D3 response cache — keyed off (tenant_id, GET, path, q).
+        # Skipped when use_cache=False; writes still go through .post()
+        # which bypasses this path entirely.
+        from mcp_theos.cache import make_response_key, response_cache
+        cache_key = make_response_key(
+            getattr(self.cfg, "tenant_id", "") or "",
+            "GET", path, q,
+        ) if use_cache else ""
+        cached_body = response_cache.get(cache_key) if cache_key else None
+        if cached_body is not None:
+            body = cached_body
+        else:
+            resp = await self._client.get(path, params=q)
+            resp.raise_for_status()
+            body = resp.json()
+            if cache_key:
+                response_cache.set(cache_key, body)
         _check_errors(body)
 
         if record_id is not None:
@@ -260,6 +276,45 @@ class VelneoClient:
         for k, v in (params or {}).items():
             q[f"param[{k}]"] = v
         resp = await self._client.get(f"_process/{quote(name)}", params=q)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def query(
+        self,
+        name: str,
+        *,
+        filters: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        page_size: int | None = None,
+        page: int | None = None,
+    ) -> dict[str, Any]:
+        """Invoke a Velneo ``_query/<name>`` endpoint.
+
+        Velneo exposes its Búsquedas via two parallel URLs:
+
+        * ``/_process/<name>`` — caller passes ``param[VAR]=value``
+        * ``/_query/<name>``   — caller passes ``filter[FIELD]=value``
+          and standard pagination (``page[size]`` / ``page[number]``)
+
+        Some Búsquedas accept both shapes (verified empirically on
+        Mepriga: ``_query/vent_fact_vent_busq`` works with ``param[]``
+        proceso-style). This helper sends whichever the caller passes;
+        when both are given they're combined.
+        """
+        q: dict[str, Any] = {}
+        if page_size is not None:
+            q["page[size]"] = int(page_size)
+        if page is not None:
+            q["page[number]"] = int(page)
+        for k, v in (filters or {}).items():
+            if v is None:
+                continue
+            q[f"filter[{k}]"] = v
+        for k, v in (params or {}).items():
+            if v is None:
+                continue
+            q[f"param[{k}]"] = v
+        resp = await self._client.get(f"_query/{quote(name)}", params=q)
         resp.raise_for_status()
         return resp.json()
 

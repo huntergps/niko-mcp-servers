@@ -698,6 +698,75 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_open_debts",
+        "description": (
+            "Customer debts with SALDO > 0 via the native Velneo "
+            "``_query/deudas_cli_con_saldo`` (server-side SALDO+OFF "
+            "pre-filter — accurate, won't miss rows past page 1). "
+            "Filter por ``client_id`` (más rápido) o ``customer_query`` "
+            "(WORDS fallback in-memory). Devuelve totales agregados "
+            "más un ``by_age_bucket`` (0_30, 31_60, 61_90, 90_plus, "
+            "not_yet_due) para reportes de antigüedad."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "integer"},
+                "customer_query": {"type": "string"},
+                "only_overdue": {"type": "boolean", "default": False},
+                "date_from": {"type": "string"},
+                "date_to": {"type": "string"},
+                "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": 500},
+            },
+        },
+    },
+    {
+        "name": "velneo_query",
+        "description": (
+            "Generic Velneo Búsqueda invoker via ``_query/<name>``. "
+            "Whitelisted to: deudas_cli_con_saldo, vent_deud_clie_busq*, "
+            "vent_fact_vent_busq*, productos_busq, presen_busq, "
+            "buscar_cod_bar, cod_bar_parts, corte_deudas_* (verified "
+            "vs untested status returned in the response). Pass "
+            "``filters`` for REST-style ``filter[FIELD]=value`` and/or "
+            "``params`` for proceso-style ``param[VAR]=value`` — some "
+            "Búsquedas accept both. Use this when none of the dedicated "
+            "tools fits."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "filters": {"type": "object", "additionalProperties": True},
+                "params": {"type": "object", "additionalProperties": True},
+                "page_size": {"type": "integer", "default": 100, "minimum": 1, "maximum": 500},
+                "page": {"type": "integer", "default": 1, "minimum": 1},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "partner_360",
+        "description": (
+            "Audit-grade panoramic of a customer: ENT + ENT_ERP_CLI "
+            "extension + flags + deudas abiertas vía "
+            "``_query/deudas_cli_con_saldo`` + aging buckets "
+            "(0_30, 31_60, 61_90, 90_plus, not_yet_due) + últimos "
+            "10 cobros. Identifica por partner_id, cif o "
+            "customer_query (mismo orden de paths que "
+            "identify_customer). Si el match es por WORDS o RAG, "
+            "retorna ``error_code=needs_disambiguation``."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {"type": "integer"},
+                "cif": {"type": "string"},
+                "customer_query": {"type": "string"},
+            },
+        },
+    },
+    {
         "name": "customer_full_view",
         "description": (
             "Vista panorámica de un cliente en una sola llamada. "
@@ -902,6 +971,9 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "list_withholdings": ("admin_ops.list_withholdings", admin_ops.list_withholdings),
     "list_purchase_invoices": ("admin_ops.list_purchase_invoices", admin_ops.list_purchase_invoices),
     "list_supplier_debts": ("admin_ops.list_supplier_debts", admin_ops.list_supplier_debts),
+    "get_open_debts": ("admin_ops.get_open_debts", admin_ops.get_open_debts),
+    "velneo_query": ("admin_ops.velneo_query", admin_ops.velneo_query),
+    "partner_360": ("admin_ops.partner_360", admin_ops.partner_360),
     "customer_full_view": ("admin_ops.customer_full_view", admin_ops.customer_full_view),
     "list_recent_stock_movements": ("admin_ops.list_recent_stock_movements", admin_ops.list_recent_stock_movements),
     "check_stock": ("products.check_stock", products.check_stock),
@@ -1034,15 +1106,35 @@ async def _execute_tool(request: Request, name: str, args: dict[str, Any]) -> st
         args = dict(args)
         args.setdefault("channel_user_id", channel_user_id)
 
+    import time
+    t0 = time.monotonic()
+    log_ctx = {
+        "tool": name,
+        "tenant_id": getattr(cfg, "tenant_id", "") or "",
+        "tenant_slug": getattr(cfg, "slug", "") or "",
+        "channel": channel,
+        "channel_user_id": channel_user_id,
+    }
     async with VelneoClient(cfg) as client:
         try:
             result = await fn(client, **args)
         except TypeError as exc:
+            logger.info(
+                "tool_call",
+                extra={**log_ctx, "ok": False, "error": f"bad_args:{exc}",
+                       "latency_ms": int((time.monotonic() - t0) * 1000)},
+            )
             return json.dumps(
                 {"success": False, "error": f"bad arguments: {exc}"},
                 ensure_ascii=False,
             )
         except VelneoError as exc:
+            logger.info(
+                "tool_call",
+                extra={**log_ctx, "ok": False,
+                       "error": f"velneo_{exc.status}:{exc.message}",
+                       "latency_ms": int((time.monotonic() - t0) * 1000)},
+            )
             return json.dumps(
                 {
                     "success": False,
@@ -1051,6 +1143,14 @@ async def _execute_tool(request: Request, name: str, args: dict[str, Any]) -> st
                 },
                 ensure_ascii=False,
             )
+    ok = bool(result.get("success", True)) if isinstance(result, dict) else True
+    err_code = result.get("error_code") or result.get("error") if isinstance(result, dict) and not ok else None
+    logger.info(
+        "tool_call",
+        extra={**log_ctx, "ok": ok,
+               "error": (str(err_code)[:120] if err_code else None),
+               "latency_ms": int((time.monotonic() - t0) * 1000)},
+    )
     return json.dumps(result, ensure_ascii=False, default=str)
 
 

@@ -23,10 +23,21 @@ logger = logging.getLogger(__name__)
 
 
 async def embed_query(text: str) -> list[float]:
-    """Single-text embedding via Ollama's batch endpoint."""
+    """Single-text embedding via Ollama's batch endpoint.
+
+    Hot path is cached for 1 hour (see ``mcp_theos.cache``) — the same
+    customer query typed twice in close succession (typical Lila
+    re-ask pattern) does NOT round-trip to Ollama the second time.
+    """
     clean = (text or "").strip()
     if not clean:
         raise ValueError("empty query")
+    from mcp_theos.cache import embedding_cache, make_embedding_key
+    key = make_embedding_key(settings.embedding_model, clean)
+    cached = embedding_cache.get(key)
+    if cached is not None:
+        return cached
+
     async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.post(
             f"{settings.ollama_url}/api/embed",
@@ -38,6 +49,7 @@ async def embed_query(text: str) -> list[float]:
         raise RuntimeError(
             f"ollama returned no embedding for {settings.embedding_model!r}"
         )
+    embedding_cache.set(key, embeddings[0])
     return embeddings[0]
 
 

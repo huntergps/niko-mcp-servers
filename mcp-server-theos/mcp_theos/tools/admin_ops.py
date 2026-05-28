@@ -1763,6 +1763,373 @@ async def list_supplier_debts(
 
 
 # ---------------------------------------------------------------------------
+# get_open_debts — wrapper around _query/deudas_cli_con_saldo
+# ---------------------------------------------------------------------------
+
+
+_STMT_DEUD_FIELDS = [
+    "ID", "NAME", "FECHA", "VENCIMIENTO",
+    "ENT_ERP_CLI", "EGRESOS",
+    "TOTAL_DEUDA", "PAGADO", "CRUZADO", "SALDO", "RETENIDO",
+    "DIAS", "DIAS_VENCIDOS",
+    "CON_SALDO", "POR_VENCER", "COBRADO", "OFF",
+    "REFERENCIA",
+    "NRO_DEUDA", "NRO_TOTAL_DEUDAS", "TIPO",
+]
+
+
+async def get_open_debts(
+    client: VelneoClient,
+    *,
+    client_id: int | None = None,
+    customer_query: str | None = None,
+    only_overdue: bool = False,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Customer debts with SALDO > 0 via Velneo's native query.
+
+    Wraps ``_query/deudas_cli_con_saldo`` — the Búsqueda the ERP UI
+    uses for its own "deudas con saldo" view. Pre-filtered server-side
+    (SALDO > 0 + OFF != 1) so the agent does NOT need to page through
+    closed debts to find the open ones.
+
+    Identifying a customer via ``client_id`` is the cheapest path
+    (single integer filter). ``customer_query`` falls back to the
+    direct VENT_DEUD_CLIE WORDS path with the customer name embedded
+    inline (since the query endpoint does not natively honor a NOM
+    var on this Búsqueda — verified empirically).
+
+    Returns aggregated totals (total_deuda, pagado, saldo) + per-debt
+    items + a small ``by_age_bucket`` summary (0-30 / 31-60 / 61-90 /
+    90+) to support aging reports.
+    """
+    df = _norm_velneo_date(date_from)
+    dt = _norm_velneo_date(date_to)
+
+    filters: dict[str, Any] = {}
+    if client_id is not None:
+        filters["ENT_ERP_CLI"] = client_id
+
+    try:
+        body = await client.query(
+            "deudas_cli_con_saldo",
+            filters=filters,
+            page_size=min(max(limit * 2, 50), 500),
+        )
+    except VelneoError as exc:
+        return _err(exc)
+
+    rows_raw = body.get("vent_deud_clie") or []
+    from mcp_theos.velneo_http import _upper_keys
+    rows = [_upper_keys(r) for r in rows_raw]
+
+    # Optional WORDS narrow when no client_id — happens here because
+    # the _query endpoint does not honor a NOM param on this Búsqueda.
+    if customer_query and client_id is None:
+        try:
+            extra = await client.get(
+                "VENT_DEUD_CLIE",
+                params={"words": customer_query.strip(),
+                        "pagesize": min(max(limit * 2, 50), 500),
+                        "sort": "-FECHA"},
+                fields=_STMT_DEUD_FIELDS,
+            )
+            existing_ids = {r.get("ID") for r in rows}
+            for r in extra.rows:
+                if not r.get("OFF") and float(r.get("SALDO") or 0) > 0.01:
+                    if r.get("ID") not in existing_ids:
+                        rows.append(r)
+        except VelneoError:
+            pass  # words fallback is best-effort
+
+    # In-memory narrow.
+    df_s = df or ""
+    dt_s = dt or ""
+    items: list[dict[str, Any]] = []
+    total_deuda = pagado = saldo = 0.0
+    aging = {"0_30": 0.0, "31_60": 0.0, "61_90": 0.0, "90_plus": 0.0,
+             "not_yet_due": 0.0}
+    for r in rows:
+        if r.get("OFF"):
+            continue
+        if float(r.get("SALDO") or 0) <= 0.01:
+            continue
+        try:
+            dv = int(r.get("DIAS_VENCIDOS") or 0)
+        except (TypeError, ValueError):
+            dv = 0
+        if only_overdue and dv <= 0:
+            continue
+        f = _short_date(r.get("FECHA"))
+        if df_s and f and f < df_s:
+            continue
+        if dt_s and f and f > dt_s:
+            continue
+        items.append(r)
+        sal = float(r.get("SALDO") or 0)
+        total_deuda += float(r.get("TOTAL_DEUDA") or 0)
+        pagado += float(r.get("PAGADO") or 0)
+        saldo += sal
+        if dv <= 0:
+            aging["not_yet_due"] += sal
+        elif dv <= 30:
+            aging["0_30"] += sal
+        elif dv <= 60:
+            aging["31_60"] += sal
+        elif dv <= 90:
+            aging["61_90"] += sal
+        else:
+            aging["90_plus"] += sal
+        if len(items) >= limit:
+            break
+
+    items.sort(key=lambda x: (x.get("FECHA") or "", x.get("VENCIMIENTO") or ""))
+
+    return {
+        "success": True,
+        "path": "_query/deudas_cli_con_saldo",
+        "count": len(items),
+        "total_scanned": len(rows),
+        "filter": {
+            "client_id": client_id,
+            "customer_query": (customer_query or "").strip() or None,
+            "only_overdue": only_overdue,
+            "date_from": df, "date_to": dt,
+        },
+        "items": items,
+        "totals": {
+            "total_deuda": round(total_deuda, 2),
+            "pagado": round(pagado, 2),
+            "saldo": round(saldo, 2),
+        },
+        "by_age_bucket": {k: round(v, 2) for k, v in aging.items()},
+    }
+
+
+# ---------------------------------------------------------------------------
+# velneo_query — generic Velneo Búsqueda invocation
+# ---------------------------------------------------------------------------
+
+
+# Whitelist of Búsquedas the agent is allowed to invoke directly. Some
+# (corte_*) are documented in the swagger but returned 0 in every probe
+# — they need specific tenant-side params we have not yet discovered.
+# We expose them so an operator can experiment, but mark which ones are
+# verified vs untested.
+_QUERY_WHITELIST = {
+    "deudas_cli_con_saldo":              "verified",
+    "vent_deud_clie_busq":               "verified",
+    "vent_deud_clie_busq1":              "verified",
+    "vent_fact_vent_busq":                "verified — accepts param[SUCURSAL] + param[NOM]",
+    "vent_fact_vent_busq_ats":           "untested — ATS report filter",
+    "vent_fact_vent_code_list":          "untested",
+    "productos_busq":                     "untested",
+    "productos_cod_bar":                  "untested",
+    "presen_busq":                        "untested",
+    "buscar_cod_bar":                     "untested",
+    "cod_bar_parts":                      "untested",
+    # The corte_* family — Velneo documents them but they require
+    # specific params (likely cut date + EMP + maybe SUCURSAL). Keep
+    # them in the allow list so the agent can experiment.
+    "corte_deudas_clientes":             "untested — needs unknown params",
+    "corte_deudas_vs_pagos_clientes":    "untested — needs unknown params",
+    "vent_deud_clie_para_fecha":          "untested — needs unknown params",
+}
+
+
+async def velneo_query(
+    client: VelneoClient,
+    *,
+    name: str,
+    filters: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+    page_size: int = 100,
+    page: int = 1,
+) -> dict[str, Any]:
+    """Generic invocation of a Velneo ``_query/<name>`` Búsqueda.
+
+    Used when none of the dedicated tools fits. Restricted to the
+    whitelist (see ``_QUERY_WHITELIST``) to keep the surface bounded.
+    Filters use ``filter[FIELD]=value`` syntax (REST-style). Params
+    use ``param[VAR]=value`` (proceso-style) — some Búsquedas accept
+    both shapes and combine them.
+
+    Returns the raw envelope ``{count, total_count, <table>: [...]}``
+    plus the resolved row list under ``rows`` for convenience.
+    """
+    key = (name or "").strip().lower()
+    if key not in _QUERY_WHITELIST:
+        return {
+            "success": False,
+            "error_code": "query_not_whitelisted",
+            "error": f"query {name!r} not in whitelist",
+            "allowed_queries": sorted(_QUERY_WHITELIST),
+        }
+    try:
+        body = await client.query(
+            key, filters=filters, params=params,
+            page_size=page_size, page=page,
+        )
+    except VelneoError as exc:
+        return _err(exc)
+
+    rows: list[dict[str, Any]] = []
+    from mcp_theos.velneo_http import _upper_keys
+    if isinstance(body, dict):
+        for k, v in body.items():
+            if k in {"errors", "count", "total_count"}:
+                continue
+            if isinstance(v, list):
+                rows = [_upper_keys(r) for r in v if isinstance(r, dict)]
+                break
+
+    return {
+        "success": True,
+        "name": key,
+        "status": _QUERY_WHITELIST[key],
+        "count": body.get("count") if isinstance(body, dict) else len(rows),
+        "total_count": body.get("total_count") if isinstance(body, dict) else len(rows),
+        "rows": rows,
+        "raw": body,
+    }
+
+
+# ---------------------------------------------------------------------------
+# F4 partner_360 — inspect_partner + aging buckets + recent payments
+# ---------------------------------------------------------------------------
+
+
+async def partner_360(
+    client: VelneoClient,
+    *,
+    partner_id: int | None = None,
+    cif: str | None = None,
+    customer_query: str | None = None,
+) -> dict[str, Any]:
+    """Audit-grade panoramic of a customer.
+
+    Like ``inspect_partner`` but richer:
+
+    * pulls open debts via ``_query/deudas_cli_con_saldo`` (server-side
+      filter — accurate, doesn't risk missing rows past the first
+      page)
+    * computes a saldo aging bucket breakdown (0-30 / 31-60 / 61-90 /
+      90+ / not_yet_due) from DIAS_VENCIDOS
+    * adds last 10 payments via VENT_COBR_DEUD
+    * surfaces SIN_CREDITO + NO_VENDER + total bucket signals as flags
+
+    Use this for auditoría or "cuéntame todo de KLEINTURS"; for a
+    quick "saldo de X" prefer the lighter ``inspect_partner`` or
+    ``check_balance``.
+    """
+    # Identify partner (prefer fastest path).
+    pid: int | None = None
+    ent_row: dict[str, Any] = {}
+    erp_ext: dict[str, Any] = {}
+    if partner_id:
+        try:
+            ent = await client.get("ENT", record_id=partner_id, fields=_ENT_FIELDS)
+            if ent.rows:
+                ent_row = ent.rows[0]
+                pid = int(ent_row.get("ID") or 0)
+        except VelneoError as exc:
+            return _err(exc)
+    elif cif or customer_query:
+        from mcp_theos.tools.partners import identify_customer
+        ident = await identify_customer(
+            client, cif=cif, name=customer_query,
+        )
+        if not ident.get("found"):
+            return {
+                "success": False,
+                "error_code": "partner_not_found",
+                "error": "No identifiqué al cliente.",
+                "lookup": ident,
+            }
+        first = ident["matches"][0]
+        if first.get("_match_via") in ("words", "rag"):
+            return {
+                "success": False,
+                "error_code": "needs_disambiguation",
+                "error": "Encontré coincidencias por aproximación; pide confirmación.",
+                "matches": ident["matches"][:5],
+            }
+        ent_row = first
+        pid = int(first.get("ID") or 0)
+    else:
+        return {"success": False, "error": "partner_id, cif, or customer_query required"}
+
+    if not pid:
+        return {"success": False, "error": "could not resolve partner"}
+
+    # ERP_CLI ext.
+    try:
+        ext = await client.get(
+            "ENT_ERP_CLI", record_id=pid, fields=_ENT_ERP_CLI_FIELDS,
+        )
+        erp_ext = ext.rows[0] if ext.rows else {}
+    except VelneoError:
+        erp_ext = {}
+
+    # Open debts via _query (server-side SALDO > 0).
+    open_debts = await get_open_debts(client, client_id=pid, limit=200)
+
+    # Recent payments via direct table.
+    payments: list[dict[str, Any]] = []
+    try:
+        resp = await client.get(
+            "VENT_COBR_DEUD",
+            params={"ENT_ERP_CLI": pid, "pagesize": 10, "sort": "-FECHA"},
+            fields=_COBR_FIELDS,
+        )
+        payments = resp.rows
+    except VelneoError:
+        pass
+
+    flags: list[str] = []
+    if ent_row.get("SIN_CREDITO"):
+        flags.append("sin_credito")
+    if ent_row.get("OFF"):
+        flags.append("ent_off")
+    if erp_ext.get("NO_VENDER"):
+        flags.append("no_vender")
+    if erp_ext.get("OFF"):
+        flags.append("erp_cli_off")
+    try:
+        if int(erp_ext.get("DIAS_VENCIDOS") or 0) > 0:
+            flags.append("dias_vencidos")
+    except (TypeError, ValueError):
+        pass
+    try:
+        if int(erp_ext.get("FACTVENCIDAS") or 0) > 0:
+            flags.append("facturas_vencidas")
+    except (TypeError, ValueError):
+        pass
+    buckets = open_debts.get("by_age_bucket") or {}
+    if (buckets.get("90_plus") or 0) > 0:
+        flags.append("debt_90_plus")
+    if (buckets.get("61_90") or 0) > 0:
+        flags.append("debt_61_90")
+
+    return {
+        "success": True,
+        "partner_id": pid,
+        "ent": ent_row,
+        "ent_erp_cli": erp_ext,
+        "has_erp_cli": bool(erp_ext),
+        "flags": flags,
+        "open_debts": open_debts.get("items") or [],
+        "open_debt_count": open_debts.get("count") or 0,
+        "open_debt_totals": open_debts.get("totals") or {},
+        "by_age_bucket": buckets,
+        "recent_payments": payments,
+        "recent_payment_count": len(payments),
+    }
+
+
+# ---------------------------------------------------------------------------
 # F1 customer_full_view — composite tool: identify + activity sweep
 # ---------------------------------------------------------------------------
 
