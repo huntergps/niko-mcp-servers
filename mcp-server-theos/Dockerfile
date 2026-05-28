@@ -11,6 +11,11 @@ RUN pip install --no-cache-dir .
 
 COPY mcp_theos/ mcp_theos/
 
+# Image cache lives under /var/cache (volume-mounted in docker-compose
+# so the cache survives container recreate). Create the directory now
+# so the process can write to it even before the first save.
+RUN mkdir -p /var/cache/mcp-theos/images
+
 EXPOSE 8086
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \

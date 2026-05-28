@@ -35,6 +35,15 @@ class Settings(BaseSettings):
     velneo_default_page_size: int = 200
     velneo_max_pages: int = 50
 
+    # On-disk image cache (mirror of the visor app's strategy — see
+    # /Users/elmers/Documents/develop/2026/visor/lib/services/
+    # image_cache_service.dart). Sized for the Mepriga catalog:
+    # ~96K products × ~400KB each = 38GB if everything was hot. The
+    # default ``max_files`` keeps us under ~400MB by evicting LRU.
+    image_cache_dir: str = "/var/cache/mcp-theos/images"
+    image_cache_ttl_seconds: int = 24 * 3600  # 24h
+    image_cache_max_files: int = 1000
+
     # Cap for the per-search RAG fan-out: how many product codes we
     # enrich with a follow-up ``visor_datos`` call. Each enrichment is
     # one HTTP round-trip to the ERP, so keep this small.

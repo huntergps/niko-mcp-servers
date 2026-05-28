@@ -252,49 +252,139 @@ async def get_product_image(
     *,
     code: str,
 ) -> dict[str, Any]:
-    """Fetch the product image as base64 (PNG).
+    """Fetch the product image as base64 (PNG), cached on disk.
 
-    Thin wrapper over ``_visor_datos(codbar, dar_imagen=1)``. Returns
-    ``{success, code, name, image_base64, image_filename}`` so the
-    channel layer can attach the image directly to a Telegram /
-    WhatsApp / widget message. Heavy payload (~400KB per product) —
-    use only when the customer explicitly asks to see the product or
-    the bot decides to render a product card with image.
+    Mirrors the Theos visor app's two-step strategy (see
+    :mod:`mcp_theos.image_cache`):
+
+    1. Light probe via ``visor_datos(dar_imagen=0)`` to recover the
+       header + ``fecha_mod_imagen`` (the image version tag).
+    2. If our on-disk cache has the same version → serve from disk
+       and skip the heavy ~400KB base64 transfer entirely.
+    3. Otherwise, second call with ``dar_imagen=1`` to refetch and
+       refresh the cache.
+
+    The cache is shared across all clients of a tenant and persists
+    across container restarts (volume-mounted in docker-compose).
+    Concurrent requests for the same product are deduplicated: only
+    the first one hits Velneo, the others await the same Future.
     """
+    import base64
+
+    from mcp_theos.image_cache import get_cache
+
     q = (code or "").strip()
     if not q:
         return {"success": False, "error": "empty code"}
 
-    raw = await _visor_datos(client, q, include_image=True)
-    if raw is None:
+    tenant_id = client.cfg.tenant_id
+    cache = get_cache()
+
+    # Step 1 — light probe to learn the server's current version tag.
+    light = await _visor_datos(client, q, include_image=False)
+    if light is None:
         return {
             "success": False,
             "error_code": "not_found",
-            "error": f"product {q!r} not found (visor_datos returned NO_ENCONTRADO)",
+            "error": f"product {q!r} not found (visor_datos NO_ENCONTRADO)",
         }
-
-    img64 = raw.get("imagen64") or ""
-    img_url = raw.get("imagen") or ""
-    if not img64 and not img_url:
-        return {
-            "success": False,
-            "error_code": "no_image",
-            "error": "El producto existe pero no tiene imagen registrada en Theos.",
-            "code": raw.get("codigo"),
-            "name": raw.get("name"),
-        }
-
-    return {
-        "success": True,
-        "id": raw.get("id"),
-        "code": raw.get("codigo"),
-        "name": raw.get("name"),
-        "family": raw.get("familia"),
-        "image_base64": img64 if img64 else None,
-        "image_url": img_url if img_url else None,
-        "image_filename": f"{(raw.get('codigo') or q)}.png",
-        "image_mtime": raw.get("fecha_mod_imagen"),
+    server_version = (light.get("fecha_mod_imagen") or "").strip()
+    base_card = {
+        "id": light.get("id"),
+        "code": light.get("codigo") or q,
+        "name": light.get("name"),
+        "family": light.get("familia"),
+        "image_mtime": server_version or None,
+        "image_filename": f"{light.get('codigo') or q}.png",
     }
+
+    # Step 2 — cache lookup. If we have a copy AND the version matches
+    # (or the server has no version, in which case we fall back to TTL),
+    # serve from disk.
+    cached_bytes, cached_version = cache.get_cached(tenant_id, q)
+    if cached_bytes:
+        fresh = (
+            (server_version and cached_version == server_version)
+            or not server_version
+        )
+        if fresh:
+            return {
+                **base_card,
+                "success": True,
+                "from_cache": True,
+                "image_base64": base64.b64encode(cached_bytes).decode("ascii"),
+                "image_bytes": len(cached_bytes),
+            }
+
+    # Step 3 — in-flight dedup. If another request is already fetching
+    # this image, await its result instead of issuing a second call.
+    fut, is_leader = await cache.begin_fetch(tenant_id, q)
+    if not is_leader:
+        try:
+            shared = await fut
+        except Exception:  # noqa: BLE001
+            shared = None
+        if shared:
+            return {
+                **base_card,
+                "success": True,
+                "from_cache": True,
+                "shared_with_inflight": True,
+                "image_base64": base64.b64encode(shared).decode("ascii"),
+                "image_bytes": len(shared),
+            }
+        return {
+            **base_card,
+            "success": False,
+            "error_code": "fetch_failed_shared",
+            "error": "Otra solicitud paralela falló al traer la imagen.",
+        }
+
+    # We're the leader — do the heavy fetch and resolve the future.
+    img_bytes: bytes | None = None
+    try:
+        full = await _visor_datos(client, q, include_image=True)
+        if full is None:
+            return {
+                **base_card,
+                "success": False,
+                "error_code": "not_found_full",
+                "error": "El producto desapareció entre el light probe y el fetch full.",
+            }
+        img64 = (full.get("imagen64") or "").strip()
+        img_url = (full.get("imagen") or "").strip()
+        if not img64 and not img_url:
+            return {
+                **base_card,
+                "success": False,
+                "error_code": "no_image",
+                "error": "El producto existe pero no tiene imagen registrada en Theos.",
+            }
+        if img64:
+            try:
+                img_bytes = base64.b64decode(img64)
+            except Exception:  # noqa: BLE001
+                img_bytes = None
+            if img_bytes:
+                cache.save(tenant_id, q, img_bytes, server_version or None)
+            return {
+                **base_card,
+                "success": True,
+                "from_cache": False,
+                "image_base64": img64,
+                "image_url": img_url or None,
+                "image_bytes": len(img_bytes) if img_bytes else 0,
+            }
+        # URL-only branch — Theos rarely uses this for Mepriga but
+        # support it for completeness.
+        return {
+            **base_card,
+            "success": True,
+            "from_cache": False,
+            "image_url": img_url,
+        }
+    finally:
+        await cache.finish_fetch(tenant_id, q, fut, img_bytes)
 
 
 async def check_stock(
