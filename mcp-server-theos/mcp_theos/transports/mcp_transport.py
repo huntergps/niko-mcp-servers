@@ -392,10 +392,33 @@ async def _execute_tool(request: Request, name: str, args: dict[str, Any]) -> st
         except (TypeError, ValueError):
             partner_id_int = 0
         if not partner_id_int:
+            # Important: the LLM (deepseek-v4-pro) can misread a
+            # "client_id required" message as "ask the customer for
+            # their email". The wording below is verbose on purpose
+            # — it tells the LLM EXACTLY what to do next so it does
+            # not invent its own follow-up.
             return json.dumps({
                 "success": False,
-                "error_code": "missing_partner_id",
-                "error": "client_id es requerido para datos financieros.",
+                "error_code": "needs_customer_identification",
+                "next_action": "identify_customer",
+                "error": (
+                    "ANTES de mostrar datos financieros (saldo, facturas, "
+                    "pagos, estado de cuenta) DEBES tener el partner_id del "
+                    "cliente identificado en este chat. AHORA NO LO TIENES. "
+                    "PASOS A SEGUIR (en este turno, en orden):\n"
+                    "1) Si el cliente AÚN no te ha dado cédula o RUC, "
+                    "PÍDELE: 'Para consultar tu saldo necesito identificarte. "
+                    "¿Me compartes tu cédula (10 dígitos) o RUC (13 dígitos)?'\n"
+                    "2) Cuando el cliente te dé el número, llama la tool "
+                    "identify_customer(ruc=<numero>) o "
+                    "identify_customer(cedula=<numero>). Esa tool devuelve "
+                    "partner_id en el top-level del JSON.\n"
+                    "3) Solo DESPUÉS de obtener un partner_id válido, "
+                    "llama esta tool de nuevo pasándolo como client_id.\n"
+                    "PROHIBIDO: pedir email, asumir identidad desde memoria "
+                    "del chat, o decir 'tu ficha' sin haber llamado "
+                    "identify_customer primero."
+                ),
             }, ensure_ascii=False)
         if not channel:
             return json.dumps({
@@ -411,6 +434,7 @@ async def _execute_tool(request: Request, name: str, args: dict[str, Any]) -> st
             return json.dumps({
                 "success": False,
                 "error_code": "otp_required",
+                "next_action": "request_otp",
                 "error": OTP_REQUIRED_MSG,
             }, ensure_ascii=False)
 
