@@ -92,7 +92,12 @@ def _shape_product(raw: dict[str, Any]) -> dict[str, Any]:
             "descuento_monto": float(p.get("descuento_monto") or 0),
             "iva": p.get("iva") or "",
             "iva_pct": iva_pct,
-            "costo_empaque": float(p.get("costo_emapaque") or 0),
+            # Velneo emits the typo ``costo_emapaque`` (sic — see the
+            # visor_datos source); accept the clean spelling too in
+            # case the ERP team ever fixes it.
+            "costo_empaque": float(
+                p.get("costo_emapaque") or p.get("costo_empaque") or 0
+            ),
             "utilidad_pct": float(p.get("utilidad") or 0),
         }
         presentations.append(entry)
