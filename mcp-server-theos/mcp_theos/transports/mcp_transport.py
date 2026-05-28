@@ -670,6 +670,34 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "list_supplier_debts",
+        "description": (
+            "Deudas a proveedores (COMP_DEUD_PROV) — el equivalente "
+            "compras de ``list_pending_invoices``. Filtra por "
+            "proveedor via ``supplier_query`` (WORDS sobre NAME, "
+            "que carga RUC + razón social del proveedor inline — "
+            "\"DISPROINCO\" → 2 deudas $1124.74 + $1073.01) o "
+            "``supplier_id`` (ENT_ERP_PROV). Pasa ``cont_compras_id`` "
+            "para ver las deudas de UNA factura específica. "
+            "``only_with_balance=true`` (default) muestra solo SALDO "
+            "> 0; ``only_overdue=true`` filtra DIAS_VENCIDOS > 0. "
+            "Devuelve totales agregados + breakdown por proveedor."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "supplier_query": {"type": "string"},
+                "supplier_id": {"type": "integer"},
+                "cont_compras_id": {"type": "integer"},
+                "only_with_balance": {"type": "boolean", "default": True},
+                "only_overdue": {"type": "boolean", "default": False},
+                "date_from": {"type": "string"},
+                "date_to": {"type": "string"},
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+            },
+        },
+    },
+    {
         "name": "customer_full_view",
         "description": (
             "Vista panorámica de un cliente en una sola llamada. "
@@ -873,6 +901,7 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "list_credit_notes": ("admin_ops.list_credit_notes", admin_ops.list_credit_notes),
     "list_withholdings": ("admin_ops.list_withholdings", admin_ops.list_withholdings),
     "list_purchase_invoices": ("admin_ops.list_purchase_invoices", admin_ops.list_purchase_invoices),
+    "list_supplier_debts": ("admin_ops.list_supplier_debts", admin_ops.list_supplier_debts),
     "customer_full_view": ("admin_ops.customer_full_view", admin_ops.customer_full_view),
     "list_recent_stock_movements": ("admin_ops.list_recent_stock_movements", admin_ops.list_recent_stock_movements),
     "check_stock": ("products.check_stock", products.check_stock),

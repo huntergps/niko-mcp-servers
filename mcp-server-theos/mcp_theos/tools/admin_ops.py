@@ -1042,6 +1042,26 @@ _CONT_COMPRAS_FIELDS = [
     "EMP", "SUC",
 ]
 
+# COMP_DEUD_PROV (cuentas por pagar). Allowlist verified 2026-05-28
+# against Mepriga. Blocked: ENT, CIF (read via WORDS on NAME instead),
+# EGRESOS, VENT_FACT_VENT, CRUZADO, RETENIDO, TIPO, NRO_DEUDA,
+# NRO_TOTAL_DEUDAS. The supplier's RUC + razón social are embedded in
+# NAME ("0993405590001 DISPROINCO S.A.S. Ingreso 3803 Ref 001-001-17")
+# so we can identify the proveedor without joining ENT_ERP_PROV (which
+# is GET-blocked under this API key).
+_COMP_DEUD_FIELDS = [
+    "ID", "NAME", "FECHA", "VENCIMIENTO",
+    "ALT_TIM", "MOD_TIM",
+    "ENT_ERP_PROV", "CONT_COMPRAS",
+    "TOTAL_DEUDA", "PAGADO", "SALDO",
+    "DIAS", "DIAS_VENCIDOS",
+    "CON_SALDO", "POR_VENCER", "COBRADO",
+    "OFF", "OFF_MOTIVO",
+    "REFERENCIA",
+    "EMP", "SUC", "DIVISIONES",
+    "BANDERA", "FECHA_CONTA",
+]
+
 
 def _doc_summary(doc_type: str) -> dict[str, Any]:
     """Empty summary scaffold per document type."""
@@ -1619,6 +1639,126 @@ async def list_purchase_invoices(
             "sri_status": sri_status, "only_unpaid": only_unpaid,
         },
         "purchase_invoices": out,
+    }
+
+
+# ---------------------------------------------------------------------------
+# list_supplier_debts (COMP_DEUD_PROV) — cuentas por pagar
+# ---------------------------------------------------------------------------
+
+
+async def list_supplier_debts(
+    client: VelneoClient,
+    *,
+    supplier_query: str | None = None,
+    supplier_id: int | None = None,
+    cont_compras_id: int | None = None,
+    only_with_balance: bool = True,
+    only_overdue: bool = False,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Deudas a proveedores — Mepriga "Cuentas por Pagar".
+
+    Mirror of the customer-side debt path (VENT_DEUD_CLIE) for the
+    procurement side. Filter by supplier via ``supplier_query`` (WORDS
+    over NAME which carries RUC + razón social inline) or by explicit
+    ``supplier_id`` (ENT_ERP_PROV). Pass ``cont_compras_id`` to narrow
+    to one purchase invoice's debts.
+
+    ``only_with_balance=True`` (default) keeps rows with SALDO > 0,
+    matching the operator's "qué le debo a X" mental model.
+    ``only_overdue=True`` further narrows to rows with DIAS_VENCIDOS
+    > 0.
+
+    Returns ``{ count, items, totals: {total_deuda, pagado, saldo} }``
+    plus a per-supplier breakdown when no specific ``supplier_id`` was
+    given (the "TOTAL: DISPROINCO 2197.75" footer pattern from the
+    Velneo PDF report).
+    """
+    nom = (supplier_query or "").strip() or None
+    df = _norm_velneo_date(date_from)
+    dt = _norm_velneo_date(date_to)
+
+    params: dict[str, Any] = {
+        "sort": "-FECHA",
+        "pagesize": min(max(limit * 3, 50), 500),
+    }
+    if supplier_id is not None:
+        params["ENT_ERP_PROV"] = supplier_id
+    if cont_compras_id is not None:
+        params["CONT_COMPRAS"] = cont_compras_id
+    if nom:
+        params["words"] = nom
+
+    try:
+        resp = await client.get(
+            "COMP_DEUD_PROV", params=params, fields=_COMP_DEUD_FIELDS,
+        )
+    except VelneoError as exc:
+        return _err(exc)
+
+    df_s = df or ""
+    dt_s = dt or ""
+    items: list[dict[str, Any]] = []
+    total_deuda = pagado = saldo = 0.0
+    by_supplier: dict[int, dict[str, Any]] = {}
+    for r in resp.rows:
+        if r.get("OFF"):
+            continue
+        if only_with_balance and float(r.get("SALDO") or 0) <= 0.01:
+            continue
+        if only_overdue:
+            try:
+                dv = int(r.get("DIAS_VENCIDOS") or 0)
+            except (TypeError, ValueError):
+                dv = 0
+            if dv <= 0:
+                continue
+        f = _short_date(r.get("FECHA"))
+        if df_s and f and f < df_s:
+            continue
+        if dt_s and f and f > dt_s:
+            continue
+        items.append(r)
+        total_deuda += float(r.get("TOTAL_DEUDA") or 0)
+        pagado += float(r.get("PAGADO") or 0)
+        saldo += float(r.get("SALDO") or 0)
+        pv = r.get("ENT_ERP_PROV")
+        if pv is not None:
+            slot = by_supplier.setdefault(int(pv), {
+                "supplier_id": int(pv),
+                "debt_count": 0, "saldo": 0.0,
+            })
+            slot["debt_count"] += 1
+            slot["saldo"] += float(r.get("SALDO") or 0)
+        if len(items) >= limit:
+            break
+
+    suppliers = sorted(
+        ({**v, "saldo": round(v["saldo"], 2)} for v in by_supplier.values()),
+        key=lambda x: -x["saldo"],
+    )
+
+    return {
+        "success": True,
+        "count": len(items),
+        "total_scanned": len(resp.rows),
+        "filter": {
+            "supplier_query": nom, "supplier_id": supplier_id,
+            "cont_compras_id": cont_compras_id,
+            "only_with_balance": only_with_balance,
+            "only_overdue": only_overdue,
+            "date_from": df, "date_to": dt,
+        },
+        "items": items,
+        "totals": {
+            "total_deuda": round(total_deuda, 2),
+            "pagado": round(pagado, 2),
+            "saldo": round(saldo, 2),
+        },
+        "by_supplier": suppliers,
     }
 
 
