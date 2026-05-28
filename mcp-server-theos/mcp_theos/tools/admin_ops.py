@@ -1643,6 +1643,157 @@ async def list_purchase_invoices(
 
 
 # ---------------------------------------------------------------------------
+# identify_supplier — proveedor lookup (ENT_ERP_PROV is GET-blocked, so
+# we go through COMP_DEUD_PROV / CONT_COMPRAS which carry the supplier
+# name + RUC denormalized in NAME)
+# ---------------------------------------------------------------------------
+
+
+_SUPPLIER_PROBE_DEBT_FIELDS = [
+    "ID", "NAME", "ENT_ERP_PROV", "TOTAL_DEUDA", "SALDO",
+    "FECHA", "VENCIMIENTO", "DIAS_VENCIDOS",
+]
+_SUPPLIER_PROBE_INV_FIELDS = [
+    "ID", "NAME", "FECHA", "ENT_ERP_PROV",
+    "RAZONSOCIALCOMPRADOR", "SRI_IDENTIFICACION",
+    "TOTAL", "PAGADO", "SALDO",
+]
+
+
+async def identify_supplier(
+    client: VelneoClient,
+    *,
+    query: str,
+    limit: int = 5,
+) -> dict[str, Any]:
+    """Resolve a proveedor from a free-text query.
+
+    ``ENT_ERP_PROV/{id}`` direct GET is **405** under the niko_saas
+    API key, so we cannot read provider master rows directly. Instead
+    we use COMP_DEUD_PROV.NAME (carries "RUC + Razón Social + Ingreso"
+    inline) via the WORDS index, then fall back to CONT_COMPRAS for
+    suppliers without open debts.
+
+    Returns up to ``limit`` distinct suppliers, each with:
+
+        { supplier_id (ENT_ERP_PROV),
+          display_name (parsed from NAME),
+          ruc (parsed from NAME / SRI_IDENTIFICACION when available),
+          open_debt_count, open_debt_saldo,
+          recent_invoice_count, sample_rows: [...]  }
+
+    DOES NOT delegate to identify_customer — proveedores live in
+    ENT_ERP_PROV (different from ENT_ERP_CLI) and the partner_embeddings
+    RAG only indexes customers. Calling identify_customer for a
+    supplier query would silently return wrong rows.
+    """
+    q = (query or "").strip()
+    if not q:
+        return {"success": False, "error": "query required"}
+
+    # Stage 1 — pull recent COMP_DEUD_PROV rows that match the WORDS
+    # index over NAME. Cap pull to keep response small.
+    try:
+        debts = await client.get(
+            "COMP_DEUD_PROV",
+            params={"words": q, "pagesize": 50, "sort": "-FECHA"},
+            fields=_SUPPLIER_PROBE_DEBT_FIELDS,
+        )
+    except VelneoError as exc:
+        return _err(exc)
+
+    # Group by ENT_ERP_PROV. The NAME field of each debt row carries
+    # ("0993405590001 DISPROINCO S.A.S. Ingreso ...") so we lift the
+    # first numeric token = RUC and the next words up to "Ingreso" as
+    # the display name.
+    import re
+    by_pid: dict[int, dict[str, Any]] = {}
+    for r in debts.rows:
+        if r.get("OFF"):
+            continue
+        pid = r.get("ENT_ERP_PROV")
+        if not pid:
+            continue
+        pid_i = int(pid)
+        name = (r.get("NAME") or "").strip()
+        ruc_match = re.match(r"^\s*(\d{10,13})\s+", name)
+        ruc = ruc_match.group(1) if ruc_match else None
+        display = name
+        if ruc_match:
+            tail = name[ruc_match.end():]
+            display = re.split(r"\bIngreso\b|\bRef\b", tail, maxsplit=1)[0].strip(" -")
+        slot = by_pid.setdefault(pid_i, {
+            "supplier_id": pid_i,
+            "display_name": display,
+            "ruc": ruc,
+            "open_debt_count": 0,
+            "open_debt_saldo": 0.0,
+            "recent_invoice_count": 0,
+            "sample_rows": [],
+        })
+        if float(r.get("SALDO") or 0) > 0.01:
+            slot["open_debt_count"] += 1
+            slot["open_debt_saldo"] += float(r.get("SALDO") or 0)
+        if len(slot["sample_rows"]) < 3:
+            slot["sample_rows"].append({
+                "id": r.get("ID"),
+                "fecha": _short_date(r.get("FECHA")),
+                "saldo": float(r.get("SALDO") or 0),
+            })
+
+    # Stage 2 — if nothing came back from debts, try CONT_COMPRAS so
+    # suppliers without open debts are still findable.
+    if not by_pid:
+        try:
+            inv = await client.get(
+                "CONT_COMPRAS",
+                params={"words": q, "pagesize": 20, "sort": "-FECHA"},
+                fields=_SUPPLIER_PROBE_INV_FIELDS,
+            )
+        except VelneoError as exc:
+            return _err(exc)
+        for r in inv.rows:
+            pid = r.get("ENT_ERP_PROV")
+            if not pid:
+                continue
+            pid_i = int(pid)
+            ruc = (r.get("SRI_IDENTIFICACION") or "").strip() or None
+            display = (r.get("RAZONSOCIALCOMPRADOR") or "").strip() or \
+                      (r.get("NAME") or "").strip()
+            slot = by_pid.setdefault(pid_i, {
+                "supplier_id": pid_i,
+                "display_name": display,
+                "ruc": ruc,
+                "open_debt_count": 0, "open_debt_saldo": 0.0,
+                "recent_invoice_count": 0,
+                "sample_rows": [],
+            })
+            slot["recent_invoice_count"] += 1
+
+    matches = sorted(
+        ({**v, "open_debt_saldo": round(v["open_debt_saldo"], 2)}
+         for v in by_pid.values()),
+        key=lambda x: (-x["open_debt_saldo"], -x["recent_invoice_count"]),
+    )[:limit]
+
+    out: dict[str, Any] = {
+        "success": True,
+        "found": bool(matches),
+        "count": len(matches),
+        "matches": matches,
+    }
+    # Auto-pick supplier_id at top level if there is exactly one
+    # unambiguous match (saldo > 0 or invoices > 0).
+    if len(matches) == 1:
+        m = matches[0]
+        out["supplier_id"] = m["supplier_id"]
+        out["id"] = m["supplier_id"]
+        out["name"] = m["display_name"]
+        out["vat"] = m["ruc"]
+    return out
+
+
+# ---------------------------------------------------------------------------
 # list_supplier_debts (COMP_DEUD_PROV) — cuentas por pagar
 # ---------------------------------------------------------------------------
 

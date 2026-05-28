@@ -89,11 +89,17 @@ MCP_TOOLS: list[dict[str, Any]] = [
     {
         "name": "identify_customer",
         "description": (
-            "Look a customer up by RUC, cédula, email, name or phone and "
-            "return a merged profile (master + customer-extension fields "
-            "like SALDO / CUPOC). Pass exactly one identifier. The tool "
-            "walks 4 paths in order, falling back only if the prior path "
-            "returned 0 rows:\n"
+            "Resolve a CUSTOMER (ENT_ERP_CLI) from a free-text query.\n"
+            "**IMPORTANT — this tool is CUSTOMERS ONLY.** Do NOT call "
+            "it for suppliers / proveedores / cuentas por pagar / "
+            "compras — for those use ``identify_supplier``. The RAG "
+            "partner_embeddings only indexes customers; calling this "
+            "for a supplier query returns the WRONG party silently.\n\n"
+            "Look a customer up by RUC, cédula, email, name or phone "
+            "and return a merged profile (master + customer-extension "
+            "fields like SALDO / CUPOC). Pass exactly one identifier. "
+            "The tool walks 4 paths in order, falling back only if the "
+            "prior path returned 0 rows:\n"
             "  1) per-chat cache (5 min TTL) — if you already identified "
             "this customer in the same conversation, the answer comes "
             "back instantly with ``from_cache=true``; you do NOT need to "
@@ -670,6 +676,33 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "identify_supplier",
+        "description": (
+            "Resolve a PROVEEDOR (NOT a customer) from a free-text "
+            "query. Use this — NOT ``identify_customer`` — whenever "
+            "the user asks about a supplier: \"cuánto le debo a X\", "
+            "\"cuentas por pagar de X\", \"compras a X\", \"deuda a "
+            "X\", \"proveedor X\". ``identify_customer`` only knows "
+            "customers (ENT_ERP_CLI + partner_embeddings RAG); using "
+            "it for a supplier query returns the WRONG party. This "
+            "tool walks COMP_DEUD_PROV.NAME (WORDS index — name + "
+            "RUC denormalized inline) and falls back to CONT_COMPRAS "
+            "for suppliers without open debts. Returns each match "
+            "with supplier_id (ENT_ERP_PROV), display_name, ruc, "
+            "open_debt_saldo and recent_invoice_count for "
+            "disambiguation."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": "supplier name, RUC, or token"},
+                "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 20},
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "list_supplier_debts",
         "description": (
             "Deudas a proveedores (COMP_DEUD_PROV) — el equivalente "
@@ -970,6 +1003,7 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "list_credit_notes": ("admin_ops.list_credit_notes", admin_ops.list_credit_notes),
     "list_withholdings": ("admin_ops.list_withholdings", admin_ops.list_withholdings),
     "list_purchase_invoices": ("admin_ops.list_purchase_invoices", admin_ops.list_purchase_invoices),
+    "identify_supplier": ("admin_ops.identify_supplier", admin_ops.identify_supplier),
     "list_supplier_debts": ("admin_ops.list_supplier_debts", admin_ops.list_supplier_debts),
     "get_open_debts": ("admin_ops.get_open_debts", admin_ops.get_open_debts),
     "velneo_query": ("admin_ops.velneo_query", admin_ops.velneo_query),
