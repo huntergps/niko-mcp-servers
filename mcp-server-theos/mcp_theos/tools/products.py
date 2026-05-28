@@ -178,17 +178,73 @@ async def get_product_details(
     code: str,
     include_image: bool = False,
 ) -> dict[str, Any]:
-    """Pull the full product card by code or barcode."""
+    """Pull the full product card by code or barcode.
+
+    Two-step lookup:
+
+    1. ``visor_datos(codbar=<code>)`` is the fast path — works whenever
+       ``<code>`` is registered as a barcode in ``INV_PRESENT_PRODUCTO``.
+    2. If that returns ``NO_ENCONTRADO`` we fall back to a direct
+       ``PRODUCTOS?filter[CODIGO]=<code>`` lookup. That catches the
+       case where the LLM has the internal CODIGO (not a barcode) —
+       typically a discontinued or non-sale product without any
+       presentation registered. We surface the row with a clear note
+       so the bot can tell the customer instead of inventing.
+    """
     q = (code or "").strip()
     if not q:
         return {"success": False, "error": "empty code"}
     raw = await _visor_datos(client, q, include_image=include_image)
-    if raw is None:
+    if raw is not None:
+        return _shape_product(raw)
+
+    # Fallback — code may be a CODIGO that has no barcode entry.
+    try:
+        resp = await client.get(
+            "PRODUCTOS",
+            params={"CODIGO": q, "pagesize": 1},
+            fields=["ID", "CODIGO", "NAME", "INV_FAMI", "VENDIBLE", "OFF"],
+        )
+    except Exception:
+        resp = None
+
+    rows = resp.rows if resp is not None else []
+    if not rows:
         return {
             "success": False,
-            "error": f"product {q!r} not found",
+            "error_code": "not_found",
+            "error": f"product {q!r} not found in catalog",
         }
-    return _shape_product(raw)
+
+    row = rows[0]
+    is_vendible = row.get("VENDIBLE") is not False  # None or True both count as sellable
+    is_off = bool(row.get("OFF"))
+    if is_off:
+        status_note = "El producto está marcado como eliminado en el sistema."
+    elif not is_vendible:
+        status_note = (
+            "Este producto está registrado pero NO está habilitado para "
+            "venta directa (vendible=false). No tiene precio ni "
+            "presentaciones disponibles en este momento."
+        )
+    else:
+        status_note = (
+            "El producto existe pero no tiene presentaciones registradas "
+            "en INV_PRESENT_PRODUCTO — no se puede cotizar hasta que se "
+            "agregue al menos una presentación con código de barras."
+        )
+
+    return {
+        "success": True,
+        "id": row.get("ID"),
+        "code": row.get("CODIGO"),
+        "name": row.get("NAME"),
+        "family": None,
+        "pvp_main": None,
+        "presentations": [],
+        "not_sellable": True,
+        "_note": status_note,
+    }
 
 
 async def search_products(
@@ -245,7 +301,7 @@ async def search_products(
         resp = await client.get(
             "PRODUCTOS",
             params={"words": primary, "pagesize": max_pull},
-            fields=["ID", "CODIGO", "NAME", "OFF"],
+            fields=["ID", "CODIGO", "NAME", "OFF", "VENDIBLE"],
         )
         hits = resp.rows
     except Exception as exc:
@@ -255,11 +311,20 @@ async def search_products(
             "products": [],
         }
 
-    # In-memory post-filter: drop OFF and require every other token to
-    # appear in NAME (case-insensitive substring).
+    # In-memory post-filter:
+    # * drop OFF rows (logically deleted)
+    # * drop VENDIBLE=false rows (discontinued / not for direct sale) —
+    #   surfacing them produced "Precio no disponible" noise in the
+    #   chat and broke the follow-up ``get_product_details`` call
+    #   because those rows typically have no INV_PRESENT_PRODUCTO entry
+    #   for ``visor_datos`` to match against.
+    # * require every other token of the query to appear in NAME
+    #   (case-insensitive substring).
     filtered: list[dict[str, Any]] = []
     for r in hits:
         if r.get("OFF"):
+            continue
+        if r.get("VENDIBLE") is False:
             continue
         name = (r.get("NAME") or "").upper()
         if other_tokens and not all(t in name for t in other_tokens):
@@ -289,7 +354,13 @@ async def search_products(
             pass  # silent — RAG is best-effort fallback
 
     # Enrich each hit with visor_datos (cap = rag_max_enrich so we
-    # don't drag the LLM with N round-trips).
+    # don't drag the LLM with N round-trips). Products that fail
+    # enrichment — usually because they have no INV_PRESENT_PRODUCTO
+    # entry (no barcode registered) — are SKIPPED entirely instead of
+    # being surfaced with "Precio no disponible", which confused both
+    # the bot and the customer (chat 2026-05-28 with @mepriga_ventas_bot
+    # showed "Precio no disponible en este momento" for ID 143940
+    # FAVORITA ACEITE 360ML, a vendible=false row).
     products: list[dict[str, Any]] = []
     enrich_cap = min(len(filtered), settings.rag_max_enrich)
     for r in filtered[:enrich_cap]:
@@ -301,19 +372,14 @@ async def search_products(
         except Exception:
             raw = None
         if raw is None:
-            # Cannot reach the product card — surface what we have so
-            # the LLM still has the name to mention.
-            products.append({
-                "success": True,
-                "id": r.get("ID"),
-                "code": code,
-                "name": r.get("NAME"),
-                "family": None,
-                "presentations": [],
-                "_note": "enrichment from Theos failed; partial data",
-            })
+            # No barcode in the ERP for this product — skip; it cannot
+            # be cotizado anyway.
             continue
         shaped = _shape_product(raw)
+        if not shaped.get("presentations"):
+            # Defence-in-depth: a malformed visor_datos response could
+            # come back with ok=true but no presentations. Skip same.
+            continue
         if "_similarity" in r:
             shaped["similarity"] = r["_similarity"]
         products.append(shaped)
