@@ -188,9 +188,10 @@ async def search_products(
     # Path B — RAG: embed → pgvector top-K → enrich each with visor_datos
     from mcp_theos.rag import product_codes_by_similarity
 
+    schema = f"tenant_{client.cfg.slug}"
     try:
         hits = await product_codes_by_similarity(
-            client.cfg.slug, q, limit=min(limit, settings.rag_max_enrich),
+            schema, q, limit=min(limit, settings.rag_max_enrich),
         )
     except Exception as exc:
         return {
