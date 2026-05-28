@@ -1,7 +1,10 @@
-"""Velneo invoices (VENT_FACT_VENT) + balance (ENT_ERP_CLI / VENT_DEUD_CLIE)."""
+"""Velneo invoices (VENT_FACT_VENT) + balance (ENT_ERP_CLI / VENT_DEUD_CLIE) +
+customer statement (VENT_DEUD_CLIE list + per-row PDF rendering).
+"""
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from mcp_theos.velneo_http import VelneoClient, VelneoError
@@ -112,14 +115,254 @@ async def check_balance(
 
     if detailed:
         try:
+            # ``filter[CON_SALDO]`` does not actually filter on this
+            # tenant (returns count=0 even for clients with open
+            # debts). Pull a page and filter in-memory by saldo > 0.
             deuds = await client.get(
                 "VENT_DEUD_CLIE",
-                params={"ENT_ERP_CLI": client_id, "CON_SALDO": 1, "pagesize": 200},
+                params={"ENT_ERP_CLI": client_id, "pagesize": 200},
                 fields=_DEUD_FIELDS,
             )
-            out["debts"] = deuds.rows
-            out["debt_count"] = len(deuds.rows)
+            open_only = [r for r in deuds.rows if _saldo_positive(r)]
+            out["debts"] = open_only
+            out["debt_count"] = len(open_only)
         except VelneoError as exc:
             out["debts_error"] = f"velneo {exc.status} {exc.message}"
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Customer statement (estado de cuenta)
+# ---------------------------------------------------------------------------
+
+
+# Same projection as _DEUD_FIELDS but includes REFERENCIA (SRI invoice
+# number like "001-001-581914") + CONTABILI source. CAJERO is the
+# user_id of the cashier; resolving it to a name would need access
+# to the USR table which is not exposed via the niko_saas API key,
+# so we leave the numeric id and let the PDF renderer decide.
+_STMT_FIELDS = [
+    "ID", "NAME", "FECHA", "VENCIMIENTO",
+    "ENT_ERP_CLI", "EGRESOS",
+    "TOTAL_DEUDA", "PAGADO", "CRUZADO", "SALDO", "RETENIDO",
+    "DIAS", "DIAS_VENCIDOS",
+    "CON_SALDO", "POR_VENCER", "COBRADO", "OFF",
+    "REFERENCIA",
+    "NRO_DEUDA", "NRO_TOTAL_DEUDAS",
+    "TIPO",
+]
+
+
+def _saldo_positive(row: dict[str, Any]) -> bool:
+    try:
+        return float(row.get("SALDO") or 0) > 0.01
+    except (TypeError, ValueError):
+        return False
+
+
+def _parse_days(value: Any) -> int | None:
+    """``DIAS`` comes back as a signed string ("-146", "2"). Returns int or None."""
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _short_date(value: Any) -> str:
+    """``2026-05-16T00:00:00.000Z`` → ``2026-05-16``."""
+    if not value or value == "Invalid Date":
+        return ""
+    s = str(value)
+    return s[:10] if "T" in s else s
+
+
+async def _resolve_partner_header(
+    client: VelneoClient, partner_id: int,
+) -> dict[str, Any]:
+    """Pull ENT row + matching ENT_ERP_CLI row for the statement header."""
+    out: dict[str, Any] = {
+        "id": partner_id, "name": "", "cif": "",
+        "email": "", "address": "",
+    }
+    try:
+        ent = await client.get(
+            "ENT", record_id=partner_id,
+            fields=["ID", "NAME", "NOM_COM", "CIF", "MAIL_PRINCIPAL", "DIR_PRI"],
+        )
+        if ent.rows:
+            row = ent.rows[0]
+            out.update({
+                "name": (row.get("NAME") or "").strip(),
+                "commercial_name": (row.get("NOM_COM") or "").strip(),
+                "cif": (row.get("CIF") or "").strip(),
+                "email": (row.get("MAIL_PRINCIPAL") or "").strip(),
+                "address": str(row.get("DIR_PRI") or "").strip(),
+            })
+    except VelneoError:
+        pass
+    return out
+
+
+async def get_customer_statement(
+    client: VelneoClient,
+    *,
+    client_id: int,
+    only_with_balance: bool = True,
+    only_overdue: bool = False,
+    cutoff_date: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Pull the customer's debt list for an account-statement view.
+
+    Equivalent to Theos' ``CARGAR_DEUDAS`` proceso which uses the
+    ``CORTE_DEUDAS_CLIENTES`` Búsqueda. Velneo's REST cannot drive
+    that Búsqueda directly, so we paginate VENT_DEUD_CLIE filtered by
+    ``ENT_ERP_CLI`` and apply the cutoff / overdue / has-balance
+    rules in memory.
+
+    Returns a payload ready to render as either chat text or PDF:
+    ``{ partner, items: [{fecha, vencimiento, dias, referencia, total,
+    pagado, saldo, ...}], totals: {total, pagado, saldo, count} }``.
+    """
+    if not client_id:
+        return {"success": False, "error": "client_id required"}
+
+    # ``ENT_ERP_CLI_SALDO`` is a Velneo index on VENT_DEUD_CLIE that
+    # transparently filters rows whose SALDO > 0 — the same index the
+    # Theos ``CORTE_DEUDAS_CLIENTES`` Búsqueda walks for its print
+    # statement. We use it whenever ``only_with_balance=True`` (default)
+    # so the server does the filtering instead of pulling 210 rows
+    # only to discard 191. When the caller asks for the full ledger
+    # (paid + unpaid) we fall back to the regular ENT_ERP_CLI filter.
+    filter_key = "ENT_ERP_CLI_SALDO" if only_with_balance else "ENT_ERP_CLI"
+    try:
+        resp = await client.get(
+            "VENT_DEUD_CLIE",
+            params={filter_key: client_id, "pagesize": limit},
+            fields=_STMT_FIELDS,
+        )
+    except VelneoError as exc:
+        return {
+            "success": False,
+            "error": f"velneo {exc.status}: {exc.message}",
+        }
+
+    cutoff_iso = (cutoff_date or "").strip()  # "YYYY-MM-DD" expected
+    items: list[dict[str, Any]] = []
+    total = pagado = saldo = 0.0
+    for raw in resp.rows:
+        if raw.get("OFF"):
+            continue
+        if only_with_balance and not _saldo_positive(raw):
+            continue
+        days = _parse_days(raw.get("DIAS"))
+        if only_overdue and (days is None or days <= 0):
+            continue
+        if cutoff_iso:
+            f = _short_date(raw.get("FECHA"))
+            if f and f > cutoff_iso:
+                continue
+        item = {
+            "id": raw.get("ID"),
+            "fecha": _short_date(raw.get("FECHA")),
+            "vencimiento": _short_date(raw.get("VENCIMIENTO")),
+            "dias": days,
+            "referencia": (raw.get("REFERENCIA") or "").strip(),
+            "detalle": (raw.get("NAME") or "").strip(),
+            "total_deuda": float(raw.get("TOTAL_DEUDA") or 0),
+            "pagado": float(raw.get("PAGADO") or 0),
+            "saldo": float(raw.get("SALDO") or 0),
+            "egresos": raw.get("EGRESOS"),  # FK to VENT_FACT_VENT
+            "tipo": (raw.get("TIPO") or "").strip(),
+            "nro_deuda": raw.get("NRO_DEUDA"),
+            "nro_total_deudas": raw.get("NRO_TOTAL_DEUDAS"),
+        }
+        items.append(item)
+        total += item["total_deuda"]
+        pagado += item["pagado"]
+        saldo += item["saldo"]
+
+    # Order matching the Theos PDF (FECHA, VENCIMIENTO ascending).
+    items.sort(key=lambda r: (r.get("fecha") or "", r.get("vencimiento") or ""))
+
+    partner = await _resolve_partner_header(client, int(client_id))
+
+    return {
+        "success": True,
+        "partner": partner,
+        "cutoff_date": cutoff_iso or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "only_with_balance": only_with_balance,
+        "only_overdue": only_overdue,
+        "items": items,
+        "totals": {
+            "count": len(items),
+            "total_deuda": round(total, 2),
+            "pagado": round(pagado, 2),
+            "saldo": round(saldo, 2),
+        },
+    }
+
+
+async def get_customer_statement_pdf(
+    client: VelneoClient,
+    *,
+    client_id: int,
+    only_with_balance: bool = True,
+    only_overdue: bool = False,
+    cutoff_date: str | None = None,
+) -> dict[str, Any]:
+    """Render the customer statement as a PDF and return base64.
+
+    The Velneo REST API has no PDF endpoint (the desktop form prints
+    via Velneo's own report engine). We build the PDF here with
+    reportlab so the bot can attach it directly to a Telegram /
+    WhatsApp message.
+    """
+    data = await get_customer_statement(
+        client,
+        client_id=client_id,
+        only_with_balance=only_with_balance,
+        only_overdue=only_overdue,
+        cutoff_date=cutoff_date,
+    )
+    if not data.get("success"):
+        return data
+
+    try:
+        from mcp_theos.pdf import render_statement_pdf
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "success": False,
+            "error": f"PDF renderer unavailable: {type(exc).__name__}: {exc}",
+        }
+
+    import base64
+
+    # Resolve brand from public.tenants — same pattern used by the OTP
+    # path. Avoids hardcoding "Tecnosmart" / "Mepriga" in the renderer.
+    from mcp_theos.otp import _get_tenant_commercial_name
+    brand = await _get_tenant_commercial_name(client.cfg.tenant_id)
+
+    try:
+        pdf_bytes = render_statement_pdf(data, brand=brand)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "success": False,
+            "error": f"PDF render failed: {type(exc).__name__}: {exc}",
+        }
+
+    return {
+        "success": True,
+        "partner": data["partner"],
+        "cutoff_date": data["cutoff_date"],
+        "totals": data["totals"],
+        "item_count": len(data["items"]),
+        "pdf_base64": base64.b64encode(pdf_bytes).decode("ascii"),
+        "pdf_filename": (
+            f"estado_cuenta_{data['partner'].get('cif') or client_id}"
+            f"_{data['cutoff_date']}.pdf"
+        ),
+    }

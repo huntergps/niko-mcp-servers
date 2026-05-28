@@ -245,6 +245,50 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_customer_statement",
+        "description": (
+            "Customer account statement (estado de cuenta) — the open "
+            "debt list with FECHA, VENCIMIENTO, REFERENCIA (SRI invoice "
+            "number), DIAS, TOTAL_DEUDA, PAGADO, SALDO. By default only "
+            "shows debts with saldo > 0; pass ``only_overdue=true`` to "
+            "restrict to overdue rows (DIAS > 0). REQUIRES a verified "
+            "OTP session — call request_otp + verify_otp first if the "
+            "gate rejects the call. Equivalent to the Theos 'Detalle de "
+            "Deudas del Cliente' form."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "integer"},
+                "only_with_balance": {"type": "boolean", "default": True},
+                "only_overdue": {"type": "boolean", "default": False},
+                "cutoff_date": {"type": "string", "description": "ISO YYYY-MM-DD; rows with FECHA after this are skipped"},
+            },
+            "required": ["client_id"],
+        },
+    },
+    {
+        "name": "get_customer_statement_pdf",
+        "description": (
+            "Same as get_customer_statement but returns the statement "
+            "rendered as a PDF (base64). Use this when the customer "
+            "asks for an official document or asks the bot to send "
+            "their estado de cuenta. REQUIRES a verified OTP session. "
+            "Output: { pdf_base64, pdf_filename, totals, item_count }; "
+            "the channel layer attaches the PDF to the chat."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "integer"},
+                "only_with_balance": {"type": "boolean", "default": True},
+                "only_overdue": {"type": "boolean", "default": False},
+                "cutoff_date": {"type": "string"},
+            },
+            "required": ["client_id"],
+        },
+    },
+    {
         "name": "get_customer_payments",
         "description": (
             "List customer payments. REQUIRES a verified OTP session — "
@@ -283,6 +327,8 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "verify_otp": ("otp_tools.verify_otp", otp_tools.verify_otp),
     "get_customer_invoices": ("invoices.get_customer_invoices", invoices.get_customer_invoices),
     "check_balance": ("invoices.check_balance", invoices.check_balance),
+    "get_customer_statement": ("invoices.get_customer_statement", invoices.get_customer_statement),
+    "get_customer_statement_pdf": ("invoices.get_customer_statement_pdf", invoices.get_customer_statement_pdf),
     "get_customer_payments": ("payments.get_customer_payments", payments.get_customer_payments),
 }
 
@@ -293,6 +339,8 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
 OTP_PROTECTED_TOOLS: frozenset[str] = frozenset({
     "check_balance",
     "get_customer_invoices",
+    "get_customer_statement",
+    "get_customer_statement_pdf",
     "get_customer_payments",
 })
 
