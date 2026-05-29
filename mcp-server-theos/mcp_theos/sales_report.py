@@ -1273,6 +1273,7 @@ def _write_detalle(
     subfamilia_names: dict[int, str],
     product_info: dict[int, dict[str, Any]],
     factura_info: dict[int, dict[str, Any]],
+    credit_flags: dict[int, bool] | None = None,
 ) -> None:
     """Write VENTAS_DETALLE — 29-col raw line layout matching Velneo UI export.
 
@@ -1390,14 +1391,15 @@ def _write_detalle(
 
         fecha_hora_str = _fmt_datetime_es(r.get("FECHA_CONTA"))
 
-        # Forma de pago — campo ``contado`` viene en cada línea (True =
-        # cobrado en el acto, False = venta a crédito). El detalle más
-        # fino (efectivo vs tarjeta vs cheque) está en la cabecera y
-        # requeriría join — no se incluye en esta versión.
-        contado_raw = r.get("CONTADO")
-        forma_pago = "Contado" if contado_raw is True else (
-            "Crédito" if contado_raw is False else ""
-        )
+        # Forma de pago — usa ``venta_credito`` de la cabecera (swagger
+        # de Velneo: "Fue Venta a Crédito"). Pre-cargada en credit_flags
+        # por _fetch_invoice_credit_flags al inicio de ``generate``.
+        # True = Crédito, False = Contado. Si no tenemos el flag (sin
+        # join), queda vacío.
+        if credit_flags and inv_id in credit_flags:
+            forma_pago = "Crédito" if credit_flags[inv_id] else "Contado"
+        else:
+            forma_pago = ""
 
         familia_name = familia_names.get(fam_id, "")
         values = [
@@ -1486,6 +1488,75 @@ def _write_detalle(
         ws.auto_filter.ref = f"A1:{last_col}{last_row_n}"
 
 
+async def _fetch_invoice_credit_flags(
+    client: VelneoClient,
+    *,
+    date_from: str,
+    date_to: str,
+) -> dict[int, bool]:
+    """Return ``{invoice_id: venta_credito_bool}`` for the date range.
+
+    The flag lives on the VENT_FACT_VENT header (swagger description:
+    "Fue Venta a Crédito"), not on the INV_MOVIMIENTOS line. So we
+    paginate the header table with one exact-date filter per day in
+    parallel — Velneo's filter[FECHA][gte]/[lte] form returns 0 rows
+    silently (same gotcha as VENT_NOTA_CRED), so per-day calls are the
+    correct API surface here.
+    """
+    import asyncio
+    from datetime import date as _date, timedelta
+
+    try:
+        d_from = _date.fromisoformat(date_from[:10])
+        d_to = _date.fromisoformat(date_to[:10])
+    except ValueError:
+        return {}
+    days = [(d_from + timedelta(days=i)).isoformat()
+            for i in range((d_to - d_from).days + 1)]
+
+    async def fetch_day(day_str: str) -> dict[int, bool]:
+        flags: dict[int, bool] = {}
+        page_num = 1
+        page_size = 500
+        while True:
+            try:
+                resp = await client._client.get(  # noqa: SLF001
+                    "vent_fact_vent",
+                    params={
+                        "filter[FECHA]": day_str,
+                        "page[size]": page_size,
+                        "page[number]": page_num,
+                        "fields": "ID,VENTA_CREDITO",
+                    },
+                )
+                resp.raise_for_status()
+                body = resp.json()
+            except Exception:
+                return flags
+            rows = body.get("vent_fact_vent") or []
+            if not rows:
+                break
+            for r in rows:
+                try:
+                    iid = int(r.get("id") or 0)
+                except (TypeError, ValueError):
+                    iid = 0
+                if iid:
+                    flags[iid] = bool(r.get("venta_credito"))
+            if len(rows) < page_size:
+                break
+            page_num += 1
+        return flags
+
+    # Run all days in parallel. asyncio.gather caps at the event loop's
+    # capacity — for typical ranges (1-31 days) this is fine.
+    results = await asyncio.gather(*[fetch_day(d) for d in days])
+    merged: dict[int, bool] = {}
+    for d in results:
+        merged.update(d)
+    return merged
+
+
 async def summarize_sales(
     client: VelneoClient,
     *,
@@ -1556,6 +1627,13 @@ async def summarize_sales(
     # Lookups (cached).
     bodega_names = await _resolve_lookup(client, "INV_BODEGA")
     familia_parent, _ = await _resolve_family_hierarchy(client)
+
+    # Pre-fetch the venta_credito flag for every invoice in the range,
+    # in parallel — needed because the line-level proceso doesn't carry
+    # it. Cost: ~3 paginated GETs per day, all parallel.
+    credit_flags = await _fetch_invoice_credit_flags(
+        client, date_from=date_from, date_to=date_to,
+    )
 
     while True:
         page_params = {**base_params, "page[size]": PAGE_SIZE, "page[number]": page_num}
@@ -1661,14 +1739,17 @@ async def summarize_sales(
             if inv_id:
                 bc["facturas"].add(inv_id)
 
-            # Forma de pago — booleano CONTADO. True=contado, False=crédito.
-            contado_raw = uk.get("CONTADO")
-            if contado_raw is True:
-                forma = "Contado"
-                pvp_contado += pvp
-            elif contado_raw is False:
-                forma = "Crédito"
-                pvp_credito += pvp
+            # Forma de pago — basada en VENTA_CREDITO de la cabecera
+            # (swagger: "Fue Venta a Crédito"). Pre-cargada en
+            # credit_flags por _fetch_invoice_credit_flags. True =
+            # Crédito, False = Contado, ausente = "(sin dato)".
+            if inv_id and inv_id in credit_flags:
+                if credit_flags[inv_id]:
+                    forma = "Crédito"
+                    pvp_credito += pvp
+                else:
+                    forma = "Contado"
+                    pvp_contado += pvp
             else:
                 forma = "(sin dato)"
             bfp = by_forma_pago[forma]
@@ -2039,8 +2120,15 @@ async def generate(
     _add_dashboard_charts(informe_ws, datos_ws, bodegas, familias_chart,
                           anchor_row=last_row)
 
+    # Pre-fetch venta_credito flag per invoice — needed for the
+    # "Forma Pago" column in VENTAS_DETALLE (and downstream pivot).
+    # See _fetch_invoice_credit_flags docstring for the API rationale.
+    credit_flags = await _fetch_invoice_credit_flags(
+        client, date_from=date_from, date_to=date_to,
+    )
     _write_detalle(detalle_ws, rows, bodega_names, familia_names,
-                   subfamilia_names, product_info, factura_info)
+                   subfamilia_names, product_info, factura_info,
+                   credit_flags=credit_flags)
 
     # "Evolucion de Ventas" — hourly evolution table + combo chart.
     # Pre-computed in Python so the user gets values upon opening the
