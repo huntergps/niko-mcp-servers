@@ -883,6 +883,8 @@ async def sales_quick_summary(
     sucursal: str | None = None,
     top_n_clientes: int = 10,
     include_credit_notes: bool = True,
+    cutoff_hour: int | None = None,
+    match_current_hour: bool = False,
 ) -> dict[str, Any]:
     """Aggregate sales (and optionally NCs) and return JSON only — no XLSX.
 
@@ -943,8 +945,12 @@ async def sales_quick_summary(
         summarize_credit_notes as _sum_ncs,
     )
 
-    sales = await _sum_sales(client, date_from=df, date_to=dt,
-                             sucursal=sucursal, top_n_clientes=top_n_clientes)
+    sales = await _sum_sales(
+        client, date_from=df, date_to=dt, sucursal=sucursal,
+        top_n_clientes=top_n_clientes,
+        cutoff_hour=cutoff_hour,
+        match_current_hour=match_current_hour,
+    )
     if not sales.get("success"):
         return sales
 
@@ -954,8 +960,41 @@ async def sales_quick_summary(
         nc_total = float(ncs.get("total_nc") or 0)
         sales["totals"]["nc_total"] = nc_total
         sales["totals"]["saldo_neto"] = round(
-            sales["totals"]["pvp"] - nc_total, 2
+            sales["totals"]["pvp"] - nc_total, 2,
         )
+
+        # Combine sales + NC per day so the caller has the
+        # neto_ajustado_por_dia ready without doing the join itself.
+        # Caveat: NC headers only carry a date, not an hour — when a
+        # ``cutoff_hour`` is in effect we still subtract the FULL day's
+        # NCs (that's what the operator does manually too — the column
+        # is not available with hourly granularity).
+        nc_by_day = {x["day"]: x for x in (ncs.get("por_dia") or [])}
+        combined = []
+        for s_day in sales.get("por_dia") or []:
+            day = s_day["day"]
+            nc_day = nc_by_day.get(day) or {"total": 0.0, "n_ncs": 0}
+            neto_aj = round(s_day["neto"] - float(nc_day.get("total") or 0), 2)
+            combined.append({
+                "day": day,
+                "pvp": s_day["pvp"],
+                "neto": s_day["neto"],
+                "nc_total": round(float(nc_day.get("total") or 0), 2),
+                "neto_ajustado": neto_aj,
+                "n_facturas": s_day["n_facturas"],
+                "n_lineas": s_day["n_lineas"],
+                "n_ncs": nc_day.get("n_ncs", 0),
+            })
+        sales["por_dia_combinado"] = combined
+
+        # Period averages on the combined view.
+        n_days_combined = len(combined)
+        if n_days_combined:
+            sum_neto_aj = sum(c["neto_ajustado"] for c in combined)
+            sales["totals"]["avg_neto_ajustado_por_dia"] = round(
+                sum_neto_aj / n_days_combined, 2,
+            )
+            sales["totals"]["sum_neto_ajustado"] = round(sum_neto_aj, 2)
 
     return sales
 

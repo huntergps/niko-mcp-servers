@@ -1054,7 +1054,31 @@ MCP_TOOLS: list[dict[str, Any]] = [
                     "type": "boolean", "default": True,
                     "description": (
                         "Si True (default), incluye total de NCs del rango y "
-                        "expone saldo_neto = ventas_pvp - nc_total."
+                        "expone saldo_neto = ventas_pvp - nc_total. Tambien "
+                        "agrega ``por_dia_combinado`` con neto_ajustado por "
+                        "dia (neto - NC del dia) y ``avg_neto_ajustado_por_dia``."
+                    ),
+                },
+                "cutoff_hour": {
+                    "type": "integer", "minimum": 0, "maximum": 23,
+                    "description": (
+                        "Corte horario (0-23) aplicado UNIFORMEMENTE a TODOS "
+                        "los dias del rango. Las lineas con FECHA_CONTA.hour "
+                        "> cutoff_hour se descartan. Usar para comparar "
+                        "'ventas a esta misma hora' contra dias anteriores "
+                        "(apples-to-apples). El response trae ``por_dia`` "
+                        "con totales hasta esa hora por cada dia."
+                    ),
+                },
+                "match_current_hour": {
+                    "type": "boolean", "default": False,
+                    "description": (
+                        "Si True, ignora ``cutoff_hour`` y usa la hora actual "
+                        "ECU como cutoff. ATAJO para la consulta tipica "
+                        "'cuanto se ha vendido cada dia comparado a esta "
+                        "misma hora'. El response trae ``cutoff_hour_used`` "
+                        "con el valor resultante para que la respuesta lo "
+                        "mencione (ej. '...hasta 13h00')."
                     ),
                 },
             },

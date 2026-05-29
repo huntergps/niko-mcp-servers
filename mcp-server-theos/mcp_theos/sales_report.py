@@ -1947,6 +1947,8 @@ async def summarize_sales(
     max_rows: int = 200000,
     top_n_clientes: int = 10,
     top_n_productos: int = 10,
+    cutoff_hour: int | None = None,
+    match_current_hour: bool = False,
 ) -> dict[str, Any]:
     """Aggregate sales lines for a date range, no XLSX, JSON only.
 
@@ -1993,6 +1995,8 @@ async def summarize_sales(
     by_producto: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"pvp": 0.0, "cantidad": 0.0, "lineas": 0,
                   "cod_bar": "", "producto_id": 0})
+    by_day: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"pvp": 0.0, "neto": 0.0, "facturas": set(), "lineas": 0})
     facturas_all: set[int] = set()
     total_pvp = 0.0
     total_neto = 0.0
@@ -2006,6 +2010,19 @@ async def summarize_sales(
     except (TypeError, ValueError):
         offset = -5.0
     offset_int = int(offset)
+
+    # Resolve cutoff_hour. When ``match_current_hour=True`` we snap to
+    # the current Ecuador clock — useful for "ventas a esta misma hora
+    # comparado a los días anteriores".
+    if match_current_hour and cutoff_hour is None:
+        cutoff_hour = (datetime.utcnow() + timedelta(hours=offset_int)).hour
+    if cutoff_hour is not None:
+        try:
+            cutoff_hour = int(cutoff_hour)
+            if not (0 <= cutoff_hour <= 23):
+                cutoff_hour = None
+        except (TypeError, ValueError):
+            cutoff_hour = None
 
     # Lookups (cached).
     bodega_names = await _resolve_lookup(client, "INV_BODEGA")
@@ -2047,6 +2064,35 @@ async def summarize_sales(
         for uk in day_rows:
             if n_lineas >= max_rows:
                 break
+
+            # Apply cutoff_hour FIRST — affects all downstream
+            # accumulators so the comparison is apples-to-apples across
+            # past and present days. A line without a parseable
+            # FECHA_CONTA can't be cut precisely; when a cutoff is set
+            # we discard those lines (they'd skew the cumulative total).
+            fc_raw = uk.get("FECHA_CONTA")
+            line_day_iso: str | None = None
+            line_hour_ecu: int | None = None
+            if fc_raw and "T" in str(fc_raw):
+                try:
+                    _dt = datetime.strptime(
+                        str(fc_raw).replace("Z", "").split(".")[0],
+                        "%Y-%m-%dT%H:%M:%S",
+                    ) + timedelta(hours=offset_int)
+                    line_day_iso = _dt.date().isoformat()
+                    line_hour_ecu = _dt.hour
+                except ValueError:
+                    pass
+            if cutoff_hour is not None:
+                if line_hour_ecu is None or line_hour_ecu > cutoff_hour:
+                    continue
+            # In-progress day defense (clock skew).
+            today_iso_local = _today_ecu_iso()
+            current_hour_ecu_local = (datetime.utcnow() + timedelta(hours=offset_int)).hour
+            if (line_day_iso == today_iso_local and line_hour_ecu is not None
+                    and line_hour_ecu > current_hour_ecu_local):
+                continue
+
             # Cached/fetched rows already come UPPER-cased and filtered
             # to _KEEP_KEYS, so no re-projection needed here.
             try:
@@ -2076,28 +2122,25 @@ async def summarize_sales(
             if inv_id:
                 facturas_all.add(inv_id)
 
-            fc = uk.get("FECHA_CONTA")
-            if fc and "T" in str(fc):
-                try:
-                    dt = datetime.strptime(
-                        str(fc).replace("Z", "").split(".")[0],
-                        "%Y-%m-%dT%H:%M:%S",
-                    )
-                    dt = dt + timedelta(hours=offset_int)
-                    # Skip hours that haven't happened yet for the in-
-                    # progress day (paranoia against clock skew).
-                    today_iso_local = _today_ecu_iso()
-                    current_hour_ecu_local = (datetime.utcnow() + timedelta(hours=offset_int)).hour
-                    if day == today_iso_local and dt.hour > current_hour_ecu_local:
-                        continue
-                    hour_lbl = f"{dt.hour:02d}h00"
-                    bh = by_hour[hour_lbl]
-                    bh["pvp"] += pvp
-                    bh["lineas"] += 1
-                    if inv_id:
-                        bh["facturas"].add(inv_id)
-                except ValueError:
-                    pass
+            # Per-day accumulator (PVP and neto, for "ventas por día"
+            # responses with breakdowns that respect the cutoff).
+            day_key = line_day_iso or day
+            bd = by_day[day_key]
+            bd["pvp"] += pvp
+            bd["neto"] += neto
+            bd["lineas"] += 1
+            if inv_id:
+                bd["facturas"].add(inv_id)
+
+            # Hour bucket — pre-cut filtering already ensured we only
+            # have past+within-cutoff hours.
+            if line_hour_ecu is not None:
+                hour_lbl = f"{line_hour_ecu:02d}h00"
+                bh = by_hour[hour_lbl]
+                bh["pvp"] += pvp
+                bh["lineas"] += 1
+                if inv_id:
+                    bh["facturas"].add(inv_id)
 
             fam_name = familia_parent.get(fam_id, f"FAM_{fam_id}") if fam_id else "(sin familia)"
             bf = by_familia[fam_name]
@@ -2175,10 +2218,25 @@ async def summarize_sales(
         current_pvp=total_pvp, sucursal=suc,
     )
 
+    # Per-day breakdown sorted ascending — useful for "ventas día por
+    # día" / averaging across days. n_days_with_data drives the average.
+    por_dia_list = []
+    for d in sorted(by_day.keys()):
+        bd = by_day[d]
+        por_dia_list.append({
+            "day": d,
+            "pvp": round(bd["pvp"], 2),
+            "neto": round(bd["neto"], 2),
+            "n_facturas": len(bd["facturas"]),
+            "n_lineas": bd["lineas"],
+        })
+    n_days_with_data = len(por_dia_list)
+
     response = {
         "success": True,
         "date_from": date_from,
         "date_to": date_to,
+        "cutoff_hour_used": cutoff_hour,  # null when no cutoff applied
         "total_lines": n_lineas,
         "total_lines_in_range": total_count,
         "truncated": truncated,
@@ -2196,7 +2254,12 @@ async def summarize_sales(
             "pvp_credito": round(pvp_credito, 2),
             "pct_contado": round(100 * pvp_contado / total_pvp, 1) if total_pvp else 0.0,
             "pct_credito": round(100 * pvp_credito / total_pvp, 1) if total_pvp else 0.0,
+            # Averages per day (helpful for multi-day responses).
+            "avg_pvp_per_day": round(total_pvp / n_days_with_data, 2) if n_days_with_data else 0.0,
+            "avg_neto_per_day": round(total_neto / n_days_with_data, 2) if n_days_with_data else 0.0,
+            "n_days_with_data": n_days_with_data,
         },
+        "por_dia": por_dia_list,
         "por_hora": [
             {"hora": h, "pvp": round(d["pvp"], 2),
              "n_facturas": len(d["facturas"]), "n_lineas": d["lineas"]}
@@ -2276,6 +2339,8 @@ async def summarize_credit_notes(
     n_ncs_off = 0
     by_pto_emi: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"total": 0.0, "n_ncs": 0})
+    by_day_nc: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"total": 0.0, "subtotal": 0.0, "n_ncs": 0})
 
     df = date_from[:10] if date_from else ""
     dt = date_to[:10] if date_to else df
@@ -2343,6 +2408,14 @@ async def summarize_credit_notes(
             est_pto = f"{est}-{pto}" if est else "(sin caja)"
             by_pto_emi[est_pto]["total"] += t
             by_pto_emi[est_pto]["n_ncs"] += 1
+            # Per-day NC accumulator (note: VENT_NOTA_CRED.FECHA carries
+            # only the day, not the hour — so we can't apply a cutoff to
+            # NCs the same way we do to sales lines. Caller should
+            # disclose that limitation when comparing intraday).
+            bd_nc = by_day_nc[f_day]
+            bd_nc["total"] += t
+            bd_nc["subtotal"] += s
+            bd_nc["n_ncs"] += 1
 
         if len(rows) < page_size:
             break
@@ -2364,6 +2437,11 @@ async def summarize_credit_notes(
             {"establecimiento_pto": ep,
              "total": round(d["total"], 2), "n_ncs": d["n_ncs"]}
             for ep, d in sorted(by_pto_emi.items(), key=lambda x: -x[1]["total"])
+        ],
+        "por_dia": [
+            {"day": d, "total": round(v["total"], 2),
+             "subtotal": round(v["subtotal"], 2), "n_ncs": v["n_ncs"]}
+            for d, v in sorted(by_day_nc.items())
         ],
     }
 
