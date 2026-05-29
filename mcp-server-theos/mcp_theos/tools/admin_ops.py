@@ -1013,6 +1013,9 @@ async def sales_evolution_chart(
     year: str | int | None = None,
     sucursal: str | None = None,
     mode: str = "auto",
+    metric: str = "pvp",
+    cutoff_hour: int | None = None,
+    match_current_hour: bool = False,
     deliver_to_chat: str | None = None,
 ) -> dict[str, Any]:
     """Render a focused evolution chart (NOT the 2x2 dashboard) and push
@@ -1089,6 +1092,9 @@ async def sales_evolution_chart(
         else:
             mode = "daily_trend"
     valid = {"single_day_hourly", "multi_day_hourly_compare", "daily_trend"}
+    metric = (metric or "pvp").lower()
+    if metric not in {"pvp", "neto"}:
+        metric = "pvp"
     if mode not in valid:
         return {"success": False,
                 "error": f"mode must be one of {sorted(valid)} or 'auto'"}
@@ -1106,6 +1112,7 @@ async def sales_evolution_chart(
     from collections import defaultdict
     day_x_hour: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     daily_pvp: dict[str, float] = defaultdict(float)
+    daily_neto: dict[str, float] = defaultdict(float)
     daily_facts: dict[str, set[int]] = defaultdict(set)
     days_from_cache = 0
     days_live = 0
@@ -1115,6 +1122,19 @@ async def sales_evolution_chart(
     today_ecu = (_datetime.now(timezone.utc) - timedelta(hours=5))
     today_iso = today_ecu.date().isoformat()
     current_hour_ecu = today_ecu.hour
+
+    # Resolve cutoff_hour the same way summarize_sales does so a request
+    # for "evolución día por día a esta misma hora" applies the same
+    # filter across all days.
+    if match_current_hour and cutoff_hour is None:
+        cutoff_hour = current_hour_ecu
+    if cutoff_hour is not None:
+        try:
+            cutoff_hour = int(cutoff_hour)
+            if not (0 <= cutoff_hour <= 23):
+                cutoff_hour = None
+        except (TypeError, ValueError):
+            cutoff_hour = None
     for day in days:
         day_result = await _get_day_lines(client, day=day, sucursal=suc)
         if not day_result.get("success"):
@@ -1125,32 +1145,48 @@ async def sales_evolution_chart(
         else:
             days_live += 1
         for uk in day_result.get("rows") or []:
-            try:
-                pvp = float(uk.get("PVP_LINEA") or 0)
-            except (TypeError, ValueError):
-                pvp = 0.0
-            try:
-                inv_id = int(uk.get("VENT_FACT_VENT") or 0)
-            except (TypeError, ValueError):
-                inv_id = 0
-            daily_pvp[day] += pvp
-            if inv_id:
-                daily_facts[day].add(inv_id)
+            # Parse timestamp first so the cutoff filter affects ALL
+            # accumulators (daily_pvp, daily_neto, daily_facts and the
+            # hour-bucket together).
             fc = uk.get("FECHA_CONTA")
+            line_hour_ecu: int | None = None
             if fc and "T" in str(fc):
                 try:
                     dt_obj = _datetime.strptime(
                         str(fc).replace("Z", "").split(".")[0],
                         "%Y-%m-%dT%H:%M:%S",
                     ) + timedelta(hours=offset_int)
-                    # Skip lines from hours that haven't happened yet
-                    # for the in-progress day (rare clock-skew defense).
-                    if day == today_iso and dt_obj.hour > current_hour_ecu:
-                        continue
-                    hour_lbl = f"{dt_obj.hour:02d}h00"
-                    day_x_hour[day][hour_lbl] += pvp
+                    line_hour_ecu = dt_obj.hour
                 except ValueError:
-                    pass
+                    line_hour_ecu = None
+            # In-progress day defense (clock skew).
+            if (day == today_iso and line_hour_ecu is not None
+                    and line_hour_ecu > current_hour_ecu):
+                continue
+            # Cutoff applied uniformly to every day.
+            if cutoff_hour is not None:
+                if line_hour_ecu is None or line_hour_ecu > cutoff_hour:
+                    continue
+
+            try:
+                pvp = float(uk.get("PVP_LINEA") or 0)
+            except (TypeError, ValueError):
+                pvp = 0.0
+            try:
+                neto = float(uk.get("PRECIO_NETO_LINEA") or 0)
+            except (TypeError, ValueError):
+                neto = 0.0
+            try:
+                inv_id = int(uk.get("VENT_FACT_VENT") or 0)
+            except (TypeError, ValueError):
+                inv_id = 0
+            daily_pvp[day] += pvp
+            daily_neto[day] += neto
+            if inv_id:
+                daily_facts[day].add(inv_id)
+            if line_hour_ecu is not None:
+                hour_lbl = f"{line_hour_ecu:02d}h00"
+                day_x_hour[day][hour_lbl] += pvp
 
     total_pvp = sum(daily_pvp.values())
     n_fact_total = sum(len(v) for v in daily_facts.values())
@@ -1206,21 +1242,34 @@ async def sales_evolution_chart(
                 totals_per_day=dict(daily_pvp),
             )
         else:  # daily_trend
+            # When metric=neto, plot the partial NETO per day (matches the
+            # text sales_quick_summary returns for "ventas día por día a
+            # esta misma hora"). When metric=pvp, plot PVP as before.
+            if metric == "neto":
+                per_day_value = {d: daily_neto.get(d, 0.0) for d in days}
+                total_value = sum(per_day_value.values())
+                bench_for_chart = None  # benchmark is PVP-only, would mislead
+                bench_label_for_chart = None
+            else:
+                per_day_value = {d: daily_pvp.get(d, 0.0) for d in days}
+                total_value = total_pvp
+                bench_for_chart = bench_avg_per_day or None
+                bench_label_for_chart = (
+                    f"Prom/día últ 7d ${bench_avg_per_day:,.0f}"
+                    if bench_avg_per_day else None
+                )
             daily_rows = [
-                {"day": d, "pvp": daily_pvp.get(d, 0.0),
+                {"day": d, "pvp": per_day_value[d],
                  "n_facturas": len(daily_facts.get(d, set()))}
                 for d in days
             ]
             png = build_daily_trend_png(
                 daily=daily_rows,
                 period_label=period_label,
-                total_pvp=total_pvp,
+                total_pvp=total_value,
                 n_fact_total=n_fact_total,
-                benchmark_pvp=bench_avg_per_day or None,
-                benchmark_label=(
-                    f"Prom/día últ 7d ${bench_avg_per_day:,.0f}"
-                    if bench_avg_per_day else None
-                ),
+                benchmark_pvp=bench_for_chart,
+                benchmark_label=bench_label_for_chart,
             )
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": f"chart_render_failed: {exc}"}
@@ -1228,10 +1277,20 @@ async def sales_evolution_chart(
     from mcp_theos.telegram_delivery import (
         send_photo as _send_photo, BotTokenMissing,
     )
-    caption = f"<b>Evolución — {period_label}</b>\nTotal ${total_pvp:,.0f}  ·  {n_fact_total:,} fact"
-    # Flag if the range includes the in-progress day so the reader knows
-    # the latest hours/day are partial, not closed.
-    if today_iso in days:
+    if mode == "daily_trend" and metric == "neto":
+        caption_total = sum(daily_neto.values())
+        caption = (
+            f"<b>Evolución NETO — {period_label}</b>\n"
+            f"Total ${caption_total:,.0f}  ·  {n_fact_total:,} fact"
+        )
+    else:
+        caption = (
+            f"<b>Evolución — {period_label}</b>\n"
+            f"Total ${total_pvp:,.0f}  ·  {n_fact_total:,} fact"
+        )
+    if cutoff_hour is not None:
+        caption += f"\n<i>Cortado uniformemente hasta {cutoff_hour:02d}h00 ECU en todos los días</i>"
+    elif today_iso in days:
         caption += f"\n<i>Día {today_ecu.strftime('%d/%m')} en curso — datos hasta {today_ecu.strftime('%H:%M')} ECU</i>"
     try:
         await _send_photo(
@@ -1256,12 +1315,17 @@ async def sales_evolution_chart(
         "png_size_kb": round(len(png) / 1024, 1),
         "date_from": df,
         "date_to": dt,
+        "metric": metric,
+        "cutoff_hour": cutoff_hour,
         "totals": {
             "pvp": round(total_pvp, 2),
+            "neto": round(sum(daily_neto.values()), 2),
             "n_facturas": n_fact_total,
         },
         "daily_breakdown": [
-            {"day": d, "pvp": round(daily_pvp.get(d, 0.0), 2),
+            {"day": d,
+             "pvp": round(daily_pvp.get(d, 0.0), 2),
+             "neto": round(daily_neto.get(d, 0.0), 2),
              "n_facturas": len(daily_facts.get(d, set()))}
             for d in days
         ],

@@ -1120,6 +1120,35 @@ MCP_TOOLS: list[dict[str, Any]] = [
                     ),
                 },
                 "sucursal": {"type": "string"},
+                "metric": {
+                    "type": "string",
+                    "enum": ["pvp", "neto"],
+                    "default": "pvp",
+                    "description": (
+                        "pvp = ventas brutas. neto = sin impuestos. "
+                        "Usar 'neto' cuando el usuario pidio comparativa de "
+                        "neto/sin IVA dia por dia."
+                    ),
+                },
+                "cutoff_hour": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 23,
+                    "description": (
+                        "Corta TODOS los dias del rango uniformemente hasta "
+                        "esta hora ECU (apples-to-apples). Solo afecta modes "
+                        "daily_trend y multi_day_hourly_compare."
+                    ),
+                },
+                "match_current_hour": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Si True equivale a cutoff_hour=hora actual ECU. "
+                        "Usar cuando el gerente pregunta 'ventas dia por dia "
+                        "a esta misma hora' o 'lo que va del dia comparado'."
+                    ),
+                },
                 "deliver_to_chat": {
                     "type": "string",
                     "description": "REQUERIDO. Telegram chat_id.",
