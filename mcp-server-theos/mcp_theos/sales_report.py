@@ -1790,6 +1790,21 @@ async def _compute_deltas(
 
     # Multi-day: compare against the immediately-preceding equivalent
     # period (same length). E.g. 26-28 May compares vs 23-25 May.
+    #
+    # GUARD: para rangos largos (>14 días, p.ej. mes completo) el período
+    # anterior implica descargar otros 30+ días no cacheados de Velneo —
+    # ~75 min para month='2026-05'. Hermes corta antes (timeout MCP) y
+    # Lila termina sin datos útiles. Para rangos largos el benchmark no
+    # agrega valor decisional (comparar mayo vs abril completos es poco
+    # accionable) — lo omitimos.
+    if n_days > 14:
+        return {
+            "vs_previous_period": None,
+            "vs_previous_period_skipped_reason": (
+                f"rango {n_days} dias muy largo — comparativo omitido para "
+                f"evitar descarga masiva del periodo anterior"
+            ),
+        }
     prev_to = (df - timedelta(days=1)).isoformat()
     prev_from = (df - timedelta(days=n_days)).isoformat()
     prev = await _compute_period_pvp(client, date_from=prev_from,
