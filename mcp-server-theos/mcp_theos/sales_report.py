@@ -1025,6 +1025,242 @@ def _write_informe(
     return last_row
 
 
+def _aggregate_by_hour(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Aggregate rows by operative hour (HoraTxt) for the DASHBOARD sheet.
+
+    Returns a list of ``{hora_txt, pvp_total, n_facturas, n_lineas}``
+    sorted by ``hora_txt`` (which is a zero-padded ``HHh00`` string —
+    sorts lexicographically the same as numerically when zero-padded).
+
+    Mirrors the Excel-side formulas:
+      * Hora extracted from FECHA_CONTA (with the same UTC-5 shift the
+        Fecha Hora display column uses).
+      * If FECHA_CONTA day is later than FECHA day, hour wraps with +24
+        so the closing-past-midnight tranche shows as 24h00, 25h00...
+      * EsFactura = unique count of Id Venta (each invoice counted once).
+      * Total Ventas = sum of PVP Linea (converted to float).
+    """
+    import os
+    try:
+        offset = float(os.environ.get("VELNEO_TZ_OFFSET_HOURS", "-5"))
+    except (TypeError, ValueError):
+        offset = -5.0
+    offset_int = int(offset)
+
+    buckets: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"pvp_total": 0.0, "facturas": set(), "n_lineas": 0}
+    )
+    for r in rows:
+        fc_raw = r.get("FECHA_CONTA")
+        if not fc_raw or fc_raw == "Invalid Date":
+            continue
+        s = str(fc_raw)
+        if "T" not in s:
+            continue
+        try:
+            from datetime import timedelta
+            dt = datetime.strptime(
+                s.replace("Z", "").split(".")[0], "%Y-%m-%dT%H:%M:%S",
+            )
+            dt = dt + timedelta(hours=offset_int)
+        except ValueError:
+            continue
+        hour = dt.hour
+
+        # Compare against the row's FECHA. The shift offset is the same
+        # used by the display column; so if dt.date() > FECHA's date,
+        # the venta was registered after midnight (closing tranche).
+        fecha_day = _short_date(r.get("FECHA"))[:10]
+        if fecha_day and dt.date().isoformat() > fecha_day:
+            hour += 24
+        hora_txt = f"{hour:02d}h00"
+
+        try:
+            pvp_v = float(r.get("PVP_LINEA") or 0)
+        except (TypeError, ValueError):
+            pvp_v = 0.0
+        try:
+            inv_id = int(r.get("VENT_FACT_VENT") or 0)
+        except (TypeError, ValueError):
+            inv_id = 0
+
+        b = buckets[hora_txt]
+        b["pvp_total"] += pvp_v
+        b["n_lineas"] += 1
+        if inv_id:
+            b["facturas"].add(inv_id)
+
+    out: list[dict[str, Any]] = []
+    for hora_txt in sorted(buckets.keys()):
+        b = buckets[hora_txt]
+        out.append({
+            "hora_txt": hora_txt,
+            "pvp_total": round(b["pvp_total"], 2),
+            "n_facturas": len(b["facturas"]),
+            "n_lineas": b["n_lineas"],
+        })
+    return out
+
+
+def _write_dashboard(
+    ws,
+    hourly: list[dict[str, Any]],
+) -> None:
+    """DASHBOARD sheet — title + agg table + combo chart.
+
+    Table layout (A4 onwards):
+        A: Hora (HHh00)
+        B: Total Ventas ($)   — column, primary axis
+        C: Cantidad Facturas  — line, secondary axis
+        D: Cantidad Líneas    — line, secondary axis
+
+    The chart anchors at F4. AutoFilter is applied to A4:D{N} so the
+    user can filter hours interactively. Slicers proper aren't writable
+    from openpyxl, so AutoFilter is the closest one-click filter.
+    """
+    from openpyxl.chart import BarChart, LineChart, Reference
+    from openpyxl.chart.label import DataLabelList
+    from openpyxl.chart.marker import Marker
+    from openpyxl.chart.shapes import GraphicalProperties
+    from openpyxl.drawing.line import LineProperties
+
+    fmt_money = MONEY_FORMAT
+    fmt_int = '#,##0'
+
+    title_font = Font(bold=True, size=18, color=PALETTE_TABLE_HEADER, name="Calibri")
+    instruction_font = Font(size=11, color="7F7F7F", italic=True, name="Calibri")
+    hdr_font = Font(bold=True, size=11, color=PALETTE_WHITE, name="Calibri")
+    hdr_fill = PatternFill("solid", fgColor=PALETTE_TABLE_HEADER)
+    hdr_align = Alignment(horizontal="center", vertical="center")
+    body_left = Alignment(horizontal="left", vertical="center")
+    body_right = Alignment(horizontal="right", vertical="center")
+    total_font = Font(bold=True, size=11, color=PALETTE_PRIMARY, name="Calibri")
+    total_fill = PatternFill("solid", fgColor=PALETTE_TOTAL)
+
+    ws.column_dimensions["A"].width = 10
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 16
+    ws.column_dimensions["D"].width = 16
+    ws.sheet_view.showGridLines = False
+
+    # Row 1: title
+    ws.row_dimensions[1].height = 28
+    ws.append([_cell(ws, value="Evolución de Ventas por Hora", font=title_font)])
+
+    # Row 2: instructions
+    ws.row_dimensions[2].height = 18
+    ws.append([_cell(
+        ws,
+        value=(
+            "Usa los filtros (icono ⏷ en los encabezados de la tabla) "
+            "para acotar por hora. La tabla y el gráfico reflejan los "
+            "totales del rango pedido."
+        ),
+        font=instruction_font,
+    )])
+
+    # Row 3: blank gutter
+    ws.append([None])
+
+    # Row 4: table headers
+    ws.row_dimensions[4].height = 22
+    ws.append([
+        _cell(ws, value="Hora", font=hdr_font, fill=hdr_fill, alignment=hdr_align),
+        _cell(ws, value="Total Ventas ($)", font=hdr_font, fill=hdr_fill, alignment=hdr_align),
+        _cell(ws, value="Cantidad Facturas", font=hdr_font, fill=hdr_fill, alignment=hdr_align),
+        _cell(ws, value="Cantidad Líneas", font=hdr_font, fill=hdr_fill, alignment=hdr_align),
+    ])
+
+    # Data rows
+    sum_pvp = 0.0
+    sum_facts = 0
+    sum_lines = 0
+    for b in hourly:
+        ws.append([
+            _cell(ws, value=b["hora_txt"], alignment=body_left),
+            _cell(ws, value=b["pvp_total"], alignment=body_right, number_format=fmt_money),
+            _cell(ws, value=b["n_facturas"], alignment=body_right, number_format=fmt_int),
+            _cell(ws, value=b["n_lineas"], alignment=body_right, number_format=fmt_int),
+        ])
+        sum_pvp += b["pvp_total"]
+        sum_facts += b["n_facturas"]
+        sum_lines += b["n_lineas"]
+
+    # Total row
+    ws.append([
+        _cell(ws, value="TOTAL", font=total_font, fill=total_fill, alignment=body_left),
+        _cell(ws, value=round(sum_pvp, 2), font=total_font, fill=total_fill,
+              alignment=body_right, number_format=fmt_money),
+        _cell(ws, value=sum_facts, font=total_font, fill=total_fill,
+              alignment=body_right, number_format=fmt_int),
+        _cell(ws, value=sum_lines, font=total_font, fill=total_fill,
+              alignment=body_right, number_format=fmt_int),
+    ])
+
+    if not hourly:
+        return
+
+    last_data_row = 4 + len(hourly)
+    # AutoFilter range covers the data only (not the total row).
+    ws.auto_filter.ref = f"A4:D{last_data_row}"
+
+    # Combo chart — columns (Total Ventas) + 2 lines (Facturas, Líneas)
+    # on a secondary axis. Anchored at F4 next to the table.
+    def _gp(hex_color: str) -> GraphicalProperties:
+        gp = GraphicalProperties(solidFill=hex_color)
+        gp.line = LineProperties(noFill=True)
+        return gp
+
+    cats_ref = Reference(ws, min_col=1, min_row=5, max_row=last_data_row)
+
+    bar = BarChart()
+    bar.type = "col"
+    bar.grouping = "clustered"
+    bar.style = 2
+    bar.title = "Evolución de Ventas por Hora"
+    bar.x_axis.title = "Hora"
+    bar.y_axis.title = "Total Ventas ($)"
+    bar.varyColors = False
+    bar.width = 22
+    bar.height = 12
+    bar_data = Reference(ws, min_col=2, max_col=2,
+                         min_row=4, max_row=last_data_row)
+    bar.add_data(bar_data, titles_from_data=True)
+    bar.set_categories(cats_ref)
+    bar.series[0].graphicalProperties = _gp("4472C4")
+    bar.legend.position = "b"
+
+    # Line chart layer — two series on a secondary axis.
+    line = LineChart()
+    line_data = Reference(ws, min_col=3, max_col=4,
+                          min_row=4, max_row=last_data_row)
+    line.add_data(line_data, titles_from_data=True)
+    line.set_categories(cats_ref)
+    # Distinct colors + markers per the user's spec.
+    s0 = line.series[0]
+    s0.graphicalProperties = GraphicalProperties()
+    s0.graphicalProperties.line = LineProperties(solidFill="ED7D31", w=22000)
+    s0.marker = Marker(symbol="circle", size=7)
+    s0.marker.graphicalProperties = GraphicalProperties(solidFill="ED7D31")
+    s0.marker.graphicalProperties.line = LineProperties(solidFill="ED7D31")
+    s1 = line.series[1]
+    s1.graphicalProperties = GraphicalProperties()
+    s1.graphicalProperties.line = LineProperties(solidFill="70AD47", w=22000)
+    s1.marker = Marker(symbol="square", size=7)
+    s1.marker.graphicalProperties = GraphicalProperties(solidFill="70AD47")
+    s1.marker.graphicalProperties.line = LineProperties(solidFill="70AD47")
+    # Secondary axis: assign a different axId so openpyxl emits a
+    # ``<c:valAx>`` for the secondary scale and Excel renders the lines
+    # against it.
+    line.y_axis.axId = 200
+    line.y_axis.crosses = "max"
+
+    bar += line  # combo composition
+    ws.add_chart(bar, "F4")
+
+
 def _write_detalle(
     ws,
     rows: list[dict[str, Any]],
@@ -1055,17 +1291,23 @@ def _write_detalle(
         "Bodega", "Familia Principal", "SubFamilia",
         "Id Venta", "Establecimiento", "Pto Emision", "Secuencia",
         "Fecha", "Fecha Hora", "Cliente", "CIF", "MES", "DIA", "AÑO",
+        # Auxiliary columns for the DASHBOARD sheet. Filled with Excel
+        # formulas so the user can pivot/filter without re-running the
+        # report. Refer to col J (PVP Linea), T (Id Venta), X (Fecha),
+        # Y (Fecha Hora), and the previous aux columns (AE..AH).
+        "Hora", "Venta_Num", "EsFactura", "HoraTxt",
     ]
 
     # Column widths — must be set BEFORE appending any row in write_only mode.
-    # 30 columns (matches headers above).
+    # 34 columns (matches headers above).
     widths = [16, 12, 34, 8, 8, 10,
               12, 10, 10, 12,
               12, 12, 10,
               12, 14, 10,
               22, 22, 22,
               10, 6, 6, 10,
-              12, 19, 28, 16, 6, 6, 6]
+              12, 19, 28, 16, 6, 6, 6,
+              6, 12, 9, 8]
     for j, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(j)].width = w
     ws.row_dimensions[1].height = 32
@@ -1084,7 +1326,9 @@ def _write_detalle(
 
     # Data rows — appended as plain Python lists, no per-cell styling.
     # Money columns get their format from a single per-row WriteOnlyCell
-    # (cheaper than full styling on every cell).
+    # (cheaper than full styling on every cell). The 4 auxiliary columns
+    # at the end carry Excel formulas keyed off this row's index.
+    data_row_idx = 0
     for r in rows:
         pid_raw = r.get("PRODUCTOS")
         try:
@@ -1181,7 +1425,36 @@ def _write_detalle(
                 out_row.append(_cell(ws, value=v, number_format=money_fmt))
             else:
                 out_row.append(v)
+
+        # Auxiliary formula columns (AE..AH). row_n is the 1-based row
+        # number inside the sheet (header is row 1, so row_n = current_idx + 2).
+        # We can't know row_n upfront in write_only mode, so we let the
+        # rows pile up and stamp the formula references using current
+        # length of out_row before appending. After this append the
+        # data sits at ``data_row_idx + 2`` because the header is row 1.
+        row_n = data_row_idx + 2
+        # Hora: dos dígitos de la hora dentro de "dd/mm/aaaa HH:MM:SS"
+        # (posición 12, longitud 2). Si Fecha Hora está vacía, devuelve 0.
+        out_row.append(
+            f'=IFERROR(VALUE(MID(Y{row_n},12,2)),0)'
+        )
+        # Venta_Num: PVP Linea convertido de texto a número.
+        out_row.append(
+            f'=IFERROR(NUMBERVALUE(J{row_n},".",","),0)'
+        )
+        # EsFactura: 1 sólo en la PRIMERA línea de cada Id Venta.
+        out_row.append(
+            f'=IF(COUNTIF($T$2:T{row_n},T{row_n})=1,1,0)'
+        )
+        # HoraTxt: hora operativa extendida. Si Fecha Hora cayó en un día
+        # posterior a Fecha (cierre pasada la medianoche), suma 24 a la
+        # hora para que se ordene linealmente después de 23h00.
+        out_row.append(
+            f'=IF(LEFT(Y{row_n},10)<>X{row_n},'
+            f'TEXT(AE{row_n}+24,"00"),TEXT(AE{row_n},"00"))&"h00"'
+        )
         ws.append(out_row)
+        data_row_idx += 1
 
 
 async def generate(
@@ -1352,6 +1625,15 @@ async def generate(
     detalle_ws = wb.create_sheet("VENTAS_DETALLE")
     _write_detalle(detalle_ws, rows, bodega_names, familia_names,
                    subfamilia_names, product_info, factura_info)
+
+    # DASHBOARD sheet — hourly evolution table + combo chart.
+    # Pre-computed in Python so the user gets values upon opening the
+    # workbook without needing to refresh a pivot. AutoFilter on the
+    # table provides per-hour interactive filtering. (openpyxl can't
+    # write proper Excel slicers, so AutoFilter is the closest stand-in.)
+    dashboard_ws = wb.create_sheet("DASHBOARD")
+    hourly = _aggregate_by_hour(rows)
+    _write_dashboard(dashboard_ws, hourly)
 
     # 4. Aggregate totals for the response payload.
     grand_total_pvp = sum(
