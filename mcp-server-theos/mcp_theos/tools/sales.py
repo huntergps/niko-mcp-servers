@@ -341,8 +341,19 @@ async def get_quotation(
     *,
     order_id: int,
 ) -> dict[str, Any]:
+    # Quotations mutate within a single chat turn (create → add line →
+    # update → remove → render_pdf in one breath), so the per-process
+    # HTTP cache turns into stale data faster than it earns its keep.
+    # Force a live fetch on both header and lines — same fix the bot
+    # surfaced when update_quotation_line reported success but the
+    # very next get_quotation echoed the pre-update row.
     try:
-        header = await client.get("VENT_ORDEN_VENTA", record_id=order_id, fields=_ORDEN_FIELDS)
+        header = await client.get(
+            "VENT_ORDEN_VENTA",
+            record_id=order_id,
+            fields=_ORDEN_FIELDS,
+            use_cache=False,
+        )
     except VelneoError as exc:
         return {"success": False, "error": f"velneo {exc.status} {exc.message}"}
     if not header.rows:
@@ -352,6 +363,7 @@ async def get_quotation(
         "VENT_ORDEN_MOVIMIENTOS",
         params={"VENT_ORDEN_VENTA": order_id, "pagesize": 500},
         fields=_MOV_FIELDS,
+        use_cache=False,
     )
     return {
         "success": True,
@@ -446,6 +458,7 @@ async def add_quotation_line(
     quantity: float,
     presentation_codbar: str | None = None,
     unit_price: float | None = None,
+    num_linea_override: int | None = None,
 ) -> dict[str, Any]:
     """Append a line to an existing quotation (canonical odoo name).
 
@@ -477,7 +490,13 @@ async def add_quotation_line(
         return header_resp
     header = header_resp.get("order") or {}
     existing = header_resp.get("lines") or []
-    next_num = (max((int(l.get("NUM_LINEA") or 0) for l in existing), default=0)) + 1
+    if num_linea_override is not None:
+        # update_quotation_line passes the original NUM_LINEA so the
+        # recreated row sits in the same slot the cashier UI showed
+        # it in — otherwise a "change qty" jumps the line to the end.
+        target_num = int(num_linea_override)
+    else:
+        target_num = (max((int(l.get("NUM_LINEA") or 0) for l in existing), default=0)) + 1
 
     eff_emp = header.get("EMP")
     eff_bod = header.get("INV_BODEGA")
@@ -485,7 +504,7 @@ async def add_quotation_line(
 
     body: dict[str, Any] = {
         "VENT_ORDEN_VENTA": order_id,
-        "NUM_LINEA": next_num,
+        "NUM_LINEA": target_num,
         "PRODUCTOS": product_id,
         "CAN": quantity,
     }
@@ -532,7 +551,7 @@ async def add_quotation_line(
         "order_id": order_id,
         "line": created,
         "line_count": len(existing) + 1,
-        "num_linea": next_num,
+        "num_linea": target_num,
         "applied": {
             "company_id": eff_emp,
             "warehouse_id": eff_bod,
@@ -606,7 +625,9 @@ async def update_quotation_line(
         return {"success": False, "error": f"delete failed: velneo {exc.status} {exc.message}"}
 
     # 2) POST a fresh row at the same NUM_LINEA (so list order stays).
-    #    add_quotation_line resolves pricing + inherits header fields.
+    #    add_quotation_line resolves pricing + inherits header fields,
+    #    and num_linea_override pins the slot — without it the recreate
+    #    appends to the end and the cashier sees the order shuffle.
     create = await add_quotation_line(
         client,
         order_id=order_id,
@@ -614,6 +635,7 @@ async def update_quotation_line(
         quantity=new_qty,
         presentation_codbar=new_codbar,
         unit_price=unit_price,
+        num_linea_override=old_num,
     )
     if not create.get("success"):
         return {
