@@ -40,6 +40,80 @@ from openpyxl.utils import get_column_letter
 
 
 # ---------------------------------------------------------------------------
+# Inventory-movement cache — per (tenant, sucursal, day).
+# ---------------------------------------------------------------------------
+#
+# Lines from VENT_FACT_MOV_BUSQ_3P for days strictly before "today ECU"
+# are immutable (Velneo doesn't back-date inventory moves once a day
+# closes). Caching them on disk turns multi-day reports from O(N×days)
+# requests into O(1) for past days + the live pagination for today only.
+#
+# Storage: ``$MOV_CACHE_DIR/<tenant_id>/<sucursal>/<YYYY-MM-DD>.v1.jsonl``
+# (or default ``/var/cache/mcp-theos/movs``). One JSON-encoded row per
+# line, already projected to ``_KEEP_KEYS`` so we don't re-store the
+# 130-key raw rows. The ``.v1.`` suffix is a cache-version marker —
+# bumping it (e.g. to ``.v2.``) when ``_KEEP_KEYS`` changes triggers a
+# clean re-fetch without manual purge.
+
+import os as _os
+import json as _json
+from pathlib import Path as _Path
+
+_CACHE_VERSION = "v2"
+_CACHE_DIR_ENV = _os.environ.get(
+    "MOV_CACHE_DIR", "/var/cache/mcp-theos/movs",
+)
+
+
+def _cache_root() -> _Path:
+    return _Path(_CACHE_DIR_ENV)
+
+
+def _cache_path(tenant_id: str, sucursal: str, day: str) -> _Path:
+    safe_t = tenant_id.replace("/", "_")
+    safe_s = (sucursal or "default").replace("/", "_")
+    return _cache_root() / safe_t / safe_s / f"{day}.{_CACHE_VERSION}.jsonl"
+
+
+def _today_ecu_iso() -> str:
+    """ISO date for "today" in Ecuador (UTC-5, no DST)."""
+    from datetime import datetime, timezone, timedelta
+    ec = datetime.now(timezone.utc) - timedelta(hours=5)
+    return ec.date().isoformat()
+
+
+def _read_jsonl(path: _Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(_json.loads(line))
+                except _json.JSONDecodeError:
+                    # Corrupt line → treat the whole file as a miss so
+                    # we re-fetch from the upstream. Cheaper than
+                    # carrying partial state.
+                    return []
+    except FileNotFoundError:
+        return []
+    return rows
+
+
+def _write_jsonl(path: _Path, rows: list[dict[str, Any]]) -> None:
+    """Atomic write — staged file rename so a crash mid-write doesn't
+    leave a half-baked cache entry."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(_json.dumps(r, separators=(",", ":")) + "\n")
+    tmp.replace(path)
+
+
+# ---------------------------------------------------------------------------
 # Small helper for write_only mode — every styled cell needs a fresh
 # WriteOnlyCell instance bound to the sheet. We use this helper everywhere
 # so the call sites stay readable.
@@ -1488,6 +1562,118 @@ def _write_detalle(
         ws.auto_filter.ref = f"A1:{last_col}{last_row_n}"
 
 
+async def _fetch_day_lines_via_proceso(
+    client: VelneoClient,
+    *,
+    day: str,
+    sucursal: str,
+    page_size: int = 500,
+) -> dict[str, Any]:
+    """Paginate the VENT_FACT_MOV_BUSQ_3P proceso for a SINGLE day.
+
+    Returns ``{success, rows: [filtered], total_count, truncated_err}``.
+    Rows are already filtered to ``_KEEP_KEYS`` so the caller can hand
+    them straight to the cache writer without re-projecting.
+    """
+    from urllib.parse import quote
+    from mcp_theos.velneo_http import _upper_keys
+
+    base_params = {
+        "param[SUCURSAL]": sucursal,
+        "param[FCH_FACT]": "1",
+        "param[FCH_DES]": day,
+        "param[FCH_HST]": day,
+        "param[OFF]": "0",
+    }
+    rows: list[dict[str, Any]] = []
+    total_count = 0
+    page_num = 1
+    while True:
+        page_params = {**base_params, "page[size]": page_size,
+                       "page[number]": page_num}
+        try:
+            resp = await client._client.get(  # noqa: SLF001
+                f"_process/{quote('VENT_FACT_MOV_BUSQ_3P')}",
+                params=page_params,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "error_code": "transport",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "rows": rows, "page_at_failure": page_num}
+        if total_count == 0:
+            total_count = int(body.get("total_count") or 0)
+        page_rows = body.get("inv_movimientos") or []
+        if page_num == 1 and not page_rows and body.get("errors"):
+            first = body["errors"][0]
+            msg = first.get("message") if isinstance(first, dict) else str(first)
+            return {"success": False, "error_code": "proceso_denied",
+                    "error": msg, "rows": []}
+        for r in page_rows:
+            if not isinstance(r, dict):
+                continue
+            uk = _upper_keys(r)
+            kept = {k: v for k, v in uk.items() if k in _KEEP_KEYS}
+            rows.append(kept)
+        if len(page_rows) < page_size:
+            break
+        if total_count and len(rows) >= total_count:
+            break
+        page_num += 1
+    return {"success": True, "rows": rows, "total_count": total_count}
+
+
+async def _get_day_lines(
+    client: VelneoClient,
+    *,
+    day: str,
+    sucursal: str,
+) -> dict[str, Any]:
+    """Return the day's filtered movement rows — from cache if past day,
+    paginating Velneo otherwise. Cache misses for past days populate
+    the cache so the next call is free.
+    """
+    today = _today_ecu_iso()
+    is_past = day < today
+
+    if is_past:
+        path = _cache_path(client.cfg.tenant_id, sucursal, day)
+        cached = _read_jsonl(path)
+        if cached:
+            return {"success": True, "rows": cached,
+                    "total_count": len(cached), "from_cache": True}
+
+    result = await _fetch_day_lines_via_proceso(
+        client, day=day, sucursal=sucursal,
+    )
+    if result.get("success") and is_past:
+        # Persist immutable past days. Best-effort — log + continue on
+        # disk errors so a broken cache mount doesn't kill the report.
+        try:
+            _write_jsonl(_cache_path(client.cfg.tenant_id, sucursal, day),
+                         result["rows"])
+        except OSError as e:
+            logger.warning("cache write failed for %s/%s: %s",
+                           sucursal, day, e)
+    result["from_cache"] = False
+    return result
+
+
+async def _iter_days(date_from: str, date_to: str) -> list[str]:
+    """Yield each ISO day between ``date_from`` and ``date_to`` inclusive."""
+    from datetime import date as _date, timedelta
+    try:
+        d_from = _date.fromisoformat(date_from[:10])
+        d_to = _date.fromisoformat(date_to[:10])
+    except ValueError:
+        return []
+    if d_to < d_from:
+        return []
+    return [(d_from + timedelta(days=i)).isoformat()
+            for i in range((d_to - d_from).days + 1)]
+
+
 async def _fetch_invoice_credit_flags(
     client: VelneoClient,
     *,
@@ -1595,7 +1781,6 @@ async def summarize_sales(
         "param[FCH_HST]": date_to,
         "param[OFF]": "0",
     }
-    PAGE_SIZE = 500
 
     # In-memory aggregators (no row list).
     by_hour: dict[str, dict[str, Any]] = defaultdict(
@@ -1620,7 +1805,6 @@ async def summarize_sales(
     pvp_credito = 0.0
     n_lineas = 0
     total_count = 0
-    page_num = 1
 
     try:
         offset = float(os.environ.get("VELNEO_TZ_OFFSET_HOURS", "-5"))
@@ -1639,33 +1823,37 @@ async def summarize_sales(
         client, date_from=date_from, date_to=date_to,
     )
 
-    while True:
-        page_params = {**base_params, "page[size]": PAGE_SIZE, "page[number]": page_num}
-        try:
-            resp = await client._client.get(  # noqa: SLF001
-                f"_process/{quote('VENT_FACT_MOV_BUSQ_3P')}",
-                params=page_params,
-            )
-            resp.raise_for_status()
-            body = resp.json()
-        except Exception as exc:  # noqa: BLE001
+    # Iterate the range day-by-day so each day can be served from the
+    # on-disk cache (past days are immutable). The first time we see a
+    # past day we pay the live pagination cost once and then it's free
+    # forever. Today's data is always fetched live.
+    days = await _iter_days(date_from, date_to)
+    days_from_cache = 0
+    days_live = 0
+    for day in days:
+        if n_lineas >= max_rows:
+            break
+        day_result = await _get_day_lines(client, day=day, sucursal=suc)
+        if not day_result.get("success"):
             return {
-                "success": False, "error_code": "transport",
-                "error": f"{type(exc).__name__}: {exc}",
-                "page_at_failure": page_num, "rows_collected": n_lineas,
+                "success": False,
+                "error_code": day_result.get("error_code", "transport"),
+                "error": day_result.get("error", "fetch day failed"),
+                "day_at_failure": day,
+                "rows_collected": n_lineas,
             }
-        if total_count == 0:
-            total_count = int(body.get("total_count") or 0)
-        page_rows = body.get("inv_movimientos") or []
-        if page_num == 1 and not page_rows and body.get("errors"):
-            first = body["errors"][0]
-            msg = first.get("message") if isinstance(first, dict) else str(first)
-            return {"success": False, "error_code": "proceso_denied", "error": msg}
+        if day_result.get("from_cache"):
+            days_from_cache += 1
+        else:
+            days_live += 1
+        day_rows = day_result.get("rows") or []
+        total_count += int(day_result.get("total_count") or len(day_rows))
 
-        for r in page_rows:
-            if not isinstance(r, dict):
-                continue
-            uk = _upper_keys(r)
+        for uk in day_rows:
+            if n_lineas >= max_rows:
+                break
+            # Cached/fetched rows already come UPPER-cased and filtered
+            # to _KEEP_KEYS, so no re-projection needed here.
             try:
                 pvp = float(uk.get("PVP_LINEA") or 0)
             except (TypeError, ValueError):
@@ -1693,7 +1881,6 @@ async def summarize_sales(
             if inv_id:
                 facturas_all.add(inv_id)
 
-            # Hour bucket — convert FECHA_CONTA from UTC to local.
             fc = uk.get("FECHA_CONTA")
             if fc and "T" in str(fc):
                 try:
@@ -1743,7 +1930,6 @@ async def summarize_sales(
             if inv_id:
                 bc["facturas"].add(inv_id)
 
-            # Producto — el row carry both PRODUCTOS (id) and NOMBRE.
             prod_name = (uk.get("NOMBRE") or "").strip()
             try:
                 prod_id = int(uk.get("PRODUCTOS") or 0)
@@ -1761,10 +1947,6 @@ async def summarize_sales(
             bp_["producto_id"] = prod_id or bp_["producto_id"]
             bp_["cod_bar"] = (uk.get("COD_BAR") or bp_["cod_bar"]).strip()
 
-            # Forma de pago — basada en VENTA_CREDITO de la cabecera
-            # (swagger: "Fue Venta a Crédito"). Pre-cargada en
-            # credit_flags por _fetch_invoice_credit_flags. True =
-            # Crédito, False = Contado, ausente = "(sin dato)".
             if inv_id and inv_id in credit_flags:
                 if credit_flags[inv_id]:
                     forma = "Crédito"
@@ -1780,14 +1962,6 @@ async def summarize_sales(
             if inv_id:
                 bfp["facturas"].add(inv_id)
 
-        if n_lineas >= max_rows:
-            break
-        if len(page_rows) < PAGE_SIZE:
-            break
-        if total_count and n_lineas >= total_count:
-            break
-        page_num += 1
-
     truncated = total_count > n_lineas
     n_facturas = len(facturas_all)
     ticket = round(total_pvp / n_facturas, 2) if n_facturas else 0.0
@@ -1799,6 +1973,10 @@ async def summarize_sales(
         "total_lines": n_lineas,
         "total_lines_in_range": total_count,
         "truncated": truncated,
+        "cache_stats": {
+            "days_from_cache": days_from_cache,
+            "days_live": days_live,
+        },
         "totals": {
             "pvp": round(total_pvp, 2),
             "neto": round(total_neto, 2),
@@ -2002,69 +2180,36 @@ async def generate(
     # page[size] on _process/<name> just like on table list endpoints
     # (verified empirically 2026-05-28).
     suc = sucursal or _tenant_sucursal(client)
-    base_params = {
-        "param[SUCURSAL]": suc,
-        "param[FCH_FACT]": "1",
-        "param[FCH_DES]": date_from,
-        "param[FCH_HST]": date_to,
-        "param[OFF]": "0",
-    }
-    PAGE_SIZE = 500
+    # Iterate day-by-day so each past day is served from the on-disk
+    # cache. Today's data is always pulled live (lines come in over the
+    # course of the day so any cache would go stale).
+    days = await _iter_days(date_from, date_to)
     rows: list[dict[str, Any]] = []
     total_count = 0
-    page_num = 1
-    while True:
-        page_params = {
-            **base_params,
-            "page[size]": PAGE_SIZE,
-            "page[number]": page_num,
-        }
-        try:
-            resp = await client._client.get(  # noqa: SLF001
-                f"_process/{quote('VENT_FACT_MOV_BUSQ_3P')}",
-                params=page_params,
-            )
-            resp.raise_for_status()
-            body = resp.json()
-        except Exception as exc:  # noqa: BLE001
-            return {
-                "success": False,
-                "error_code": "transport",
-                "error": f"{type(exc).__name__}: {exc}",
-                "page_at_failure": page_num,
-                "rows_collected": len(rows),
-            }
-        # First page tells us the universe.
-        if total_count == 0:
-            total_count = int(body.get("total_count") or 0)
-        page_rows_raw = body.get("inv_movimientos") or []
-        # Detect permission_denied / errors[] envelope on the very
-        # first page only (cheap check).
-        if page_num == 1 and not page_rows_raw and body.get("errors"):
-            first = body["errors"][0]
-            msg = first.get("message") if isinstance(first, dict) else str(first)
-            return {
-                "success": False, "error_code": "proceso_denied",
-                "error": msg,
-            }
-        # Upper-case keys + filter to _KEEP_KEYS in one pass per row.
-        for r in page_rows_raw:
-            if not isinstance(r, dict):
-                continue
-            uk = _upper_keys(r)
-            kept = {k: v for k, v in uk.items() if k in _KEEP_KEYS}
-            rows.append(kept)
-            if len(rows) >= max_rows:
-                break
-        # Stop if we hit the cap, the page was short, or we exhausted
-        # the universe.
+    days_from_cache = 0
+    days_live = 0
+    for day in days:
         if len(rows) >= max_rows:
             break
-        if len(page_rows_raw) < PAGE_SIZE:
-            break
-        if total_count and len(rows) >= total_count:
-            break
-        page_num += 1
+        day_result = await _get_day_lines(client, day=day, sucursal=suc)
+        if not day_result.get("success"):
+            return {
+                "success": False,
+                "error_code": day_result.get("error_code", "transport"),
+                "error": day_result.get("error", "fetch day failed"),
+                "day_at_failure": day,
+                "rows_collected": len(rows),
+            }
+        if day_result.get("from_cache"):
+            days_from_cache += 1
+        else:
+            days_live += 1
+        day_rows = day_result.get("rows") or []
+        total_count += int(day_result.get("total_count") or len(day_rows))
+        for r in day_rows:
+            rows.append(r)
+            if len(rows) >= max_rows:
+                break
     truncated = total_count > len(rows)
 
     if not rows:
