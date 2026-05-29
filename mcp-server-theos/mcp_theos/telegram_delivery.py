@@ -133,3 +133,39 @@ async def send_document(
             f"{body.get('description') or json.dumps(body)[:300]}"
         )
     return body.get("result") or body
+
+
+async def send_message(
+    *,
+    chat_id: str,
+    text: str,
+    parse_mode: str | None = "HTML",
+    message_thread_id: str | None = None,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Send a plain text message to a Telegram chat.
+
+    Used by background tasks that finish long after the originating
+    ``tools/call`` returned — they need to notify the chat directly
+    (success or failure) without going through the agent.
+    """
+    token = _get_bot_token()
+    url = f"{_API_BASE}/bot{token}/sendMessage"
+    payload: dict[str, Any] = {"chat_id": str(chat_id), "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if message_thread_id:
+        payload["message_thread_id"] = str(message_thread_id)
+    async with httpx.AsyncClient(timeout=timeout) as cli:
+        resp = await cli.post(url, json=payload)
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"ok": False, "raw_status": resp.status_code,
+                "raw_text": resp.text[:500]}
+    if not body.get("ok"):
+        raise TelegramAPIError(
+            f"Telegram rejected sendMessage: "
+            f"{body.get('description') or json.dumps(body)[:300]}"
+        )
+    return body.get("result") or body

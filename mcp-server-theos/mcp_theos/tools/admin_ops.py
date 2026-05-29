@@ -959,6 +959,138 @@ async def generate_sales_report(
         return {"success": False, "error": "date_from / date_to must be ISO YYYY-MM-DD"}
 
     from mcp_theos.sales_report import generate as _gen
+
+    # ------------------------------------------------------------------
+    # Background path — used when the agent calls with deliver_to_chat
+    # set. Reason: Hermes' MCP client times out at 120s, and pulling
+    # 26 days of Velneo line items ( ~125 paginated requests ) takes
+    # 5–15 minutes. We can't fit that in a single MCP round-trip.
+    #
+    # So we ack the request immediately, spawn an asyncio task with
+    # its own VelneoClient (the one passed in here gets closed when
+    # this function returns), and let it upload the XLSX + caption
+    # directly to Telegram once it's ready. The agent learns the
+    # background ID + estimated wait time and tells the user.
+    # ------------------------------------------------------------------
+    if deliver_to_chat:
+        import asyncio
+        from datetime import date as _date
+        from mcp_theos.velneo_http import VelneoClient
+        from mcp_theos.telegram_delivery import (
+            send_document as _send_doc,
+            send_message as _send_msg,
+        )
+
+        # Estimate wait time so the agent can quote it to the user.
+        # Empirical: a busy Mepriga day at PAGE_SIZE=500 needs ~5
+        # paginated requests of ~5s each plus catalog lookups => ~30s
+        # per day. Round generously, floor at 1 min.
+        try:
+            _d_from = _date.fromisoformat(df)
+            _d_to = _date.fromisoformat(dt)
+            n_days = max(1, (_d_to - _d_from).days + 1)
+        except Exception:
+            n_days = 1
+        estimated_minutes = max(1, int(round(n_days * 0.5)))
+
+        cfg_snapshot = client.cfg
+        df_local, dt_local = df, dt
+        sucursal_local = sucursal
+        max_rows_local = max_rows
+        chat_id_local = str(deliver_to_chat)
+
+        async def _bg_generate_and_deliver() -> None:
+            bg_client = VelneoClient(cfg=cfg_snapshot)
+            try:
+                result_bg = await _gen(
+                    bg_client, date_from=df_local, date_to=dt_local,
+                    sucursal=sucursal_local, max_rows=max_rows_local,
+                )
+                if not result_bg.get("success"):
+                    err = (result_bg.get("error")
+                           or result_bg.get("message")
+                           or "error desconocido")
+                    await _send_msg(
+                        chat_id=chat_id_local,
+                        text=(f"<b>Informe {df_local} a {dt_local}</b>\n"
+                              f"❌ No pude generarlo: {err}"),
+                    )
+                    return
+                xlsx_b = result_bg.pop("xlsx_bytes", None)
+                if not xlsx_b:
+                    await _send_msg(
+                        chat_id=chat_id_local,
+                        text=(f"<b>Informe {df_local} a {dt_local}</b>\n"
+                              f"No hubo ventas en ese rango."),
+                    )
+                    return
+                # Caption with totals (same shape as cron + sync path).
+                totals_bg = result_bg.get("totals") or {}
+                try:
+                    pvp_t = float(totals_bg.get("pvp_linea") or 0)
+                    net_t = float(totals_bg.get("precio_neto_linea") or 0)
+                except (TypeError, ValueError):
+                    pvp_t = net_t = 0.0
+                nlines_bg = result_bg.get("total_lines") or 0
+                if df_local == dt_local:
+                    try:
+                        _d_str = datetime.strptime(df_local, "%Y-%m-%d").strftime("%d/%m/%Y")
+                    except Exception:
+                        _d_str = df_local
+                    ttl = f"Informe de ventas — {_d_str}"
+                else:
+                    try:
+                        _a_s = datetime.strptime(df_local, "%Y-%m-%d").strftime("%d/%m/%Y")
+                        _b_s = datetime.strptime(dt_local, "%Y-%m-%d").strftime("%d/%m/%Y")
+                    except Exception:
+                        _a_s, _b_s = df_local, dt_local
+                    ttl = f"Informe de ventas — {_a_s} a {_b_s}"
+                cap = "\n".join([
+                    f"<b>{ttl}</b>",
+                    "",
+                    f"Total PVP: ${pvp_t:,.2f}",
+                    f"Total neto: ${net_t:,.2f}",
+                    f"Líneas vendidas: {int(nlines_bg):,}",
+                ])
+                _fname_range_bg = df_local if df_local == dt_local else f"{df_local}_a_{dt_local}"
+                await _send_doc(
+                    chat_id=chat_id_local,
+                    filename=f"informe_ventas_mepriga_{_fname_range_bg}.xlsx",
+                    data=xlsx_b,
+                    caption=cap,
+                    parse_mode="HTML",
+                )
+            except Exception as exc:
+                try:
+                    await _send_msg(
+                        chat_id=chat_id_local,
+                        text=(f"<b>Informe {df_local} a {dt_local}</b>\n"
+                              f"❌ Falló durante la generación: {exc}"),
+                    )
+                except Exception:
+                    pass
+            finally:
+                try:
+                    await bg_client.aclose()
+                except Exception:
+                    pass
+
+        asyncio.create_task(_bg_generate_and_deliver())
+        return {
+            "success": True,
+            "status": "processing_in_background",
+            "delivered_to_chat": chat_id_local,
+            "date_from": df,
+            "date_to": dt,
+            "estimated_minutes": estimated_minutes,
+            "message": (
+                f"Informe del {df} al {dt} en cola. Te lo subo al grupo "
+                f"en ~{estimated_minutes} min (estimado)."
+            ),
+        }
+
+    # Synchronous path — only used by the cron / programmatic callers
+    # without deliver_to_chat. Keeps the existing 120s contract.
     result = await _gen(
         client, date_from=df, date_to=dt,
         sucursal=sucursal, max_rows=max_rows,
@@ -979,79 +1111,11 @@ async def generate_sales_report(
     xlsx_filename = f"informe_ventas_mepriga_{fname_range}.xlsx"
     base_payload = {k: v for k, v in result.items() if k != "xlsx_bytes"}
 
-    # Direct-delivery path — used by the agent when it knows the target
-    # chat. Skips the base64 round-trip entirely.
-    if deliver_to_chat:
-        from mcp_theos.telegram_delivery import (
-            send_document as _send_doc,
-            BotTokenMissing,
-        )
-        # Caption HTML — same shape the cron uses so the UX is identical
-        # whether the report came from "lila, dame el informe" or the
-        # nightly 21:00 cron tick. Falls back to a bare title when totals
-        # are missing.
-        totals = base_payload.get("totals") or {}
-        try:
-            pvp_total = float(totals.get("pvp_linea") or 0)
-            neto_total = float(totals.get("precio_neto_linea") or 0)
-        except (TypeError, ValueError):
-            pvp_total = neto_total = 0.0
-        n_lines = base_payload.get("total_lines") or 0
-        if df == dt:
-            try:
-                _d = datetime.strptime(df, "%Y-%m-%d").strftime("%d/%m/%Y")
-            except Exception:
-                _d = df
-            title = f"Informe de ventas — {_d}"
-        else:
-            try:
-                _a = datetime.strptime(df, "%Y-%m-%d").strftime("%d/%m/%Y")
-                _b = datetime.strptime(dt, "%Y-%m-%d").strftime("%d/%m/%Y")
-            except Exception:
-                _a, _b = df, dt
-            title = f"Informe de ventas — {_a} a {_b}"
-        caption_lines = [
-            f"<b>{title}</b>",
-            "",
-            f"Total PVP: ${pvp_total:,.2f}",
-            f"Total neto: ${neto_total:,.2f}",
-            f"Líneas vendidas: {int(n_lines):,}",
-        ]
-        caption = "\n".join(caption_lines)
-        try:
-            await _send_doc(
-                chat_id=str(deliver_to_chat),
-                filename=xlsx_filename,
-                data=xlsx_bytes,
-                caption=caption,
-                parse_mode="HTML",
-            )
-        except BotTokenMissing as e:
-            return {
-                **base_payload,
-                "success": False,
-                "error": "telegram_bot_token_missing",
-                "message": str(e),
-            }
-        except Exception as e:
-            # Fallback: keep the base64 so the caller can retry.
-            return {
-                **base_payload,
-                "success": False,
-                "error": "telegram_upload_failed",
-                "message": f"Subida a Telegram fallo: {e}. XLSX devuelto en base64 como fallback.",
-                "xlsx_base64": base64.b64encode(xlsx_bytes).decode("ascii"),
-                "xlsx_filename": xlsx_filename,
-            }
-        return {
-            **base_payload,
-            "delivered": True,
-            "delivered_to_chat": str(deliver_to_chat),
-            "xlsx_filename": xlsx_filename,
-            "xlsx_size_kb": round(len(xlsx_bytes) / 1024, 1),
-        }
-
-    # Legacy / cron path: return base64.
+    # Cron / programmatic callers (no deliver_to_chat) — return base64
+    # so the caller can build its own caption and upload itself. The
+    # agent path above never reaches this code: when deliver_to_chat
+    # is set, the background task runs and we already returned a
+    # processing-in-background ack.
     return {
         **base_payload,
         "xlsx_base64": base64.b64encode(xlsx_bytes).decode("ascii"),
