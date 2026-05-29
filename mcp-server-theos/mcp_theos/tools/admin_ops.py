@@ -953,11 +953,45 @@ async def generate_sales_report(
             send_document as _send_doc,
             BotTokenMissing,
         )
+        # Caption HTML — same shape the cron uses so the UX is identical
+        # whether the report came from "lila, dame el informe" or the
+        # nightly 21:00 cron tick. Falls back to a bare title when totals
+        # are missing.
+        totals = base_payload.get("totals") or {}
+        try:
+            pvp_total = float(totals.get("pvp_linea") or 0)
+            neto_total = float(totals.get("precio_neto_linea") or 0)
+        except (TypeError, ValueError):
+            pvp_total = neto_total = 0.0
+        n_lines = base_payload.get("total_lines") or 0
+        if df == dt:
+            try:
+                _d = datetime.strptime(df, "%Y-%m-%d").strftime("%d/%m/%Y")
+            except Exception:
+                _d = df
+            title = f"Informe de ventas — {_d}"
+        else:
+            try:
+                _a = datetime.strptime(df, "%Y-%m-%d").strftime("%d/%m/%Y")
+                _b = datetime.strptime(dt, "%Y-%m-%d").strftime("%d/%m/%Y")
+            except Exception:
+                _a, _b = df, dt
+            title = f"Informe de ventas — {_a} a {_b}"
+        caption_lines = [
+            f"<b>{title}</b>",
+            "",
+            f"Total PVP: ${pvp_total:,.2f}",
+            f"Total neto: ${neto_total:,.2f}",
+            f"Líneas vendidas: {int(n_lines):,}",
+        ]
+        caption = "\n".join(caption_lines)
         try:
             await _send_doc(
                 chat_id=str(deliver_to_chat),
                 filename=xlsx_filename,
                 data=xlsx_bytes,
+                caption=caption,
+                parse_mode="HTML",
             )
         except BotTokenMissing as e:
             return {
