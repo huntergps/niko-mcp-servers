@@ -881,7 +881,7 @@ async def generate_sales_report(
     month: str | None = None,
     year: str | int | None = None,
     sucursal: str | None = None,
-    max_rows: int = 5000,
+    max_rows: int = 200000,
     deliver_to_chat: str | None = None,
 ) -> dict[str, Any]:
     """Generate the "Informe de ventas diarias" XLSX for a date range.

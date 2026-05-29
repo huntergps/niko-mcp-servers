@@ -307,13 +307,250 @@ def _pivot(
     return sorted(bodegas), sorted(fechas), table
 
 
+def _aggregate_for_charts(
+    bodegas: list[str],
+    table: dict[tuple[str, str], dict[str, float]],
+) -> tuple[list[str], dict[str, dict[str, float]], dict[str, float]]:
+    """Collapse the per-date pivot into the totals each chart needs.
+
+    The 4 charts that mirror the operator's "informe mejorado" template
+    never break down by fecha — they show one number per familia (or per
+    bodega) for the whole reporting window. So we sum across all dates
+    here and return:
+
+      familias — list of family names, sorted alphabetically (matches
+                 the visual order in the reference XLSX: BAZAR,
+                 PAPELERIA, PRODUCTOS DE HOGAR, VESTIMENTA, VIVERES)
+      fam_x_bod — {familia: {bodega: total_pvp}}
+      bod_totals — {bodega: total_pvp_across_familias}
+    """
+    fam_x_bod: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    bod_totals: dict[str, float] = defaultdict(float)
+    familias_set: set[str] = set()
+    for (_fecha, fam), bod_vals in table.items():
+        familias_set.add(fam)
+        for bod, v in bod_vals.items():
+            fam_x_bod[fam][bod] += v
+            bod_totals[bod] += v
+    return sorted(familias_set), dict(fam_x_bod), dict(bod_totals)
+
+
+def _write_charts_data(
+    ws,
+    bodegas: list[str],
+    familias: list[str],
+    fam_x_bod: dict[str, dict[str, float]],
+    bod_totals: dict[str, float],
+) -> None:
+    """Populate the hidden ``_datos_graficos`` sheet — three side-by-side
+    blocks that the 4 charts reference. Mirrors the layout in the
+    reference XLSX (analysed empirically).
+
+      Block 1 (cols A..B+n_bodegas) — Familia × Bodega matrix.
+      Block 2 (cols E..F)           — Familia × Total.
+      Block 3 (cols H..I)           — Bodega × Venta.
+    """
+    # Block 1: Familia × Bodega
+    ws.cell(1, 1, "Familia")
+    for j, bod in enumerate(bodegas, start=2):
+        ws.cell(1, j, bod)
+    for i, fam in enumerate(familias, start=2):
+        ws.cell(i, 1, fam)
+        for j, bod in enumerate(bodegas, start=2):
+            ws.cell(i, j, fam_x_bod.get(fam, {}).get(bod, 0))
+
+    # Block 2: Familia × Total (cols E:F)
+    ws.cell(1, 5, "Familia")
+    ws.cell(1, 6, "Total")
+    for i, fam in enumerate(familias, start=2):
+        ws.cell(i, 5, fam)
+        ws.cell(i, 6, sum(fam_x_bod.get(fam, {}).get(b, 0) for b in bodegas))
+
+    # Block 3: Bodega × Venta (cols H:I)
+    ws.cell(1, 8, "Bodega")
+    ws.cell(1, 9, "Venta")
+    for i, bod in enumerate(bodegas, start=2):
+        ws.cell(i, 8, bod)
+        ws.cell(i, 9, bod_totals.get(bod, 0))
+
+    ws.sheet_state = "hidden"
+
+
+def _add_dashboard_charts(
+    ws_informe,
+    ws_data,
+    bodegas: list[str],
+    familias: list[str],
+    anchor_row: int,
+) -> None:
+    """Place 4 charts on the INFORME sheet, anchored below the table.
+
+    Two rows × two columns layout:
+      [bar horizontal: Familia × Bodega]  [donut: Participación por Familia]
+      [bar vertical: Total por Bodega]    [donut: Participación por Bodega]
+
+    All series read from ``ws_data`` (the hidden _datos_graficos sheet).
+    """
+    from openpyxl.chart import BarChart, DoughnutChart, Reference
+    from openpyxl.chart.label import DataLabelList
+    from openpyxl.chart.marker import DataPoint
+    from openpyxl.chart.shapes import GraphicalProperties
+    from openpyxl.drawing.colors import ColorChoice as ColorChoiceClass
+    from openpyxl.drawing.fill import ColorChoice
+    from openpyxl.drawing.line import LineProperties
+
+    n_fam = len(familias)
+    n_bod = len(bodegas)
+    if n_fam == 0 or n_bod == 0:
+        return
+
+    def _solid_no_line(hex_color: str) -> GraphicalProperties:
+        gp = GraphicalProperties(solidFill=hex_color)
+        gp.line = LineProperties(noFill=True)
+        return gp
+
+    # Map first two bodegas to brand colors. Anything beyond falls back
+    # to the secondary blue so reports with extra bodegas still render.
+    bodega_chart_colors = [PALETTE_SECONDARY, PALETTE_GREEN] + [PALETTE_SECONDARY] * max(0, n_bod - 2)
+
+    # ------------------------------------------------------------------
+    # Helper: build a DataLabelList that ONLY shows the field we want.
+    # Without explicit False on the others Excel falls back to defaults
+    # (which is "show series name + category name + value" for donuts
+    # and bars). That's the source of the verbose labels we want gone.
+    # ------------------------------------------------------------------
+    def _quiet_labels(show_percent=False, show_val=False) -> DataLabelList:
+        return DataLabelList(
+            showPercent=show_percent,
+            showVal=show_val,
+            showCatName=False,
+            showSerName=False,
+            showLegendKey=False,
+            showBubbleSize=False,
+        )
+
+    # Each chart roughly portrait-shaped (matches the reference layout):
+    # 11 cm wide × 9 cm tall — about 2 chart columns fit horizontally in
+    # a standard widescreen viewer.
+    CHART_W_CM = 11.0
+    CHART_H_CM = 9.0
+
+    # ------------------------------------------------------------------
+    # Chart 0 — BarChart horizontal: Ventas por Familia y Bodega
+    # ------------------------------------------------------------------
+    c0 = BarChart()
+    c0.type = "bar"
+    c0.grouping = "clustered"
+    c0.style = 2
+    c0.title = "Ventas por Familia y Bodega"
+    c0.gapWidth = 182
+    c0.varyColors = False
+    c0.width = CHART_W_CM
+    c0.height = CHART_H_CM
+    data_ref = Reference(ws_data, min_col=2, max_col=1 + n_bod, min_row=1, max_row=1 + n_fam)
+    cats_ref = Reference(ws_data, min_col=1, min_row=2, max_row=1 + n_fam)
+    c0.add_data(data_ref, titles_from_data=True)
+    c0.set_categories(cats_ref)
+    for i, color in enumerate(bodega_chart_colors[:n_bod]):
+        c0.series[i].graphicalProperties = _solid_no_line(color)
+    c0.legend.position = "b"
+    # No data labels on the horizontal bars (matches reference template).
+
+    # ------------------------------------------------------------------
+    # Chart 1 — Doughnut: Participación por Familia
+    # ------------------------------------------------------------------
+    c1 = DoughnutChart()
+    c1.holeSize = 75
+    c1.firstSliceAng = 0
+    c1.title = "Participación por Familia"
+    c1.width = CHART_W_CM
+    c1.height = CHART_H_CM
+    fam_data = Reference(ws_data, min_col=6, min_row=1, max_row=1 + n_fam)
+    fam_cats = Reference(ws_data, min_col=5, min_row=2, max_row=1 + n_fam)
+    c1.add_data(fam_data, titles_from_data=True)
+    c1.set_categories(fam_cats)
+    c1.dataLabels = _quiet_labels(show_percent=True)
+    # Stable color rotation per family — uses the corporate palette so
+    # the donut matches the rest of the dashboard.
+    fam_palette = [
+        PALETTE_SECONDARY, "C0504D", PALETTE_GREEN, "8064A2", "4BACC6",
+        "F79646", "1F4E78", "70AD47",
+    ]
+    for k in range(n_fam):
+        dp = DataPoint(idx=k)
+        dp.graphicalProperties = _solid_no_line(fam_palette[k % len(fam_palette)])
+        c1.series[0].data_points.append(dp)
+    c1.legend.position = "r"
+
+    # ------------------------------------------------------------------
+    # Chart 2 — BarChart vertical: Total de Venta por Bodega
+    # ------------------------------------------------------------------
+    c2 = BarChart()
+    c2.type = "col"
+    c2.grouping = "clustered"
+    c2.style = 2
+    c2.title = "Total de Venta por Bodega"
+    c2.gapWidth = 219
+    c2.overlap = -27
+    c2.varyColors = False
+    c2.width = CHART_W_CM
+    c2.height = CHART_H_CM
+    bod_data = Reference(ws_data, min_col=9, min_row=1, max_row=1 + n_bod)
+    bod_cats = Reference(ws_data, min_col=8, min_row=2, max_row=1 + n_bod)
+    c2.add_data(bod_data, titles_from_data=True)
+    c2.set_categories(bod_cats)
+    c2.series[0].dLbls = _quiet_labels(show_val=True)
+    c2.series[0].graphicalProperties = _solid_no_line(PALETTE_SECONDARY)
+    c2.legend = None
+
+    # ------------------------------------------------------------------
+    # Chart 3 — Doughnut: Participación por Bodega
+    # ------------------------------------------------------------------
+    c3 = DoughnutChart()
+    c3.holeSize = 75
+    c3.firstSliceAng = 0
+    c3.title = "Participación por Bodega"
+    c3.width = CHART_W_CM
+    c3.height = CHART_H_CM
+    c3.add_data(bod_data, titles_from_data=True)
+    c3.set_categories(bod_cats)
+    c3.dataLabels = _quiet_labels(show_percent=True)
+    for k in range(n_bod):
+        dp = DataPoint(idx=k)
+        dp.graphicalProperties = _solid_no_line(bodega_chart_colors[k % len(bodega_chart_colors)])
+        c3.series[0].data_points.append(dp)
+    c3.legend.position = "b"
+
+    # ------------------------------------------------------------------
+    # Anchor the four charts in a 2×2 grid below the main table.
+    # Width / height in cm above takes precedence over anchor cell span —
+    # the anchor is just the top-left corner. Spacing rows of 22 lines
+    # apart leaves enough room for the 9 cm tall charts.
+    # ------------------------------------------------------------------
+    # Layout grid:
+    #   row base_row:   [chart0 at B]    [chart1 at E]
+    #   row base_row+22:[chart2 at B]    [chart3 at E]
+    # Col E sits past the family columns (B+C=44 chars) which roughly
+    # matches the 11 cm chart width.
+    base_row = anchor_row + 2
+    right_col_letter = get_column_letter(5)  # E
+    anchors = [
+        (f"B{base_row}",                            c0),
+        (f"{right_col_letter}{base_row}",           c1),
+        (f"B{base_row + 22}",                       c2),
+        (f"{right_col_letter}{base_row + 22}",      c3),
+    ]
+    for cell_ref, chart in anchors:
+        ws_informe.add_chart(chart, cell_ref)
+
+
 def _write_informe(
     ws,
     bodegas: list[str],
     fechas: list[str],
     table: dict[tuple[str, str], dict[str, float]],
     company_name: str = "MEGA PRIMAVERA GALAPAGOS SA",
-) -> None:
+) -> int:
     """Write the INFORME dashboard sheet using the corporate palette.
 
     Layout (top-down):
@@ -354,7 +591,29 @@ def _write_informe(
     box = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     n_bodegas = len(bodegas)
-    total_col = 2 + n_bodegas + 1  # B + bodegas + Total
+
+    # ------------------------------------------------------------------
+    # Layout columns — matches the operator's reference template.
+    # ------------------------------------------------------------------
+    #
+    #   col A    -> 2-char margin
+    #   col B    -> Familia Principal label + family names (single col)
+    #   col C    -> visual extension of the family column (gap in the
+    #               body; coloured band in the header row so the table
+    #               header looks continuous)
+    #   col D..E -> ALMACEN, BODEGA (1 col each)
+    #   col F    -> TOTAL (1 col)
+    #
+    # For n_bodegas=2 (Mepriga's case): 5 visible cols (B..F).
+    #
+    # FAMILY_LABEL_COL = 2 (B)  — family text
+    # FAMILY_EXTRA_COL = 3 (C)  — header band extension; gap in body
+    # value_start_col  = 4 (D)  — first bodega
+    # total_col        = D + n_bodegas
+    FAMILY_LABEL_COL = 2
+    FAMILY_EXTRA_COL = 3
+    value_start_col = 4
+    total_col = value_start_col + n_bodegas
 
     # ------------------------------------------------------------------
     # 1. Banner row 2 (full width — merge B:total_col)
@@ -403,14 +662,23 @@ def _write_informe(
             per_bodega_total[bod] += v
             grand_total_all += v
 
-    # Layout: each KPI takes 2 columns. Bodegas come first, "TOTAL" last.
+    # Layout: KPI cards mirror the operator's reference. Each bodega
+    # card spans 2 cols (label + value text fits comfortably). TOTAL
+    # GENERAL takes 1 col — intentionally narrower so it aligns with
+    # the TOTAL column of the table below. For n_bodegas=2 that's:
+    #   ALMACEN -> cols 2..3 (B..C)
+    #   BODEGA  -> cols 4..5 (D..E)
+    #   TOTAL   -> col 6     (F)
+    # which exactly matches the FAMILY_LABEL + FAMILY_EXTRA + bodegas +
+    # TOTAL layout of the table.
     cards = [(bod, per_bodega_total.get(bod, 0.0), _bodega_color(bod)) for bod in bodegas]
     cards.append(("TOTAL GENERAL", grand_total_all, PALETTE_PRIMARY))
 
+    spans = [2] * n_bodegas + [1]
+
     col = 2
-    KPI_COL_SPAN = 2
-    for label, value, color in cards:
-        end_col = col + KPI_COL_SPAN - 1
+    for (label, value, color), span in zip(cards, spans):
+        end_col = col + span - 1
         # Label band
         ws.merge_cells(start_row=KPI_ROW_LABEL, start_column=col,
                        end_row=KPI_ROW_LABEL, end_column=end_col)
@@ -444,10 +712,14 @@ def _write_informe(
 
     HDR_ROW = SECTION_ROW + 1
     ws.row_dimensions[HDR_ROW].height = 22
-    h = ws.cell(HDR_ROW, 2, "Familia Principal")
+    # "Familia Principal" header in col B only (matches reference).
+    # Col C is part of the header band but empty — fills with the same
+    # azul oscuro so the band looks continuous across the table.
+    h = ws.cell(HDR_ROW, FAMILY_LABEL_COL, "Familia Principal")
     h.font = hdr_font_white; h.fill = table_hdr_fill; h.alignment = left
     h.border = box
-    for j, bod in enumerate(bodegas, start=3):
+    ws.cell(HDR_ROW, FAMILY_EXTRA_COL).fill = table_hdr_fill
+    for j, bod in enumerate(bodegas, start=value_start_col):
         c = ws.cell(HDR_ROW, j, bod)
         c.font = hdr_font_white; c.fill = table_hdr_fill; c.alignment = center
         c.border = box
@@ -476,14 +748,17 @@ def _write_informe(
 
         for idx, fam in enumerate(familias):
             zebra = (idx % 2 == 1)
-            # Familia name
-            fc = ws.cell(row, 2, fam)
+            # Familia name in col B only. Col C is empty (acts as visual
+            # gap before the value columns). Zebra fill covers B+C so the
+            # banding spans the full family-column area.
+            fc = ws.cell(row, FAMILY_LABEL_COL, fam)
             fc.font = body_font
             fc.alignment = left
             if zebra:
-                fc.fill = zebra_fill
+                ws.cell(row, FAMILY_LABEL_COL).fill = zebra_fill
+                ws.cell(row, FAMILY_EXTRA_COL).fill = zebra_fill
             row_total = 0.0
-            for j, bod in enumerate(bodegas, start=3):
+            for j, bod in enumerate(bodegas, start=value_start_col):
                 v = table[(fecha, fam)].get(bod, 0.0)
                 c = ws.cell(row, j, v if v else None)
                 c.number_format = fmt
@@ -503,11 +778,15 @@ def _write_informe(
             row += 1
 
         if use_date_grouping:
-            # Date subtotal row
+            # Date subtotal row — label merged B-C (consistent with the
+            # grand total row below), values in D..F.
             ws.row_dimensions[row].height = 22
-            stc = ws.cell(row, 2, f"Subtotal {_fmt_date_es(fecha)}")
+            ws.merge_cells(start_row=row, start_column=FAMILY_LABEL_COL,
+                           end_row=row, end_column=FAMILY_EXTRA_COL)
+            stc = ws.cell(row, FAMILY_LABEL_COL, f"Subtotal {_fmt_date_es(fecha)}")
             stc.font = subtotal_font; stc.fill = subtotal_fill; stc.alignment = left
-            for j, bod in enumerate(bodegas, start=3):
+            ws.cell(row, FAMILY_EXTRA_COL).fill = subtotal_fill
+            for j, bod in enumerate(bodegas, start=value_start_col):
                 c = ws.cell(row, j, date_by_bod[bod])
                 c.number_format = fmt
                 c.font = subtotal_font; c.fill = subtotal_fill; c.alignment = right
@@ -516,26 +795,47 @@ def _write_informe(
             c.font = subtotal_font; c.fill = subtotal_fill; c.alignment = right
             row += 1
 
-    # Grand total row
+    # Grand total row — label merged B-C (matches the reference template
+    # where "TOTAL GENERAL" sits under the family column band), values
+    # in D..F line up with the body rows above.
     ws.row_dimensions[row].height = 26
-    gc = ws.cell(row, 2, "TOTAL GENERAL")
-    gc.font = grand_font; gc.fill = grand_fill; gc.alignment = left
-    for j, bod in enumerate(bodegas, start=3):
+    grand_label_align = Alignment(horizontal="left", vertical="center", indent=1)
+    grand_value_align = Alignment(horizontal="right", vertical="center", indent=1)
+    ws.merge_cells(start_row=row, start_column=FAMILY_LABEL_COL,
+                   end_row=row, end_column=FAMILY_EXTRA_COL)
+    gc = ws.cell(row, FAMILY_LABEL_COL, "TOTAL GENERAL")
+    gc.font = grand_font; gc.fill = grand_fill; gc.alignment = grand_label_align
+    ws.cell(row, FAMILY_EXTRA_COL).fill = grand_fill
+    for j, bod in enumerate(bodegas, start=value_start_col):
         c = ws.cell(row, j, grand_by_bod[bod])
         c.number_format = fmt
-        c.font = grand_font; c.fill = grand_fill; c.alignment = right
+        c.font = grand_font; c.fill = grand_fill; c.alignment = grand_value_align
     c = ws.cell(row, total_col, grand_total_recompute)
     c.number_format = fmt
-    c.font = grand_font; c.fill = grand_fill; c.alignment = right
+    c.font = grand_font; c.fill = grand_fill; c.alignment = grand_value_align
+
+    last_row = row
 
     # ------------------------------------------------------------------
-    # 4. Column widths
+    # 4. Column widths — sized so the KPI cards and the table both
+    # line up cleanly:
+    #   A   = 2  (margin)
+    #   B   = 28 (family names + ALMACEN KPI label half)
+    #   C   = 16 (extension of family column; visual gap in body)
+    #   D-E = 22 (value columns + KPI label halves)
+    #   F   = 22 (TOTAL value + single-col TOTAL GENERAL KPI)
+    # With this, B+C (44) ≈ D+E (44), so the ALMACEN and BODEGA KPI
+    # cards visually match in width, and the TOTAL card (col F) is the
+    # narrower third card — matches the reference template exactly.
     # ------------------------------------------------------------------
     ws.column_dimensions["A"].width = 2
-    ws.column_dimensions["B"].width = 32
-    for j in range(3, total_col + 1):
+    ws.column_dimensions[get_column_letter(FAMILY_LABEL_COL)].width = 28
+    ws.column_dimensions[get_column_letter(FAMILY_EXTRA_COL)].width = 16
+    for j in range(value_start_col, total_col + 1):
         ws.column_dimensions[get_column_letter(j)].width = 22
     ws.sheet_view.showGridLines = False
+
+    return last_row
 
 
 def _write_detalle(
@@ -824,7 +1124,18 @@ async def generate(
     informe_ws = wb.create_sheet("INFORME")
     bodegas, fechas, table = _pivot(rows, bodega_names, familia_names)
     company_name = getattr(client.cfg, "commercial_name", None) or "MEPRIGA"
-    _write_informe(informe_ws, bodegas, fechas, table, company_name=company_name)
+    last_row = _write_informe(informe_ws, bodegas, fechas, table,
+                              company_name=company_name)
+
+    # Hidden _datos_graficos sheet + 4 dashboard charts on INFORME.
+    # Charts read from the hidden sheet, never from the visible pivot
+    # table, so multi-day reports (where the visible pivot has per-date
+    # subtotal rows interleaved) still chart cleanly.
+    datos_ws = wb.create_sheet("_datos_graficos")
+    familias_chart, fam_x_bod, bod_totals = _aggregate_for_charts(bodegas, table)
+    _write_charts_data(datos_ws, bodegas, familias_chart, fam_x_bod, bod_totals)
+    _add_dashboard_charts(informe_ws, datos_ws, bodegas, familias_chart,
+                          anchor_row=last_row)
 
     detalle_ws = wb.create_sheet("VENTAS_DETALLE")
     _write_detalle(detalle_ws, rows, bodega_names, familia_names,
