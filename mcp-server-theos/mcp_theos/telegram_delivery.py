@@ -135,6 +135,55 @@ async def send_document(
     return body.get("result") or body
 
 
+async def send_photo(
+    *,
+    chat_id: str,
+    data: bytes,
+    filename: str = "chart.png",
+    caption: str | None = None,
+    parse_mode: str | None = "HTML",
+    message_thread_id: str | None = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Upload an image to a Telegram chat (Bot API ``sendPhoto``).
+
+    Used by the dashboard-chart tool to surface the visual summary.
+    Telegram caps inline-rendered photos at 10 MB; if the PNG is bigger
+    the caller should fall back to ``send_document``.
+    """
+    if len(data) > 10 * 1024 * 1024:
+        # Fallback: photos > 10 MB get sent as a file (no inline preview).
+        return await send_document(
+            chat_id=chat_id, filename=filename, data=data,
+            caption=caption, parse_mode=parse_mode,
+            message_thread_id=message_thread_id, timeout=timeout,
+        )
+    token = _get_bot_token()
+    url = f"{_API_BASE}/bot{token}/sendPhoto"
+    fields: list[tuple[str, str]] = [("chat_id", str(chat_id))]
+    if caption:
+        fields.append(("caption", caption))
+        if parse_mode:
+            fields.append(("parse_mode", parse_mode))
+    if message_thread_id:
+        fields.append(("message_thread_id", str(message_thread_id)))
+    files = {"photo": (filename, data, "image/png")}
+    data_fields = dict(fields)
+    async with httpx.AsyncClient(timeout=timeout) as cli:
+        resp = await cli.post(url, data=data_fields, files=files)
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"ok": False, "raw_status": resp.status_code,
+                "raw_text": resp.text[:500]}
+    if not body.get("ok"):
+        raise TelegramAPIError(
+            f"Telegram rejected sendPhoto: "
+            f"{body.get('description') or json.dumps(body)[:300]}"
+        )
+    return body.get("result") or body
+
+
 async def send_message(
     *,
     chat_id: str,

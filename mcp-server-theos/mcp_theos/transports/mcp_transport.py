@@ -1061,6 +1061,42 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "sales_dashboard_chart",
+        "description": (
+            "Genera un dashboard visual PNG (2x2 paneles: familia, hora, "
+            "contado vs credito, top cajas) y lo sube DIRECTO al chat de "
+            "Telegram via Bot API sendPhoto. USAR cuando el usuario pida "
+            "'panorama visual', 'dashboard', 'graficos', 'visualmente', "
+            "'mostrame las ventas', 'imagen del resumen', 'chart' del "
+            "rango. Mucho mas digerible que una pared de tablas para "
+            "gerencia.\n\n"
+            "Devuelve un resumen JSON corto (totales + cache_stats) sin "
+            "binario — la imagen va inline al chat. Lila puede narrar 1-2 "
+            "frases de contexto al lado del chart (NO repetir el detalle "
+            "del JSON, que ya esta en la imagen)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "month": {"type": "string", "description": "YYYY-MM"},
+                "year": {"type": "string", "description": "YYYY"},
+                "date_from": {"type": "string", "description": "ISO YYYY-MM-DD"},
+                "date_to": {"type": "string", "description": "ISO YYYY-MM-DD"},
+                "sucursal": {"type": "string"},
+                "include_credit_notes": {"type": "boolean", "default": True},
+                "deliver_to_chat": {
+                    "type": "string",
+                    "description": (
+                        "REQUERIDO. Telegram chat_id (ej '-5248384291' "
+                        "para grupo Soporte Mepriga). El PNG se sube a ese "
+                        "chat como imagen inline (no como archivo)."
+                    ),
+                },
+            },
+            "required": ["deliver_to_chat"],
+        },
+    },
+    {
         "name": "generate_sales_report",
         "description": (
             "Genera el INFORME DE VENTAS DIARIAS (XLSX) que el operador "
@@ -1240,6 +1276,7 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "check_stock": ("products.check_stock", products.check_stock),
     "search_velneo": ("admin_search.search_velneo", admin_search.search_velneo),
     "sales_quick_summary": ("admin_ops.sales_quick_summary", admin_ops.sales_quick_summary),
+    "sales_dashboard_chart": ("admin_ops.sales_dashboard_chart", admin_ops.sales_dashboard_chart),
     "generate_sales_report": ("admin_ops.generate_sales_report", admin_ops.generate_sales_report),
 }
 

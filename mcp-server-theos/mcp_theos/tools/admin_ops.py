@@ -961,6 +961,153 @@ async def sales_quick_summary(
 
 
 # ---------------------------------------------------------------------------
+# sales_dashboard_chart — PNG visual summary, sent inline to Telegram
+# ---------------------------------------------------------------------------
+
+
+async def sales_dashboard_chart(
+    client: VelneoClient,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    month: str | None = None,
+    year: str | int | None = None,
+    sucursal: str | None = None,
+    deliver_to_chat: str | None = None,
+    include_credit_notes: bool = True,
+) -> dict[str, Any]:
+    """Render a 2x2 sales dashboard PNG (familia, hora, contado/crédito,
+    cajas) and push it to a Telegram chat.
+
+    Use this for "muéstrame visual" / "dame un gráfico" / "panorama
+    visual" — much friendlier for executive reading than a wall of
+    tabulated numbers. Reuses the same aggregation as
+    ``sales_quick_summary`` so the data is identical and the cache hits
+    on past days keep it cheap.
+
+    Returns ``{success, delivered, delivered_to_chat, png_size_kb,
+    totals}``. The PNG itself goes inline to the chat (sendPhoto), so
+    Lila only needs to narrate one or two sentences of context — no
+    binary payload in the JSON.
+    """
+    import calendar
+    from datetime import date as _date, datetime as _datetime, timezone, timedelta
+
+    if year:
+        try:
+            y_int = int(str(year).strip())
+            if not (2000 <= y_int <= 2100):
+                raise ValueError
+        except (TypeError, ValueError):
+            return {"success": False, "error": "year must be YYYY"}
+        date_from = f"{y_int:04d}-01-01"
+        date_to = f"{y_int:04d}-12-31"
+    elif month:
+        try:
+            y_str, m_str = str(month).strip().split("-")
+            y_int = int(y_str)
+            m_int = int(m_str)
+            if not (1 <= m_int <= 12) or not (2000 <= y_int <= 2100):
+                raise ValueError
+        except (TypeError, ValueError):
+            return {"success": False, "error": "month must be YYYY-MM"}
+        last_day = calendar.monthrange(y_int, m_int)[1]
+        date_from = f"{y_int:04d}-{m_int:02d}-01"
+        date_to = f"{y_int:04d}-{m_int:02d}-{last_day:02d}"
+    elif not date_from and not date_to:
+        ec_now = _datetime.now(timezone.utc) - timedelta(hours=5)
+        today_iso = ec_now.date().isoformat()
+        date_from = today_iso
+        date_to = today_iso
+    if not date_from:
+        date_from = date_to
+    if not date_to:
+        date_to = date_from
+
+    df = _norm_velneo_date(date_from)
+    dt = _norm_velneo_date(date_to)
+    if not df or not dt:
+        return {"success": False, "error": "date_from / date_to must be ISO YYYY-MM-DD"}
+
+    from mcp_theos.sales_report import (
+        summarize_sales as _sum_sales,
+        summarize_credit_notes as _sum_ncs,
+    )
+
+    summary = await _sum_sales(client, date_from=df, date_to=dt, sucursal=sucursal)
+    if not summary.get("success"):
+        return summary
+    if include_credit_notes:
+        ncs = await _sum_ncs(client, date_from=df, date_to=dt)
+        nc_total = float(ncs.get("total_nc") or 0)
+        summary["totals"]["nc_total"] = nc_total
+        summary["totals"]["saldo_neto"] = round(
+            summary["totals"]["pvp"] - nc_total, 2,
+        )
+
+    if not deliver_to_chat:
+        return {
+            "success": False,
+            "error": "deliver_to_chat required for chart delivery",
+        }
+
+    from mcp_theos.sales_chart import build_dashboard_png
+    from mcp_theos.telegram_delivery import (
+        send_photo as _send_photo, BotTokenMissing,
+    )
+
+    try:
+        png = build_dashboard_png(summary)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "success": False, "error": f"chart_render_failed: {exc}",
+        }
+
+    if df == dt:
+        try:
+            _d = _datetime.strptime(df, "%Y-%m-%d").strftime("%d/%m/%Y")
+        except Exception:
+            _d = df
+        title = f"Dashboard de ventas — {_d}"
+    else:
+        try:
+            _a = _datetime.strptime(df, "%Y-%m-%d").strftime("%d/%m/%Y")
+            _b = _datetime.strptime(dt, "%Y-%m-%d").strftime("%d/%m/%Y")
+        except Exception:
+            _a, _b = df, dt
+        title = f"Dashboard de ventas — {_a} a {_b}"
+    pvp_total = float((summary.get("totals") or {}).get("pvp") or 0)
+    caption = (
+        f"<b>{title}</b>\nTotal: ${pvp_total:,.2f}"
+    )
+
+    try:
+        await _send_photo(
+            chat_id=str(deliver_to_chat),
+            data=png,
+            filename=f"dashboard_ventas_{df}{'' if df == dt else f'_a_{dt}'}.png",
+            caption=caption, parse_mode="HTML",
+        )
+    except BotTokenMissing as e:
+        return {"success": False, "error": "telegram_bot_token_missing",
+                "message": str(e)}
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "error": "telegram_upload_failed",
+                "message": str(e)}
+
+    return {
+        "success": True,
+        "delivered": True,
+        "delivered_to_chat": str(deliver_to_chat),
+        "png_size_kb": round(len(png) / 1024, 1),
+        "date_from": df,
+        "date_to": dt,
+        "totals": summary.get("totals"),
+        "cache_stats": summary.get("cache_stats"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # generate_sales_report — XLSX deliverable for the daily ops report
 # ---------------------------------------------------------------------------
 
