@@ -1629,11 +1629,17 @@ async def _get_day_lines(
     *,
     day: str,
     sucursal: str,
+    retries: int = 2,
 ) -> dict[str, Any]:
     """Return the day's filtered movement rows — from cache if past day,
     paginating Velneo otherwise. Cache misses for past days populate
     the cache so the next call is free.
+
+    Retries the live fetch on transient transport errors (Velneo sometimes
+    drops the connection mid-pagination on heavy days). Each retry waits
+    a couple of seconds — the upstream usually recovers within one.
     """
+    import asyncio
     today = _today_ecu_iso()
     is_past = day < today
 
@@ -1644,20 +1650,30 @@ async def _get_day_lines(
             return {"success": True, "rows": cached,
                     "total_count": len(cached), "from_cache": True}
 
-    result = await _fetch_day_lines_via_proceso(
-        client, day=day, sucursal=sucursal,
-    )
-    if result.get("success") and is_past:
-        # Persist immutable past days. Best-effort — log + continue on
-        # disk errors so a broken cache mount doesn't kill the report.
+    attempt = 0
+    last_result: dict[str, Any] = {}
+    while attempt <= retries:
+        last_result = await _fetch_day_lines_via_proceso(
+            client, day=day, sucursal=sucursal,
+        )
+        if last_result.get("success"):
+            break
+        # Only retry on transient transport errors.
+        if last_result.get("error_code") != "transport":
+            break
+        attempt += 1
+        if attempt <= retries:
+            await asyncio.sleep(2 * attempt)
+
+    if last_result.get("success") and is_past:
         try:
             _write_jsonl(_cache_path(client.cfg.tenant_id, sucursal, day),
-                         result["rows"])
+                         last_result["rows"])
         except OSError as e:
             logger.warning("cache write failed for %s/%s: %s",
                            sucursal, day, e)
-    result["from_cache"] = False
-    return result
+    last_result["from_cache"] = False
+    return last_result
 
 
 async def _iter_days(date_from: str, date_to: str) -> list[str]:
