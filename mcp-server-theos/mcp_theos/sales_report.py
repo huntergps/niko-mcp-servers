@@ -1702,8 +1702,15 @@ async def summarize_credit_notes(
     date_from: str,
     date_to: str,
 ) -> dict[str, Any]:
-    """Sum credit notes (VENT_NOTA_CRED) in the range. Returns totals
-    and per-pto-emision split. Pagination via the normal table list.
+    """Sum credit notes (VENT_NOTA_CRED) in the range.
+
+    NOTE on filtering: Velneo's REST API on this table does NOT honour
+    ``filter[FECHA][gte]/[lte]``. Confirmed empirically — those return 0
+    rows even when the data exists. Only ``filter[FECHA]=YYYY-MM-DD``
+    (exact match) works. So instead of constructing N exact-match calls
+    (one per day for multi-day ranges), we pull the entire NC universe
+    (≈1k–2k rows for Mepriga, ~3 paginated GETs) and filter by date in
+    memory. The cost is small and the code works for any range.
     """
     page_size = 500
     page_num = 1
@@ -1711,8 +1718,13 @@ async def summarize_credit_notes(
     subtotal = 0.0
     iva = 0.0
     n_ncs = 0
+    n_ncs_off = 0
     by_pto_emi: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"total": 0.0, "n_ncs": 0})
+
+    # Normalize the range bounds for in-memory comparison.
+    df = date_from[:10] if date_from else ""
+    dt = date_to[:10] if date_to else df
 
     while True:
         try:
@@ -1720,9 +1732,8 @@ async def summarize_credit_notes(
                 "VENT_NOTA_CRED",
                 params={
                     "pagesize": page_size,
+                    "sort": "-FECHA",
                     "page[number]": page_num,
-                    "filter[FECHA][gte]": date_from,
-                    "filter[FECHA][lte]": date_to,
                 },
                 fields=["ID", "FECHA", "TOTAL", "SUBTOTAL", "IVA",
                         "ESTABLECIMIENTO", "PUNTOEMISION", "OFF"],
@@ -1731,9 +1742,23 @@ async def summarize_credit_notes(
             return {"success": False, "error": str(exc),
                     "total_nc": round(total, 2), "n_ncs": n_ncs}
         rows = resp.rows or []
+        rows_in_range = 0
         for r in rows:
-            # Skip cancelled NCs (OFF=true)
+            f_raw = r.get("FECHA") or ""
+            f_day = str(f_raw)[:10]
+            if not f_day:
+                continue
+            # In-range filter — strings compare lexicographically on ISO dates.
+            if df and f_day < df:
+                # Sort=-FECHA means once we cross below df we're done.
+                # But the page may have multi-NC rows above/below at the
+                # very bottom; we keep scanning until we run out.
+                continue
+            if dt and f_day > dt:
+                continue
+            rows_in_range += 1
             if r.get("OFF"):
+                n_ncs_off += 1
                 continue
             try:
                 t = float(r.get("TOTAL") or 0)
@@ -1756,7 +1781,12 @@ async def summarize_credit_notes(
             est_pto = f"{est}-{pto}" if est else "(sin caja)"
             by_pto_emi[est_pto]["total"] += t
             by_pto_emi[est_pto]["n_ncs"] += 1
+
         if len(rows) < page_size:
+            break
+        # Early-out: if this whole page was below the requested range
+        # (sort desc by FECHA), we can stop — older pages are even older.
+        if df and rows and str(rows[-1].get("FECHA", ""))[:10] < df:
             break
         page_num += 1
 
@@ -1766,6 +1796,7 @@ async def summarize_credit_notes(
         "subtotal_nc": round(subtotal, 2),
         "iva_nc": round(iva, 2),
         "n_ncs": n_ncs,
+        "n_ncs_off": n_ncs_off,
         "por_pto_emision": [
             {"establecimiento_pto": ep,
              "total": round(d["total"], 2), "n_ncs": d["n_ncs"]}
