@@ -108,6 +108,80 @@ async def _resolve_lookup(
     return out
 
 
+import re as _re
+
+_FAMILY_PREFIX_RE = _re.compile(r"^\s*\d+(?:\.\d+)*\s+")
+
+
+def _clean_family_name(name: str) -> str:
+    """Strip the leading "N " or "N.N " classification prefix.
+
+    Mepriga's INV_FAMI names are like "1 VIVERES" (parent) and
+    "1.3 ABARROTES" (child). The manual report shows just "VIVERES" /
+    "ABARROTES". We strip the leading digits + dots + spaces here.
+    """
+    return _FAMILY_PREFIX_RE.sub("", str(name or "").strip())
+
+
+async def _resolve_family_hierarchy(
+    client: VelneoClient, pagesize: int = 500,
+) -> tuple[dict[int, str], dict[int, str]]:
+    """Pull INV_FAMI and walk the id_padre chain.
+
+    Returns two dicts:
+
+    * ``leaf_to_parent_name`` — ``{leaf_inv_fami_id: parent_name}`` —
+      what the line's ``INV_FAMI`` field resolves to as the "Familia
+      Principal" column of the manual report.
+    * ``id_to_self_name`` — ``{inv_fami_id: own_name}`` — used for the
+      SubFamilia column of VENTAS_DETALLE.
+
+    Names are cleaned (prefix "1 ", "1.3 " etc. stripped).
+    """
+    try:
+        resp = await client.get(
+            "INV_FAMI", params={"pagesize": pagesize},
+            fields=["ID", "NAME", "ID_PADRE"],
+            use_cache=True,
+        )
+    except VelneoError as exc:
+        logger.warning("INV_FAMI hierarchy failed: %s", exc)
+        return {}, {}
+
+    raw: dict[int, dict[str, Any]] = {}
+    for r in resp.rows:
+        rid = r.get("ID")
+        if rid is None:
+            continue
+        try:
+            rid_i = int(rid)
+        except (TypeError, ValueError):
+            continue  # alphanum sentinel rows
+        pid_raw = r.get("ID_PADRE")
+        try:
+            pid_i = int(pid_raw) if pid_raw not in (None, "", "0") else 0
+        except (TypeError, ValueError):
+            pid_i = 0
+        raw[rid_i] = {"name": str(r.get("NAME") or "").strip(),
+                      "parent": pid_i}
+
+    # Walk parent chain to find the TOP of each leaf (id == id_padre
+    # OR id_padre==0 marks the root). Cap at 5 hops to prevent loops.
+    id_to_self_name: dict[int, str] = {
+        i: _clean_family_name(v["name"]) for i, v in raw.items()
+    }
+    leaf_to_parent_name: dict[int, str] = {}
+    for leaf_id, info in raw.items():
+        cur = leaf_id
+        for _ in range(5):
+            parent = raw.get(cur, {}).get("parent", 0)
+            if parent == 0 or parent == cur or parent not in raw:
+                break
+            cur = parent
+        leaf_to_parent_name[leaf_id] = _clean_family_name(raw[cur]["name"])
+    return leaf_to_parent_name, id_to_self_name
+
+
 async def _resolve_products(
     client: VelneoClient, product_ids: set[int], chunk: int = 100,
 ) -> dict[int, dict[str, Any]]:
@@ -488,12 +562,12 @@ async def generate(
 
     # 2. Resolve lookups (cached per tenant 30s in response_cache).
     bodega_names = await _resolve_lookup(client, "INV_BODEGA", "NAME")
-    familia_names = await _resolve_lookup(client, "INV_FAMI", "NAME")
-    # SUBFAMI lookup — fallback to empty if endpoint not exposed.
-    try:
-        subfamilia_names = await _resolve_lookup(client, "INV_SUBFAMI", "NAME")
-    except Exception:
-        subfamilia_names = {}
+    # INV_FAMI is a hierarchy — the leaf id on each line points to a
+    # subfamily; we want the TOP-LEVEL parent's name as the pivot
+    # row label (matches the operator's manual report).
+    familia_parent, familia_self = await _resolve_family_hierarchy(client)
+    familia_names = familia_parent  # used by _pivot (top-level)
+    subfamilia_names = familia_self  # used by _write_detalle (leaf)
 
     product_ids: set[int] = set()
     invoice_ids: set[int] = set()
