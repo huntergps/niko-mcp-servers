@@ -1623,26 +1623,31 @@ async def generate(
     last_row = _write_informe(informe_ws, bodegas, fechas, table,
                               company_name=company_name)
 
-    # Hidden _datos_graficos sheet + 4 dashboard charts on INFORME.
-    # Charts read from the hidden sheet, never from the visible pivot
-    # table, so multi-day reports (where the visible pivot has per-date
-    # subtotal rows interleaved) still chart cleanly.
+    # Sheet creation order = visible tab order. The user wants:
+    #   1) INFORME
+    #   2) Evolucion de Ventas
+    #   3) VENTAS_DETALLE
+    #   (_datos_graficos sits at the end as a hidden helper)
+    dashboard_ws = wb.create_sheet("Evolucion de Ventas")
+    detalle_ws = wb.create_sheet("VENTAS_DETALLE")
     datos_ws = wb.create_sheet("_datos_graficos")
+
+    # Fill order is independent of tab order. We fill in dependency
+    # order: charts first (datos_ws needed by INFORME charts), then
+    # detalle, then dashboard.
     familias_chart, fam_x_bod, bod_totals = _aggregate_for_charts(bodegas, table)
     _write_charts_data(datos_ws, bodegas, familias_chart, fam_x_bod, bod_totals)
     _add_dashboard_charts(informe_ws, datos_ws, bodegas, familias_chart,
                           anchor_row=last_row)
 
-    detalle_ws = wb.create_sheet("VENTAS_DETALLE")
     _write_detalle(detalle_ws, rows, bodega_names, familia_names,
                    subfamilia_names, product_info, factura_info)
 
-    # "Evolucion de Ventas" sheet — hourly evolution table + combo chart.
+    # "Evolucion de Ventas" — hourly evolution table + combo chart.
     # Pre-computed in Python so the user gets values upon opening the
     # workbook without needing to refresh a pivot. AutoFilter on the
     # table provides per-hour interactive filtering. (openpyxl can't
     # write proper Excel slicers, so AutoFilter is the closest stand-in.)
-    dashboard_ws = wb.create_sheet("Evolucion de Ventas")
     hourly = _aggregate_by_hour(rows)
     _write_dashboard(dashboard_ws, hourly)
 
