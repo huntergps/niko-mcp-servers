@@ -41,23 +41,25 @@ from mcp_theos.velneo_http import VelneoClient, VelneoError, call_proceso_or_mes
 logger = logging.getLogger(__name__)
 
 
-# Fields we keep from the 130-key proceso row.
+# Fields we keep from the 130-key proceso row. call_proceso_or_message
+# upper-cases all keys (matches the convention used by table list
+# responses) so we filter on UPPERCASE here.
 _KEEP_KEYS = frozenset({
-    "id", "vent_fact_vent",
-    "productos", "inv_present_producto",
-    "nombre", "abrev", "factor", "can",
-    "fecha",
-    "inv_bodega",
-    "inv_fami",
-    "cod_bar",
-    "precio_bruto_empaque", "iva_empaque", "costo_empaque",
-    "precio_neto_empaque",
-    "porcentaje_dscto_vta", "porcentaje_utilidad2",
-    "pvp", "pvp_linea",
-    "costo_linea", "precio_neto_linea", "iva_linea",
-    "dcto_vtas_linea",
-    "emp", "suc",
-    "clt_ent",
+    "ID", "VENT_FACT_VENT",
+    "PRODUCTOS", "INV_PRESENT_PRODUCTO",
+    "NOMBRE", "ABREV", "FACTOR", "CAN",
+    "FECHA",
+    "INV_BODEGA",
+    "INV_FAMI",
+    "COD_BAR",
+    "PRECIO_BRUTO_EMPAQUE", "IVA_EMPAQUE", "COSTO_EMPAQUE",
+    "PRECIO_NETO_EMPAQUE",
+    "PORCENTAJE_DSCTO_VTA", "PORCENTAJE_UTILIDAD2",
+    "PVP", "PVP_LINEA",
+    "COSTO_LINEA", "PRECIO_NETO_LINEA", "IVA_LINEA",
+    "DCTO_VTAS_LINEA",
+    "EMP", "SUC",
+    "CLT_ENT",
 })
 
 
@@ -169,23 +171,23 @@ def _pivot(
     bodegas: set[str] = set()
     fechas: set[str] = set()
     for r in rows:
-        fecha = _short_date(r.get("fecha"))
+        fecha = _short_date(r.get("FECHA"))
         if not fecha:
             continue
-        bod_id = r.get("inv_bodega")
+        bod_id = r.get("INV_BODEGA")
         try:
             bod_id_i = int(bod_id) if bod_id else 0
         except (TypeError, ValueError):
             bod_id_i = 0
         bod_name = bodega_names.get(bod_id_i, f"BODEGA {bod_id_i}")
-        fam_id = r.get("inv_fami")
+        fam_id = r.get("INV_FAMI")
         try:
             fam_id_i = int(fam_id) if fam_id else 0
         except (TypeError, ValueError):
             fam_id_i = 0
         fam_name = familia_names.get(fam_id_i, f"FAMILIA {fam_id_i}")
         try:
-            pvp_linea = float(r.get("pvp_linea") or 0)
+            pvp_linea = float(r.get("PVP_LINEA") or 0)
         except (TypeError, ValueError):
             pvp_linea = 0.0
         table[(fecha, fam_name)][bod_name] += pvp_linea
@@ -299,20 +301,20 @@ def _write_detalle(
 
     row_i = 2
     for r in rows:
-        pid_raw = r.get("productos")
+        pid_raw = r.get("PRODUCTOS")
         try:
             pid = int(pid_raw) if pid_raw else 0
         except (TypeError, ValueError):
             pid = 0
         prod = product_info.get(pid) or {}
 
-        bod_raw = r.get("inv_bodega")
+        bod_raw = r.get("INV_BODEGA")
         try:
             bod_id = int(bod_raw) if bod_raw else 0
         except (TypeError, ValueError):
             bod_id = 0
 
-        fam_raw = r.get("inv_fami") or prod.get("INV_FAMI")
+        fam_raw = r.get("INV_FAMI") or prod.get("INV_FAMI")
         try:
             fam_id = int(fam_raw) if fam_raw else 0
         except (TypeError, ValueError):
@@ -324,41 +326,41 @@ def _write_detalle(
         except (TypeError, ValueError):
             sub_id = 0
 
-        inv_raw = r.get("vent_fact_vent")
+        inv_raw = r.get("VENT_FACT_VENT")
         try:
             inv_id = int(inv_raw) if inv_raw else 0
         except (TypeError, ValueError):
             inv_id = 0
         fact = factura_info.get(inv_id) or {}
 
-        fecha_str = _short_date(r.get("fecha") or fact.get("FECHA"))
+        fecha_str = _short_date(r.get("FECHA") or fact.get("FECHA"))
         yyyy, mm, dd = ("", "", "")
         if len(fecha_str) == 10:
             yyyy, mm, dd = fecha_str[0:4], fecha_str[5:7], fecha_str[8:10]
 
         familia_name = familia_names.get(fam_id, "")
         values = [
-            r.get("cod_bar") or "",
+            r.get("COD_BAR") or "",
             prod.get("CODIGO") or "",
-            r.get("nombre") or prod.get("NAME") or "",
-            r.get("abrev") or "",
-            r.get("factor"),
-            r.get("can"),
-            r.get("precio_bruto_empaque"),
-            r.get("porcentaje_dscto_vta"),
-            r.get("iva_empaque"),
-            r.get("pvp_linea"),
-            r.get("costo_empaque"),
-            r.get("precio_neto_empaque"),
-            r.get("porcentaje_utilidad2"),
-            r.get("costo_linea"),
-            r.get("precio_neto_linea"),
-            r.get("iva_linea"),
+            r.get("NOMBRE") or prod.get("NAME") or "",
+            r.get("ABREV") or "",
+            r.get("FACTOR"),
+            r.get("CAN"),
+            r.get("PRECIO_BRUTO_EMPAQUE"),
+            r.get("PORCENTAJE_DSCTO_VTA"),
+            r.get("IVA_EMPAQUE"),
+            r.get("PVP_LINEA"),
+            r.get("COSTO_EMPAQUE"),
+            r.get("PRECIO_NETO_EMPAQUE"),
+            r.get("PORCENTAJE_UTILIDAD2"),
+            r.get("COSTO_LINEA"),
+            r.get("PRECIO_NETO_LINEA"),
+            r.get("IVA_LINEA"),
             bodega_names.get(bod_id, ""),
             familia_name,
             subfamilia_names.get(sub_id, ""),
             inv_id or "",
-            fact.get("ESTABLECIMIENTO") or r.get("emp") or "",
+            fact.get("ESTABLECIMIENTO") or r.get("EMP") or "",
             fact.get("PUNTOEMISION") or "",
             fact.get("SECUENCIA") or "",
             _fmt_date_es(fecha_str),
@@ -393,6 +395,7 @@ async def generate(
     date_to: str,
     sucursal: str | None = None,
     max_rows: int = 5000,
+    resolve_facturas: bool = False,
 ) -> dict[str, Any]:
     """Pull data + build XLSX. Returns ``{xlsx_bytes, total_lines, totals}``.
 
@@ -454,17 +457,26 @@ async def generate(
     invoice_ids: set[int] = set()
     for r in rows:
         try:
-            pid = int(r.get("productos") or 0)
+            pid = int(r.get("PRODUCTOS") or 0)
             if pid: product_ids.add(pid)
         except (TypeError, ValueError):
             pass
         try:
-            iid = int(r.get("vent_fact_vent") or 0)
+            iid = int(r.get("VENT_FACT_VENT") or 0)
             if iid: invoice_ids.add(iid)
         except (TypeError, ValueError):
             pass
     product_info = await _resolve_products(client, product_ids)
-    factura_info = await _resolve_facturas(client, invoice_ids)
+    # The factura join can be SLOW (1 GET per invoice). For typical
+    # daily reports there are 100-300 distinct invoices. Disabled by
+    # default — the line already carries everything the INFORME pivot
+    # needs. Caller can re-enable with resolve_facturas=True if they
+    # want the full 29-column VENTAS_DETALLE with the SRI number
+    # decomposed.
+    if resolve_facturas:
+        factura_info = await _resolve_facturas(client, invoice_ids)
+    else:
+        factura_info = {}
 
     # 3. Build XLSX.
     wb = Workbook()
@@ -484,7 +496,7 @@ async def generate(
         v for fb in table.values() for v in fb.values()
     )
     grand_total_neto = sum(
-        float(r.get("precio_neto_linea") or 0) for r in rows
+        float(r.get("PRECIO_NETO_LINEA") or 0) for r in rows
     )
 
     # 5. Serialize.
