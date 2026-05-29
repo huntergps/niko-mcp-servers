@@ -866,6 +866,82 @@ async def list_recent_stock_movements(
 
 
 # ---------------------------------------------------------------------------
+# generate_sales_report — XLSX deliverable for the daily ops report
+# ---------------------------------------------------------------------------
+
+
+async def generate_sales_report(
+    client: VelneoClient,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    sucursal: str | None = None,
+    max_rows: int = 5000,
+) -> dict[str, Any]:
+    """Generate the "Informe de ventas diarias" XLSX for a date range.
+
+    Mirrors the layout the Mepriga operator generates manually from the
+    vClient (Facturas Ventas → Exportar → Detalle de ventas + pivot):
+
+    * ``INFORME`` sheet: pivot Fecha × (Familia Principal × Bodega) of
+      ``Suma de PVP Linea``, with daily and grand totals.
+    * ``VENTAS_DETALLE`` sheet: the 29-column raw line-level data.
+
+    Default range is today (Quito timezone) so "lila, dame el informe
+    de ventas" without a date returns the report as of right now.
+
+    Returns ``{xlsx_base64, xlsx_filename, totals, message}``. Lila's
+    channel layer attaches the XLSX to Telegram automatically when it
+    sees ``xlsx_base64`` + ``xlsx_filename`` in the tool response.
+    """
+    import base64
+    from datetime import date, datetime, timezone, timedelta
+
+    # Default to today in Ecuador (UTC-5).
+    if not date_from and not date_to:
+        ec_now = datetime.now(timezone.utc) - timedelta(hours=5)
+        today_iso = ec_now.date().isoformat()
+        date_from = today_iso
+        date_to = today_iso
+    if not date_from:
+        date_from = date_to
+    if not date_to:
+        date_to = date_from
+
+    df = _norm_velneo_date(date_from)
+    dt = _norm_velneo_date(date_to)
+    if not df or not dt:
+        return {"success": False, "error": "date_from / date_to must be ISO YYYY-MM-DD"}
+
+    from mcp_theos.sales_report import generate as _gen
+    result = await _gen(
+        client, date_from=df, date_to=dt,
+        sucursal=sucursal, max_rows=max_rows,
+    )
+    if not result.get("success"):
+        return result
+
+    xlsx_bytes = result.pop("xlsx_bytes", None)
+    if not xlsx_bytes:
+        return {
+            "success": True,
+            "no_data": True,
+            "message": result.get("message"),
+            "totals": result.get("totals"),
+        }
+
+    fname_range = df if df == dt else f"{df}_a_{dt}"
+    return {
+        **{k: v for k, v in result.items() if k != "xlsx_bytes"},
+        "xlsx_base64": base64.b64encode(xlsx_bytes).decode("ascii"),
+        "xlsx_filename": f"informe_ventas_mepriga_{fname_range}.xlsx",
+        "mime_type": (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # B1 find_invoice — flexible lookup by ID, SRI number, or text token.
 # ---------------------------------------------------------------------------
 

@@ -915,6 +915,34 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "generate_sales_report",
+        "description": (
+            "Genera el INFORME DE VENTAS DIARIAS (XLSX) que el operador "
+            "de Mepriga produce manualmente desde el vClient. Dos hojas: "
+            "``INFORME`` (pivot Familia x Bodega por fecha con totales) "
+            "y ``VENTAS_DETALLE`` (29 columnas raw a nivel de línea). "
+            "Por defecto trae HOY (Ecuador timezone) si no se pasa "
+            "rango. Acepta ``date_from`` / ``date_to`` en ISO "
+            "YYYY-MM-DD para cualquier ventana (día, semana, mes, "
+            "rango libre). Devuelve ``xlsx_base64`` + "
+            "``xlsx_filename`` — la capa de Telegram adjunta el archivo "
+            "al mensaje automáticamente. Cap de líneas: 5000 (suficiente "
+            "para 1 día; si pidieras un mes muy ocupado y truncated=true, "
+            "narrow el rango)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string",
+                              "description": "ISO YYYY-MM-DD. Default = today (ECU)"},
+                "date_to": {"type": "string",
+                            "description": "ISO YYYY-MM-DD. Default = date_from"},
+                "sucursal": {"type": "string"},
+                "max_rows": {"type": "integer", "default": 5000, "minimum": 100, "maximum": 20000},
+            },
+        },
+    },
+    {
         "name": "search_velneo",
         "description": (
             "Whitelisted lookup against a single Velneo entry-point "
@@ -1012,6 +1040,7 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "list_recent_stock_movements": ("admin_ops.list_recent_stock_movements", admin_ops.list_recent_stock_movements),
     "check_stock": ("products.check_stock", products.check_stock),
     "search_velneo": ("admin_search.search_velneo", admin_search.search_velneo),
+    "generate_sales_report": ("admin_ops.generate_sales_report", admin_ops.generate_sales_report),
 }
 
 
