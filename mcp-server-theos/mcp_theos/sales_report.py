@@ -403,37 +403,78 @@ async def generate(
     defaults to the tenant's cfg.extra.velneo_sucursal.
     """
     from mcp_theos.tools.admin_ops import _tenant_sucursal
+    from urllib.parse import quote
+    from mcp_theos.velneo_http import _upper_keys
 
-    # 1. Pull lines via the proceso.
+    # 1. Pull lines via the proceso — paginated in 500-row chunks to
+    # keep the vServer happy. Velneo's REST honors page[number] /
+    # page[size] on _process/<name> just like on table list endpoints
+    # (verified empirically 2026-05-28).
     suc = sucursal or _tenant_sucursal(client)
-    proc_params = {
-        "SUCURSAL": suc,
-        "FCH_FACT": "1",
-        "FCH_DES": date_from,
-        "FCH_HST": date_to,
-        "OFF": "0",
+    base_params = {
+        "param[SUCURSAL]": suc,
+        "param[FCH_FACT]": "1",
+        "param[FCH_DES]": date_from,
+        "param[FCH_HST]": date_to,
+        "param[OFF]": "0",
     }
-    body = await call_proceso_or_message(
-        client, "VENT_FACT_MOV_BUSQ_3P",
-        params=proc_params,
-        row_keys=("inv_movimientos",),
-    )
-    if not body.get("ok"):
-        return {
-            "success": False,
-            "error": body.get("message") or body.get("transport_error")
-                     or "proceso failed",
-            "error_code": "proceso_denied" if body.get("permission_denied") else "transport",
-        }
-    rows_full = body.get("rows") or []
-    total_count = body.get("total_count") or len(rows_full)
-    truncated = total_count > max_rows
-    # Trim each row to the keys we actually use (saves memory + the
-    # underlying response_cache hash).
+    PAGE_SIZE = 500
     rows: list[dict[str, Any]] = []
-    for r in rows_full[:max_rows]:
-        kept = {k: v for k, v in r.items() if k in _KEEP_KEYS}
-        rows.append(kept)
+    total_count = 0
+    page_num = 1
+    while True:
+        page_params = {
+            **base_params,
+            "page[size]": PAGE_SIZE,
+            "page[number]": page_num,
+        }
+        try:
+            resp = await client._client.get(  # noqa: SLF001
+                f"_process/{quote('VENT_FACT_MOV_BUSQ_3P')}",
+                params=page_params,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "success": False,
+                "error_code": "transport",
+                "error": f"{type(exc).__name__}: {exc}",
+                "page_at_failure": page_num,
+                "rows_collected": len(rows),
+            }
+        # First page tells us the universe.
+        if total_count == 0:
+            total_count = int(body.get("total_count") or 0)
+        page_rows_raw = body.get("inv_movimientos") or []
+        # Detect permission_denied / errors[] envelope on the very
+        # first page only (cheap check).
+        if page_num == 1 and not page_rows_raw and body.get("errors"):
+            first = body["errors"][0]
+            msg = first.get("message") if isinstance(first, dict) else str(first)
+            return {
+                "success": False, "error_code": "proceso_denied",
+                "error": msg,
+            }
+        # Upper-case keys + filter to _KEEP_KEYS in one pass per row.
+        for r in page_rows_raw:
+            if not isinstance(r, dict):
+                continue
+            uk = _upper_keys(r)
+            kept = {k: v for k, v in uk.items() if k in _KEEP_KEYS}
+            rows.append(kept)
+            if len(rows) >= max_rows:
+                break
+        # Stop if we hit the cap, the page was short, or we exhausted
+        # the universe.
+        if len(rows) >= max_rows:
+            break
+        if len(page_rows_raw) < PAGE_SIZE:
+            break
+        if total_count and len(rows) >= total_count:
+            break
+        page_num += 1
+    truncated = total_count > len(rows)
 
     if not rows:
         return {
