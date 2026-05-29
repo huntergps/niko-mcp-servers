@@ -1456,6 +1456,17 @@ def _write_detalle(
         ws.append(out_row)
         data_row_idx += 1
 
+    # AutoFilter on the whole data range — gives the user dropdowns on
+    # every column header (Establecimiento, Pto Emision, Fecha, Hora,
+    # HoraTxt, etc). The closest stand-in for the slicers the operator
+    # added by hand: openpyxl can't write Excel slicers (proprietary
+    # XML), but AutoFilter covers the "filter by sucursal / pto emisión
+    # / fecha" use case end-to-end.
+    if data_row_idx > 0:
+        last_col = get_column_letter(len(headers))
+        last_row_n = data_row_idx + 1  # +1 for the header row
+        ws.auto_filter.ref = f"A1:{last_col}{last_row_n}"
+
 
 async def generate(
     client: VelneoClient,
