@@ -395,6 +395,7 @@ async def generate(
     date_to: str,
     sucursal: str | None = None,
     max_rows: int = 5000,
+    resolve_products: bool = False,
     resolve_facturas: bool = False,
 ) -> dict[str, Any]:
     """Pull data + build XLSX. Returns ``{xlsx_bytes, total_lines, totals}``.
@@ -507,7 +508,17 @@ async def generate(
             if iid: invoice_ids.add(iid)
         except (TypeError, ValueError):
             pass
-    product_info = await _resolve_products(client, product_ids)
+    # Product resolution = 1 GET per UNIQUE product. A busy day at
+    # Mepriga has ~1000 distinct products → 1000 sequential GETs ~3
+    # minutes, well past the LLM tool-call timeout. The INFORME pivot
+    # does NOT need PRODUCTOS rows (the line carries INV_FAMI already).
+    # Only enable resolve_products when the caller really wants the
+    # PRODUCTOS.CODIGO column in VENTAS_DETALLE — and even then expect
+    # ~30s per 100 distinct products.
+    if resolve_products:
+        product_info = await _resolve_products(client, product_ids)
+    else:
+        product_info = {}
     # The factura join can be SLOW (1 GET per invoice). For typical
     # daily reports there are 100-300 distinct invoices. Disabled by
     # default — the line already carries everything the INFORME pivot
