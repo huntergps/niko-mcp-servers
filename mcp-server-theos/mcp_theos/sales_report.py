@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re as _re
 from collections import defaultdict
 from datetime import date, datetime
 from typing import Any
@@ -129,7 +130,7 @@ _KEEP_KEYS = frozenset({
     "ID", "VENT_FACT_VENT",
     "PRODUCTOS", "INV_PRESENT_PRODUCTO",
     "NOMBRE", "ABREV", "FACTOR", "CAN",
-    "FECHA",
+    "FECHA", "FECHA_CONTA",  # FECHA_CONTA carries the exact timestamp (hour:min:sec)
     "INV_BODEGA",
     "INV_FAMI",
     "COD_BAR",
@@ -141,7 +142,61 @@ _KEEP_KEYS = frozenset({
     "DCTO_VTAS_LINEA",
     "EMP", "SUC",
     "CLT_ENT",
+    "NAME",  # descriptor textual de la factura: id|#bill-id FAC-VTA estab-pto-sec cif-NOMBRE_CLIENTE
 })
+
+
+# Pre-compiled regex for parsing the ``NAME`` field of an INV_MOVIMIENTOS
+# row. Velneo embeds the SRI number + customer CIF + customer name in
+# that descriptor, e.g.
+#   ``936246|   #102180  FAC-VTA 002-002-561795 2000026688001-GUERRERO ALDAS NARCISA``
+# Group captures: establecimiento, punto_emision, secuencia, cif, customer_name.
+# Optional trailing date "28 May 2026" is ignored.
+_RX_NAME_FACVTA = _re.compile(
+    r"FAC-VTA\s+(?P<est>\d{1,3})-(?P<pto>\d{1,3})-(?P<sec>\d+)\s+"
+    r"(?P<cif>\S+?)-(?P<cli>.+?)"
+    r"(?:\s+\d{1,2}\s+[A-Za-z]{3,}\s+\d{4})?$"
+)
+
+
+def _parse_invoice_name(name: str) -> dict[str, str]:
+    """Parse the ``NAME`` descriptor of an INV_MOVIMIENTOS row.
+
+    Returns a dict with ``establecimiento``, ``pto_emision``, ``secuencia``,
+    ``cif`` and ``cliente``. Missing/unparseable rows return empty strings.
+    Cheap regex, no joins — the SRI number and customer name are right
+    there in the descriptor so we never need to hit VENT_FACT_VENT or
+    ENT for the daily report.
+    """
+    if not name or not isinstance(name, str):
+        return {"establecimiento": "", "pto_emision": "", "secuencia": "",
+                "cif": "", "cliente": ""}
+    m = _RX_NAME_FACVTA.search(name)
+    if not m:
+        return {"establecimiento": "", "pto_emision": "", "secuencia": "",
+                "cif": "", "cliente": ""}
+    return {
+        "establecimiento": m.group("est"),
+        "pto_emision": m.group("pto"),
+        "secuencia": m.group("sec"),
+        "cif": m.group("cif"),
+        "cliente": m.group("cli").strip(),
+    }
+
+
+def _fmt_datetime_es(value: Any) -> str:
+    """Velneo ISO timestamp → ``dd/mm/yyyy HH:MM:SS`` (Ecuador display)."""
+    if not value or value == "Invalid Date":
+        return ""
+    s = str(value)
+    # Velneo timestamps come tagged with Z but represent local Ecuador
+    # time already (Velneo is naive-local at the source). Strip the
+    # timezone marker and split into date + time.
+    if "T" not in s:
+        return _fmt_date_es(s[:10])
+    d, t = s.split("T", 1)
+    t = t.replace("Z", "").split(".")[0]  # drop millis + tz
+    return f"{_fmt_date_es(d)} {t[:8]}"
 
 
 def _short_date(value: Any) -> str:
@@ -188,8 +243,6 @@ async def _resolve_lookup(
         out[rid_i] = str(r.get(name_field) or "").strip()
     return out
 
-
-import re as _re
 
 _FAMILY_PREFIX_RE = _re.compile(r"^\s*\d+(?:\.\d+)*\s+")
 
@@ -985,17 +1038,18 @@ def _write_detalle(
         "Costo Linea", "Precio Neto Linea", "IVA Linea",
         "Bodega", "Familia Principal", "SubFamilia",
         "Id Venta", "Establecimiento", "Pto Emision", "Secuencia",
-        "Fecha", "Cliente", "MES", "DIA", "AÑO", "Columna1",
+        "Fecha", "Fecha Hora", "Cliente", "CIF", "MES", "DIA", "AÑO",
     ]
 
     # Column widths — must be set BEFORE appending any row in write_only mode.
+    # 30 columns (matches headers above).
     widths = [16, 12, 34, 8, 8, 10,
               12, 10, 10, 12,
               12, 12, 10,
               12, 14, 10,
               22, 22, 22,
-              10, 10, 10, 12,
-              12, 28, 6, 6, 6, 16]
+              10, 6, 6, 10,
+              12, 19, 28, 16, 6, 6, 6]
     for j, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(j)].width = w
     ws.row_dimensions[1].height = 32
@@ -1035,11 +1089,12 @@ def _write_detalle(
         except (TypeError, ValueError):
             fam_id = 0
 
-        sub_raw = prod.get("INV_SUBFAMI")
-        try:
-            sub_id = int(sub_raw) if sub_raw else 0
-        except (TypeError, ValueError):
-            sub_id = 0
+        # SubFamilia is the LEAF family id (the value in INV_FAMI itself).
+        # ``subfamilia_names`` maps leaf_id -> leaf_name. The old code
+        # tried to read INV_SUBFAMI from the product join (always empty
+        # without resolve_products=True). The row already carries what
+        # we need — no join required.
+        sub_name = subfamilia_names.get(fam_id, "")
 
         inv_raw = r.get("VENT_FACT_VENT")
         try:
@@ -1052,6 +1107,22 @@ def _write_detalle(
         yyyy, mm, dd = ("", "", "")
         if len(fecha_str) == 10:
             yyyy, mm, dd = fecha_str[0:4], fecha_str[5:7], fecha_str[8:10]
+
+        # Parse the row's NAME descriptor for SRI estab/pto/seq + customer
+        # CIF + customer name — no VENT_FACT_VENT join required.
+        parsed = _parse_invoice_name(r.get("NAME") or "")
+        # When the regex couldn't parse, fall back to the factura_info
+        # join (only populated if resolve_facturas=True), then to EMP/SUC
+        # as a last resort for the establecimiento/pto cells.
+        est = parsed["establecimiento"] or fact.get("ESTABLECIMIENTO") or r.get("EMP") or ""
+        pto = parsed["pto_emision"] or fact.get("PUNTOEMISION") or (
+            f"{int(r.get('SUC')):03d}" if isinstance(r.get("SUC"), int) else ""
+        )
+        seq = parsed["secuencia"] or fact.get("SECUENCIA") or ""
+        cliente = parsed["cliente"] or fact.get("RAZONSOCIALCOMPRADOR") or ""
+        cif = parsed["cif"] or fact.get("SRI_IDENTIFICACION") or ""
+
+        fecha_hora_str = _fmt_datetime_es(r.get("FECHA_CONTA"))
 
         familia_name = familia_names.get(fam_id, "")
         values = [
@@ -1073,17 +1144,18 @@ def _write_detalle(
             r.get("IVA_LINEA"),
             bodega_names.get(bod_id, ""),
             familia_name,
-            subfamilia_names.get(sub_id, ""),
+            sub_name,
             inv_id or "",
-            fact.get("ESTABLECIMIENTO") or r.get("EMP") or "",
-            fact.get("PUNTOEMISION") or "",
-            fact.get("SECUENCIA") or "",
+            est,
+            pto,
+            seq,
             _fmt_date_es(fecha_str),
-            fact.get("RAZONSOCIALCOMPRADOR") or "",
+            fecha_hora_str,
+            cliente,
+            cif,
             int(mm) if mm else "",
             int(dd) if dd else "",
             int(yyyy) if yyyy else "",
-            familia_name,
         ]
         # Wrap money columns in WriteOnlyCells so they keep the currency
         # number format; other columns go as plain Python values (cheap).
