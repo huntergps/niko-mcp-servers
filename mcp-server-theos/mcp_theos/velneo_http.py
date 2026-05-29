@@ -266,6 +266,22 @@ class VelneoClient:
             return _upper_keys(sub)
         return _upper_keys(data)
 
+    async def delete(self, table: str, *, record_id: int | str) -> dict[str, Any]:
+        """DELETE a single record by id.
+
+        Velneo's REST returns 200 with ``{"return": "..."}`` on success
+        and 200 with ``errors[]`` (or a 405 when the API key lacks the
+        method) on failure. We treat the errors[] envelope the same
+        way :func:`post` does, and raise :class:`VelneoError` on any
+        bad message — same boundary contract as POST so callers can
+        catch a single exception type.
+        """
+        resp = await self._client.delete(f"{table}/{record_id}")
+        resp.raise_for_status()
+        data = resp.json()
+        _check_errors(data)
+        return data if isinstance(data, dict) else {"return": str(data)}
+
     async def process(
         self,
         name: str,

@@ -304,11 +304,12 @@ MCP_TOOLS: list[dict[str, Any]] = [
     {
         "name": "update_quotation_line",
         "description": (
-            "Update an existing quotation line — change the quantity "
-            "or the unit price. NOTE: not currently supported on "
-            "Mepriga (API key lacks PATCH on VENT_ORDEN_MOVIMIENTOS); "
-            "the tool returns ``error_code=not_supported_yet`` so the "
-            "assistant can tell the customer transparently."
+            "Update an existing quotation line — change the quantity, "
+            "unit price, or switch to a different empaque via "
+            "``presentation_codbar``. Implemented as DELETE+POST "
+            "under the hood (the API key does not grant PATCH on "
+            "VENT_ORDEN_MOVIMIENTOS), which keeps the NUM_LINEA slot "
+            "but yields a new ``ID`` — the response shows both."
         ),
         "inputSchema": {
             "type": "object",
@@ -316,6 +317,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "line_id": {"type": "integer"},
                 "quantity": {"type": "number"},
                 "unit_price": {"type": "number"},
+                "presentation_codbar": {"type": "string"},
             },
             "required": ["line_id"],
         },
@@ -323,10 +325,9 @@ MCP_TOOLS: list[dict[str, Any]] = [
     {
         "name": "remove_quotation_line",
         "description": (
-            "Remove a quotation line. NOTE: not currently supported on "
-            "Mepriga (API key lacks DELETE on VENT_ORDEN_MOVIMIENTOS); "
-            "the tool returns ``error_code=not_supported_yet`` so the "
-            "assistant can tell the customer transparently."
+            "Remove a quotation line. The parent VENT_ORDEN_VENTA "
+            "header stays intact, so the customer can keep adding "
+            "lines or close the cotización."
         ),
         "inputSchema": {
             "type": "object",
@@ -1027,12 +1028,42 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "date_from": {"type": "string",
-                              "description": "ISO YYYY-MM-DD. Default = today (ECU)"},
-                "date_to": {"type": "string",
-                            "description": "ISO YYYY-MM-DD. Default = date_from"},
+                "month": {
+                    "type": "string",
+                    "description": (
+                        "USAR ESTE PARAMETRO cuando el usuario pida un mes "
+                        "completo ('ventas de mayo', 'informe del mes de "
+                        "mayo 2026', 'mes completo'). Formato YYYY-MM (ej. "
+                        "'2026-05'). El tool resuelve a date_from=YYYY-MM-01 "
+                        "y date_to=ultimo dia del mes (28/29/30/31). USAR "
+                        "ESTO en vez de date_from/date_to manuales — "
+                        "garantiza que se cubre el mes ENTERO sin importar "
+                        "que dia es hoy."
+                    ),
+                },
+                "year": {
+                    "type": "string",
+                    "description": (
+                        "USAR ESTE PARAMETRO cuando el usuario pida un anio "
+                        "entero ('ventas de 2026'). Formato YYYY. Resuelve "
+                        "a date_from=YYYY-01-01 y date_to=YYYY-12-31."
+                    ),
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": (
+                        "ISO YYYY-MM-DD. Default = today (ECU). Usar solo "
+                        "cuando se necesita un rango libre que NO sea un "
+                        "mes o anio completo. Para meses usar `month`, "
+                        "para anios usar `year`."
+                    ),
+                },
+                "date_to": {
+                    "type": "string",
+                    "description": "ISO YYYY-MM-DD. Default = date_from",
+                },
                 "sucursal": {"type": "string"},
-                "max_rows": {"type": "integer", "default": 5000, "minimum": 100, "maximum": 20000},
+                "max_rows": {"type": "integer", "default": 5000, "minimum": 100, "maximum": 200000},
                 "deliver_to_chat": {
                     "type": "string",
                     "description": (

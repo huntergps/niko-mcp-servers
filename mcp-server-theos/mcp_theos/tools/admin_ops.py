@@ -875,6 +875,8 @@ async def generate_sales_report(
     *,
     date_from: str | None = None,
     date_to: str | None = None,
+    month: str | None = None,
+    year: str | int | None = None,
     sucursal: str | None = None,
     max_rows: int = 5000,
     deliver_to_chat: str | None = None,
@@ -907,10 +909,38 @@ async def generate_sales_report(
       caption).
     """
     import base64
+    import calendar
     from datetime import date, datetime, timezone, timedelta
 
-    # Default to today in Ecuador (UTC-5).
-    if not date_from and not date_to:
+    # ---- Date range resolution -----------------------------------------
+    # Precedence: `year` > `month` > `date_from`/`date_to` > today (ECU).
+    # The high-precedence shortcuts exist so the LLM CAN'T accidentally
+    # truncate the range to "until today" when the user asked for a full
+    # calendar month. Passing month="2026-05" guarantees 01-31 regardless
+    # of when the call is made.
+    if year:
+        try:
+            y_int = int(str(year).strip())
+            if not (2000 <= y_int <= 2100):
+                raise ValueError
+        except (TypeError, ValueError):
+            return {"success": False, "error": "year must be YYYY (e.g. 2026)"}
+        date_from = f"{y_int:04d}-01-01"
+        date_to = f"{y_int:04d}-12-31"
+    elif month:
+        try:
+            y_str, m_str = str(month).strip().split("-")
+            y_int = int(y_str)
+            m_int = int(m_str)
+            if not (1 <= m_int <= 12) or not (2000 <= y_int <= 2100):
+                raise ValueError
+        except (TypeError, ValueError):
+            return {"success": False,
+                    "error": "month must be YYYY-MM (e.g. '2026-05')"}
+        last_day = calendar.monthrange(y_int, m_int)[1]
+        date_from = f"{y_int:04d}-{m_int:02d}-01"
+        date_to = f"{y_int:04d}-{m_int:02d}-{last_day:02d}"
+    elif not date_from and not date_to:
         ec_now = datetime.now(timezone.utc) - timedelta(hours=5)
         today_iso = ec_now.date().isoformat()
         date_from = today_iso

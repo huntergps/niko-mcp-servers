@@ -49,6 +49,9 @@ _FACT_FIELDS = [
     "KEY",                 # Datil internal UUID
     "TIPO_AMBIENTE",       # "1"=pruebas, "2"=producción
     "VENTA_CREDITO",
+    # DO NOT add VENT_PRE_FACT — owner ruling 2026-05-28: the pre-
+    # invoice workflow is out of scope for Mepriga's bot. If a future
+    # tool needs it, raise the question with the owner first.
 ]
 
 

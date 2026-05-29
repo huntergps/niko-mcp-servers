@@ -33,12 +33,49 @@ from datetime import date, datetime
 from typing import Any
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from mcp_theos.velneo_http import VelneoClient, VelneoError, call_proceso_or_message
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Mepriga corporate palette — extracted from the operator-approved
+# "informe mejorado" template (see commit message). Keep names symbolic so
+# any future tweak (logo refresh, brand reboot) touches one constant only.
+# ---------------------------------------------------------------------------
+
+PALETTE_PRIMARY = "1F4E78"        # MEPRIGA banner / grand-total row
+PALETTE_SECONDARY = "2E75B6"      # KPI header for ALMACÉN 01 / column heads
+PALETTE_GREEN = "70AD47"          # KPI header for BODEGA 15 (visual contrast)
+PALETTE_TABLE_HEADER = "305496"   # VENTAS_DETALLE / pivot table headers
+PALETTE_ZEBRA = "F8F9FB"          # alternating row fill
+PALETTE_TOTAL = "F2F2F2"          # right-most TOTAL column / subtotal rows
+PALETTE_SUBTLE = "595959"         # secondary text (dates, captions)
+PALETTE_WHITE = "FFFFFF"
+
+# Bodega code (3-digit suffix of name when present) → KPI fill color.
+# Anything not in the map falls back to PALETTE_SECONDARY.
+BODEGA_FILL_MAP = {
+    "BODEGA 15": PALETTE_GREEN,
+    "ALMACEN 01": PALETTE_SECONDARY,
+}
+
+
+def _bodega_color(name: str) -> str:
+    """Best-match color for a bodega name (case-insensitive prefix)."""
+    if not name:
+        return PALETTE_SECONDARY
+    n = name.upper()
+    for prefix, color in BODEGA_FILL_MAP.items():
+        if n.startswith(prefix):
+            return color
+    return PALETTE_SECONDARY
+
+
+MONEY_FORMAT = '"$"#,##0.00'
 
 
 # Fields we keep from the 130-key proceso row. call_proceso_or_message
@@ -277,71 +314,228 @@ def _write_informe(
     table: dict[tuple[str, str], dict[str, float]],
     company_name: str = "MEGA PRIMAVERA GALAPAGOS SA",
 ) -> None:
-    """Write the INFORME sheet: Familia x Bodega pivot per Fecha."""
-    bold = Font(bold=True)
-    title_font = Font(bold=True, size=14)
-    header_fill = PatternFill("solid", fgColor="D9E1F2")
-    money_fmt = "#,##0.00"
-    center = Alignment(horizontal="center")
+    """Write the INFORME dashboard sheet using the corporate palette.
 
-    # Headers / title
-    ws.cell(2, 2, company_name).font = title_font
-    ws.cell(3, 2, "REPORTE DE VENTAS DIARIAS").font = title_font
+    Layout (top-down):
+      Row 1     blank top margin
+      Row 2-3   MEPRIGA banner (primary blue, white bold, 22pt)
+                + subtitle "Reporte de Ventas Diarias" (secondary blue 12pt)
+      Row 4     Período (gray subtle)
+      Row 6-9   KPIs por bodega (cards horizontales)
+      Row 11+   Tabla Familia x Bodega con totales por día y total general
+    """
+    fmt = MONEY_FORMAT
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center", indent=1)
+    right = Alignment(horizontal="right", vertical="center", indent=1)
 
-    # Pivot header row
-    HDR_ROW = 7
-    ws.cell(HDR_ROW, 2, "Suma de PVP Linea").font = bold
+    primary_fill = PatternFill("solid", fgColor=PALETTE_PRIMARY)
+    secondary_fill = PatternFill("solid", fgColor=PALETTE_SECONDARY)
+    table_hdr_fill = PatternFill("solid", fgColor=PALETTE_PRIMARY)
+    zebra_fill = PatternFill("solid", fgColor=PALETTE_ZEBRA)
+    total_col_fill = PatternFill("solid", fgColor=PALETTE_TOTAL)
+    subtotal_fill = PatternFill("solid", fgColor=PALETTE_SECONDARY)
+    grand_fill = PatternFill("solid", fgColor=PALETTE_PRIMARY)
+
+    title_font = Font(bold=True, size=22, color=PALETTE_WHITE, name="Calibri")
+    subtitle_font = Font(bold=True, size=12, color=PALETTE_WHITE, name="Calibri")
+    caption_font = Font(size=11, color=PALETTE_SUBTLE, name="Calibri", italic=True)
+    kpi_label_font = Font(bold=True, size=11, color=PALETTE_WHITE, name="Calibri")
+    kpi_value_font = Font(bold=True, size=20, color=PALETTE_PRIMARY, name="Calibri")
+    kpi_value_font_total = Font(bold=True, size=20, color=PALETTE_WHITE, name="Calibri")
+    section_font = Font(bold=True, size=13, color=PALETTE_PRIMARY, name="Calibri")
+    hdr_font_white = Font(bold=True, size=11, color=PALETTE_WHITE, name="Calibri")
+    body_font = Font(size=11, color="000000", name="Calibri")
+    date_marker_font = Font(bold=True, size=11, color=PALETTE_SECONDARY, name="Calibri")
+    subtotal_font = Font(bold=True, size=11, color=PALETTE_WHITE, name="Calibri")
+    grand_font = Font(bold=True, size=12, color=PALETTE_WHITE, name="Calibri")
+
+    thin = Side(border_style="thin", color="D0D7DE")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    n_bodegas = len(bodegas)
+    total_col = 2 + n_bodegas + 1  # B + bodegas + Total
+
+    # ------------------------------------------------------------------
+    # 1. Banner row 2 (full width — merge B:total_col)
+    # ------------------------------------------------------------------
+    ws.merge_cells(start_row=2, start_column=2, end_row=2, end_column=total_col)
+    banner = ws.cell(2, 2, f"MEPRIGA — {company_name}")
+    banner.font = title_font
+    banner.fill = primary_fill
+    banner.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 38
+
+    ws.merge_cells(start_row=3, start_column=2, end_row=3, end_column=total_col)
+    sub = ws.cell(3, 2, "Reporte de Ventas Diarias")
+    sub.font = subtitle_font
+    sub.fill = secondary_fill
+    sub.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[3].height = 24
+
+    if fechas:
+        if len(fechas) == 1:
+            periodo = f"Período: {_fmt_date_es(fechas[0])}"
+        else:
+            periodo = f"Período: {_fmt_date_es(fechas[0])} a {_fmt_date_es(fechas[-1])}"
+    else:
+        periodo = "Período: —"
+    ws.merge_cells(start_row=4, start_column=2, end_row=4, end_column=total_col)
+    cap = ws.cell(4, 2, periodo)
+    cap.font = caption_font
+    cap.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[4].height = 18
+
+    # ------------------------------------------------------------------
+    # 2. KPI cards row 6 (one per bodega + total general)
+    # ------------------------------------------------------------------
+    KPI_ROW_LABEL = 6
+    KPI_ROW_VALUE = 7
+    ws.row_dimensions[KPI_ROW_LABEL].height = 22
+    ws.row_dimensions[KPI_ROW_VALUE].height = 32
+
+    # Compute per-bodega and grand totals up front (needed by both KPIs
+    # and the table grand-total row later).
+    per_bodega_total: dict[str, float] = defaultdict(float)
+    grand_total_all = 0.0
+    for (fecha, fam), bodega_vals in table.items():
+        for bod, v in bodega_vals.items():
+            per_bodega_total[bod] += v
+            grand_total_all += v
+
+    # Layout: each KPI takes 2 columns. Bodegas come first, "TOTAL" last.
+    cards = [(bod, per_bodega_total.get(bod, 0.0), _bodega_color(bod)) for bod in bodegas]
+    cards.append(("TOTAL GENERAL", grand_total_all, PALETTE_PRIMARY))
+
+    col = 2
+    KPI_COL_SPAN = 2
+    for label, value, color in cards:
+        end_col = col + KPI_COL_SPAN - 1
+        # Label band
+        ws.merge_cells(start_row=KPI_ROW_LABEL, start_column=col,
+                       end_row=KPI_ROW_LABEL, end_column=end_col)
+        lcell = ws.cell(KPI_ROW_LABEL, col, label)
+        lcell.font = kpi_label_font
+        lcell.fill = PatternFill("solid", fgColor=color)
+        lcell.alignment = center
+        # Value band
+        ws.merge_cells(start_row=KPI_ROW_VALUE, start_column=col,
+                       end_row=KPI_ROW_VALUE, end_column=end_col)
+        vcell = ws.cell(KPI_ROW_VALUE, col, value)
+        vcell.font = (kpi_value_font_total if label == "TOTAL GENERAL"
+                      else Font(bold=True, size=20, color=color, name="Calibri"))
+        if label == "TOTAL GENERAL":
+            vcell.fill = PatternFill("solid", fgColor=color)
+        vcell.alignment = Alignment(horizontal="center", vertical="center")
+        vcell.number_format = fmt
+        vcell.border = box
+        col = end_col + 1
+
+    # ------------------------------------------------------------------
+    # 3. Pivot table — Familia × Bodega with date subtotals
+    # ------------------------------------------------------------------
+    SECTION_ROW = 10
+    ws.merge_cells(start_row=SECTION_ROW, start_column=2,
+                   end_row=SECTION_ROW, end_column=total_col)
+    sec = ws.cell(SECTION_ROW, 2, "Ventas por Familia y Bodega")
+    sec.font = section_font
+    sec.alignment = left
+    ws.row_dimensions[SECTION_ROW].height = 22
+
+    HDR_ROW = SECTION_ROW + 1
+    ws.row_dimensions[HDR_ROW].height = 22
+    h = ws.cell(HDR_ROW, 2, "Familia Principal")
+    h.font = hdr_font_white; h.fill = table_hdr_fill; h.alignment = left
+    h.border = box
     for j, bod in enumerate(bodegas, start=3):
         c = ws.cell(HDR_ROW, j, bod)
-        c.font = bold; c.fill = header_fill; c.alignment = center
-    total_col = 3 + len(bodegas)
-    c = ws.cell(HDR_ROW, total_col, "Total general")
-    c.font = bold; c.fill = header_fill; c.alignment = center
+        c.font = hdr_font_white; c.fill = table_hdr_fill; c.alignment = center
+        c.border = box
+    ct = ws.cell(HDR_ROW, total_col, "TOTAL")
+    ct.font = hdr_font_white; ct.fill = table_hdr_fill; ct.alignment = center
+    ct.border = box
 
-    # Body rows
     row = HDR_ROW + 1
-    grand_total: dict[str, float] = defaultdict(float)
-    grand_total_all = 0.0
+    grand_by_bod: dict[str, float] = defaultdict(float)
+    grand_total_recompute = 0.0
+    use_date_grouping = len(fechas) > 1
+
     for fecha in fechas:
-        # Date section header
-        ws.cell(row, 2, _fmt_date_es(fecha)).font = bold
-        row += 1
-        # Familia rows for this fecha
+        if use_date_grouping:
+            # Date marker row
+            ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=total_col)
+            dm = ws.cell(row, 2, _fmt_date_es(fecha))
+            dm.font = date_marker_font
+            dm.alignment = left
+            ws.row_dimensions[row].height = 20
+            row += 1
+
         familias = sorted({fam for (f, fam) in table if f == fecha})
-        date_total: dict[str, float] = defaultdict(float)
+        date_by_bod: dict[str, float] = defaultdict(float)
         date_total_all = 0.0
-        for fam in familias:
-            ws.cell(row, 2, fam)
+
+        for idx, fam in enumerate(familias):
+            zebra = (idx % 2 == 1)
+            # Familia name
+            fc = ws.cell(row, 2, fam)
+            fc.font = body_font
+            fc.alignment = left
+            if zebra:
+                fc.fill = zebra_fill
             row_total = 0.0
             for j, bod in enumerate(bodegas, start=3):
                 v = table[(fecha, fam)].get(bod, 0.0)
-                if v:
-                    c = ws.cell(row, j, v); c.number_format = money_fmt
+                c = ws.cell(row, j, v if v else None)
+                c.number_format = fmt
+                c.alignment = right
+                if zebra:
+                    c.fill = zebra_fill
                 row_total += v
-                date_total[bod] += v
-                grand_total[bod] += v
-            c = ws.cell(row, total_col, row_total); c.number_format = money_fmt; c.font = bold
+                date_by_bod[bod] += v
+                grand_by_bod[bod] += v
+            tc = ws.cell(row, total_col, row_total)
+            tc.number_format = fmt
+            tc.alignment = right
+            tc.font = Font(bold=True, size=11, color=PALETTE_PRIMARY, name="Calibri")
+            tc.fill = total_col_fill
             date_total_all += row_total
+            grand_total_recompute += row_total
             row += 1
-        # Date subtotal
-        c = ws.cell(row, 2, f"Total {_fmt_date_es(fecha)}"); c.font = bold; c.fill = header_fill
-        for j, bod in enumerate(bodegas, start=3):
-            c = ws.cell(row, j, date_total[bod]); c.number_format = money_fmt; c.font = bold; c.fill = header_fill
-        c = ws.cell(row, total_col, date_total_all); c.number_format = money_fmt; c.font = bold; c.fill = header_fill
-        grand_total_all += date_total_all
-        row += 1
+
+        if use_date_grouping:
+            # Date subtotal row
+            ws.row_dimensions[row].height = 22
+            stc = ws.cell(row, 2, f"Subtotal {_fmt_date_es(fecha)}")
+            stc.font = subtotal_font; stc.fill = subtotal_fill; stc.alignment = left
+            for j, bod in enumerate(bodegas, start=3):
+                c = ws.cell(row, j, date_by_bod[bod])
+                c.number_format = fmt
+                c.font = subtotal_font; c.fill = subtotal_fill; c.alignment = right
+            c = ws.cell(row, total_col, date_total_all)
+            c.number_format = fmt
+            c.font = subtotal_font; c.fill = subtotal_fill; c.alignment = right
+            row += 1
 
     # Grand total row
-    c = ws.cell(row, 2, "Total general"); c.font = bold; c.fill = header_fill
+    ws.row_dimensions[row].height = 26
+    gc = ws.cell(row, 2, "TOTAL GENERAL")
+    gc.font = grand_font; gc.fill = grand_fill; gc.alignment = left
     for j, bod in enumerate(bodegas, start=3):
-        c = ws.cell(row, j, grand_total[bod]); c.number_format = money_fmt; c.font = bold; c.fill = header_fill
-    c = ws.cell(row, total_col, grand_total_all); c.number_format = money_fmt; c.font = bold; c.fill = header_fill
+        c = ws.cell(row, j, grand_by_bod[bod])
+        c.number_format = fmt
+        c.font = grand_font; c.fill = grand_fill; c.alignment = right
+    c = ws.cell(row, total_col, grand_total_recompute)
+    c.number_format = fmt
+    c.font = grand_font; c.fill = grand_fill; c.alignment = right
 
-    # Column widths
+    # ------------------------------------------------------------------
+    # 4. Column widths
+    # ------------------------------------------------------------------
     ws.column_dimensions["A"].width = 2
-    ws.column_dimensions["B"].width = 28
+    ws.column_dimensions["B"].width = 32
     for j in range(3, total_col + 1):
         ws.column_dimensions[get_column_letter(j)].width = 22
+    ws.sheet_view.showGridLines = False
 
 
 def _write_detalle(
@@ -353,10 +547,19 @@ def _write_detalle(
     product_info: dict[int, dict[str, Any]],
     factura_info: dict[int, dict[str, Any]],
 ) -> None:
-    """Write VENTAS_DETALLE with the same column layout the Velneo UI exports."""
-    bold = Font(bold=True)
-    header_fill = PatternFill("solid", fgColor="305496")
-    header_font = Font(bold=True, color="FFFFFF")
+    """Write VENTAS_DETALLE — 29-col raw line layout matching Velneo UI export.
+
+    Visual polish on top of the raw export:
+      * Header band in PALETTE_TABLE_HEADER (corporate blue), white bold.
+      * ``freeze_panes='A2'`` so the header sticks while scrolling.
+      * Money columns formatted as `"$"#,##0.00` instead of bare decimals.
+      * Subtle zebra stripes (`PALETTE_ZEBRA`) every other row for readability
+        on long sheets (~150k rows for a monthly report).
+    """
+    header_fill = PatternFill("solid", fgColor=PALETTE_TABLE_HEADER)
+    header_font = Font(bold=True, color=PALETTE_WHITE, name="Calibri", size=11)
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    zebra_fill = PatternFill("solid", fgColor=PALETTE_ZEBRA)
 
     headers = [
         "CodBar", "Codigo", "Nombre", "Empaque", "Factor", "Cantidad",
@@ -368,9 +571,14 @@ def _write_detalle(
         "Fecha", "Cliente", "MES", "DIA", "AÑO", "Columna1",
     ]
     for j, h in enumerate(headers, start=1):
-        c = ws.cell(1, j, h); c.font = header_font; c.fill = header_fill
+        c = ws.cell(1, j, h)
+        c.font = header_font
+        c.fill = header_fill
+        c.alignment = header_align
+    ws.row_dimensions[1].height = 32
+    ws.freeze_panes = "A2"
 
-    money_fmt = "#,##0.00"
+    money_fmt = MONEY_FORMAT
     money_cols = {7, 8, 9, 10, 11, 12, 14, 15, 16}  # 1-based
 
     row_i = 2
@@ -444,10 +652,15 @@ def _write_detalle(
             int(yyyy) if yyyy else "",
             familia_name,
         ]
+        # Zebra row index: row_i starts at 2 (data starts below header at 1).
+        # Stripe odd offsets so the first data row stays white.
+        is_zebra = ((row_i - 2) % 2 == 1)
         for j, v in enumerate(values, start=1):
             c = ws.cell(row_i, j, v)
             if j in money_cols:
                 c.number_format = money_fmt
+            if is_zebra:
+                c.fill = zebra_fill
         row_i += 1
 
     # Auto-ish widths

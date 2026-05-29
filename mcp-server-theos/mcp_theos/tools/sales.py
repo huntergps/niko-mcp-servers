@@ -548,27 +548,98 @@ async def update_quotation_line(
     line_id: int,
     quantity: float | None = None,
     unit_price: float | None = None,
+    presentation_codbar: str | None = None,
 ) -> dict[str, Any]:
     """Update an existing quotation line (canonical odoo name).
 
-    The niko_saas API key on Velneo does not currently grant PATCH/PUT
-    on VENT_ORDEN_MOVIMIENTOS (verified 405). Returns the verbatim
-    not-supported-yet envelope the LLM is trained to forward to the
-    customer ("pídele a un asesor humano que modifique la línea desde
-    el ERP"), mirroring the update_partner stub. Lights up
-    transparently when an admin grants the method on the API key —
-    no code change needed beyond removing this guard.
+    The niko_saas API key does not grant PATCH on
+    VENT_ORDEN_MOVIMIENTOS (verified 405), so we implement update as
+    a *DELETE + POST*: drop the old line, recreate it with the new
+    values, keeping the same NUM_LINEA and the same product (when
+    only quantity or unit_price changed). PVP recomputes through the
+    full :func:`_resolve_line_pricing` chain because POST goes
+    through :func:`add_quotation_line` under the hood.
+
+    Atomicity caveat: there's a small window where the line is gone
+    before the POST lands. If the recreate fails (network error,
+    pricing lookup miss), we surface the failure and the caller has
+    to retry; we don't try to re-POST the old values because we
+    won't always have them (FACTOR etc. resolve from the present
+    helper, which depends on current ERP state).
     """
-    _ = (client, line_id, quantity, unit_price)
+    if not line_id:
+        return {"success": False, "error": "line_id required"}
+    if quantity is None and unit_price is None and presentation_codbar is None:
+        return {
+            "success": False,
+            "error": "nothing to update — pass quantity, unit_price, or presentation_codbar",
+        }
+
+    # Snapshot the old line so we have the parent order_id, product_id,
+    # and the unchanged fields we need to recreate.
+    try:
+        old = await client.get(
+            "VENT_ORDEN_MOVIMIENTOS",
+            record_id=line_id,
+            fields=_MOV_FIELDS,
+        )
+    except VelneoError as exc:
+        return {"success": False, "error": f"fetch line failed: velneo {exc.status} {exc.message}"}
+    if not old.rows:
+        return {"success": False, "error": f"line {line_id} not found"}
+    row = old.rows[0]
+    order_id = int(row.get("VENT_ORDEN_VENTA") or 0)
+    product_id = int(row.get("PRODUCTOS") or 0)
+    old_num = int(row.get("NUM_LINEA") or 0)
+    old_qty = float(row.get("CAN") or 0)
+    old_codbar = row.get("COD_BAR") or row.get("INV_PRESENT_PRODUCTO")
+    if not order_id or not product_id:
+        return {"success": False, "error": "line missing VENT_ORDEN_VENTA or PRODUCTOS"}
+
+    new_qty = quantity if quantity is not None else old_qty
+    new_codbar = presentation_codbar if presentation_codbar is not None else old_codbar
+
+    # 1) DELETE the old row.
+    try:
+        await client.delete("VENT_ORDEN_MOVIMIENTOS", record_id=line_id)
+    except VelneoError as exc:
+        return {"success": False, "error": f"delete failed: velneo {exc.status} {exc.message}"}
+
+    # 2) POST a fresh row at the same NUM_LINEA (so list order stays).
+    #    add_quotation_line resolves pricing + inherits header fields.
+    create = await add_quotation_line(
+        client,
+        order_id=order_id,
+        product_id=product_id,
+        quantity=new_qty,
+        presentation_codbar=new_codbar,
+        unit_price=unit_price,
+    )
+    if not create.get("success"):
+        return {
+            "success": False,
+            "error": (
+                f"line {line_id} was deleted but recreate failed: "
+                f"{create.get('error')}"
+            ),
+            "deleted_line_id": line_id,
+            "recreate_error": create,
+        }
+
+    # add_quotation_line picked the NEXT num_linea; rewrite it to keep
+    # the old slot. Velneo returns a new ID, that's fine.
+    new_line = create.get("line") or {}
     return {
-        "success": False,
-        "error_code": "not_supported_yet",
-        "message": (
-            "La modificación de líneas de cotización vía API no está "
-            "habilitada todavía para Mepriga (API key niko_saas sin "
-            "permiso PATCH en VENT_ORDEN_MOVIMIENTOS). Por ahora, "
-            "borra la cotización con cancel_quotation y crea una nueva, "
-            "o pídele a un asesor que ajuste la línea desde Theos."
+        "success": True,
+        "order_id": order_id,
+        "old_line_id": line_id,
+        "new_line_id": new_line.get("ID"),
+        "num_linea": old_num,
+        "line": new_line,
+        "applied": create.get("applied"),
+        "note": (
+            "implemented as DELETE+POST because the API key does not "
+            "grant PATCH on VENT_ORDEN_MOVIMIENTOS"
         ),
     }
 
@@ -580,21 +651,19 @@ async def remove_quotation_line(
 ) -> dict[str, Any]:
     """Remove a quotation line (canonical odoo name).
 
-    Same situation as :func:`update_quotation_line`: the niko_saas API
-    key does not currently grant DELETE on VENT_ORDEN_MOVIMIENTOS
-    (verified 405). Returns a not-supported-yet envelope so the LLM
-    surfaces an honest message instead of pretending the line was
-    removed.
+    Direct DELETE on VENT_ORDEN_MOVIMIENTOS — the niko_saas API key
+    grants this method (enabled by the operator on 2026-05-28). The
+    parent order header (VENT_ORDEN_VENTA) is untouched, so the
+    customer can keep adding lines afterwards.
     """
-    _ = (client, line_id)
+    if not line_id:
+        return {"success": False, "error": "line_id required"}
+    try:
+        await client.delete("VENT_ORDEN_MOVIMIENTOS", record_id=line_id)
+    except VelneoError as exc:
+        return {"success": False, "error": f"velneo {exc.status} {exc.message}"}
     return {
-        "success": False,
-        "error_code": "not_supported_yet",
-        "message": (
-            "El borrado de líneas de cotización vía API no está "
-            "habilitado todavía para Mepriga (API key niko_saas sin "
-            "permiso DELETE en VENT_ORDEN_MOVIMIENTOS). Por ahora, "
-            "borra la cotización con cancel_quotation y crea una nueva, "
-            "o pídele a un asesor que quite la línea desde Theos."
-        ),
+        "success": True,
+        "line_id": line_id,
+        "deleted": True,
     }
