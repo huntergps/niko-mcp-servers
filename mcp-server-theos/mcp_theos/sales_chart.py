@@ -154,11 +154,21 @@ def build_hourly_compare_png(
                 transform=ax.transAxes, color=COLOR_SUBTLE)
         ax.axis("off")
     else:
+        # Use NaN for hours-without-data instead of 0 so matplotlib
+        # draws a gap on the line rather than crashing the plot to $0
+        # (which gave the misleading "ventas cayeron a cero" effect on
+        # the in-progress current day before noon).
+        import math as _math
         sorted_days = sorted(day_x_hour.keys())
         for idx, day in enumerate(sorted_days):
-            y = [day_x_hour[day].get(h, 0.0) for h in sorted_hours]
+            day_hours = day_x_hour[day]
+            y = [day_hours.get(h, _math.nan) for h in sorted_hours]
             color = palette[idx % len(palette)]
-            day_total = totals_per_day.get(day, sum(y))
+            # Recompute day_total only over the hours WE HAVE — passing
+            # NaN to sum would explode. Falls back to the externally
+            # provided totals_per_day when present.
+            real_vals = [v for v in y if not _math.isnan(v)]
+            day_total = totals_per_day.get(day, sum(real_vals))
             # day label: "dd/mm  $total"
             from datetime import date
             try:

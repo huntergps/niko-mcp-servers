@@ -2084,6 +2084,12 @@ async def summarize_sales(
                         "%Y-%m-%dT%H:%M:%S",
                     )
                     dt = dt + timedelta(hours=offset_int)
+                    # Skip hours that haven't happened yet for the in-
+                    # progress day (paranoia against clock skew).
+                    today_iso_local = _today_ecu_iso()
+                    current_hour_ecu_local = (datetime.utcnow() + timedelta(hours=offset_int)).hour
+                    if day == today_iso_local and dt.hour > current_hour_ecu_local:
+                        continue
                     hour_lbl = f"{dt.hour:02d}h00"
                     bh = by_hour[hour_lbl]
                     bh["pvp"] += pvp

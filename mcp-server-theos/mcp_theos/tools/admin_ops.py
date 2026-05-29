@@ -1070,6 +1070,12 @@ async def sales_evolution_chart(
     daily_facts: dict[str, set[int]] = defaultdict(set)
     days_from_cache = 0
     days_live = 0
+    # For the in-progress day, cap the hour axis at the current local
+    # hour so the chart doesn't pretend we have $0 in 13h00–23h00 just
+    # because we're talking at 12:30.
+    today_ecu = (_datetime.now(timezone.utc) - timedelta(hours=5))
+    today_iso = today_ecu.date().isoformat()
+    current_hour_ecu = today_ecu.hour
     for day in days:
         day_result = await _get_day_lines(client, day=day, sucursal=suc)
         if not day_result.get("success"):
@@ -1098,6 +1104,10 @@ async def sales_evolution_chart(
                         str(fc).replace("Z", "").split(".")[0],
                         "%Y-%m-%dT%H:%M:%S",
                     ) + timedelta(hours=offset_int)
+                    # Skip lines from hours that haven't happened yet
+                    # for the in-progress day (rare clock-skew defense).
+                    if day == today_iso and dt_obj.hour > current_hour_ecu:
+                        continue
                     hour_lbl = f"{dt_obj.hour:02d}h00"
                     day_x_hour[day][hour_lbl] += pvp
                 except ValueError:
@@ -1180,6 +1190,10 @@ async def sales_evolution_chart(
         send_photo as _send_photo, BotTokenMissing,
     )
     caption = f"<b>Evolución — {period_label}</b>\nTotal ${total_pvp:,.0f}  ·  {n_fact_total:,} fact"
+    # Flag if the range includes the in-progress day so the reader knows
+    # the latest hours/day are partial, not closed.
+    if today_iso in days:
+        caption += f"\n<i>Día {today_ecu.strftime('%d/%m')} en curso — datos hasta {today_ecu.strftime('%H:%M')} ECU</i>"
     try:
         await _send_photo(
             chat_id=str(deliver_to_chat),
@@ -1337,6 +1351,14 @@ async def sales_dashboard_chart(
     caption = (
         f"<b>{title}</b>\nTotal: ${pvp_total:,.2f}"
     )
+    # Mark in-progress day so the reader knows the hourly panel is partial.
+    _today_ecu_obj = _datetime.now(timezone.utc) - timedelta(hours=5)
+    _today_iso = _today_ecu_obj.date().isoformat()
+    if df <= _today_iso <= dt:
+        caption += (
+            f"\n<i>Día {_today_ecu_obj.strftime('%d/%m')} en curso — datos "
+            f"hasta {_today_ecu_obj.strftime('%H:%M')} ECU</i>"
+        )
 
     try:
         await _send_photo(
