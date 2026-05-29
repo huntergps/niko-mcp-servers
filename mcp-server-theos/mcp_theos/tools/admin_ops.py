@@ -961,6 +961,234 @@ async def sales_quick_summary(
 
 
 # ---------------------------------------------------------------------------
+# sales_evolution_chart — single chart focused on evolution over time
+# ---------------------------------------------------------------------------
+
+
+async def sales_evolution_chart(
+    client: VelneoClient,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    month: str | None = None,
+    year: str | int | None = None,
+    sucursal: str | None = None,
+    mode: str = "auto",
+    deliver_to_chat: str | None = None,
+) -> dict[str, Any]:
+    """Render a focused evolution chart (NOT the 2x2 dashboard) and push
+    it inline to Telegram. Picks the right shape based on ``mode``:
+
+    * ``single_day_hourly`` — bars per hour for ONE day. Use for
+      "cómo va el día", "evolución de hoy", "ventas hora por hora".
+    * ``multi_day_hourly_compare`` — line per day, X = hours. Use for
+      "compará los últimos 3 días", "ayer vs anteayer". Ideal range 2-7.
+    * ``daily_trend`` — bars per day. Use for "tendencia del mes",
+      "evolución de mayo", "últimos 15 días".
+    * ``auto`` (default) — picks one of the above based on ``n_days``:
+      1 day → single_day_hourly, 2-7 → multi_day_hourly_compare,
+      >7 → daily_trend.
+
+    Reuses the on-disk cache from ``_get_day_lines`` so multi-day
+    comparisons on past dates are basically free.
+    """
+    import calendar
+    import os
+    from datetime import date as _date, datetime as _datetime, timezone, timedelta
+
+    if year:
+        try:
+            y_int = int(str(year).strip())
+            if not (2000 <= y_int <= 2100):
+                raise ValueError
+        except (TypeError, ValueError):
+            return {"success": False, "error": "year must be YYYY"}
+        date_from = f"{y_int:04d}-01-01"
+        date_to = f"{y_int:04d}-12-31"
+    elif month:
+        try:
+            y_str, m_str = str(month).strip().split("-")
+            y_int = int(y_str)
+            m_int = int(m_str)
+            if not (1 <= m_int <= 12) or not (2000 <= y_int <= 2100):
+                raise ValueError
+        except (TypeError, ValueError):
+            return {"success": False, "error": "month must be YYYY-MM"}
+        last_day = calendar.monthrange(y_int, m_int)[1]
+        date_from = f"{y_int:04d}-{m_int:02d}-01"
+        date_to = f"{y_int:04d}-{m_int:02d}-{last_day:02d}"
+    elif not date_from and not date_to:
+        ec_now = _datetime.now(timezone.utc) - timedelta(hours=5)
+        today_iso = ec_now.date().isoformat()
+        date_from = today_iso
+        date_to = today_iso
+    if not date_from:
+        date_from = date_to
+    if not date_to:
+        date_to = date_from
+
+    df = _norm_velneo_date(date_from)
+    dt = _norm_velneo_date(date_to)
+    if not df or not dt:
+        return {"success": False, "error": "date_from / date_to must be ISO YYYY-MM-DD"}
+    if not deliver_to_chat:
+        return {"success": False,
+                "error": "deliver_to_chat required for chart delivery"}
+
+    from mcp_theos.sales_report import _iter_days, _get_day_lines
+    # Iterate days using cache.
+    days = await _iter_days(df, dt)
+    if not days:
+        return {"success": False, "error": "date_to < date_from"}
+
+    # Auto-select mode based on number of days.
+    if mode == "auto":
+        if len(days) == 1:
+            mode = "single_day_hourly"
+        elif len(days) <= 7:
+            mode = "multi_day_hourly_compare"
+        else:
+            mode = "daily_trend"
+    valid = {"single_day_hourly", "multi_day_hourly_compare", "daily_trend"}
+    if mode not in valid:
+        return {"success": False,
+                "error": f"mode must be one of {sorted(valid)} or 'auto'"}
+
+    try:
+        offset = float(os.environ.get("VELNEO_TZ_OFFSET_HOURS", "-5"))
+    except (TypeError, ValueError):
+        offset = -5.0
+    offset_int = int(offset)
+
+    suc = sucursal or _tenant_sucursal(client)
+
+    # Per-day aggregation. ``day_x_hour[day]["HHh00"] = pvp``,
+    # ``daily_totals[day] = pvp`` and similar for n_fact.
+    from collections import defaultdict
+    day_x_hour: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    daily_pvp: dict[str, float] = defaultdict(float)
+    daily_facts: dict[str, set[int]] = defaultdict(set)
+    days_from_cache = 0
+    days_live = 0
+    for day in days:
+        day_result = await _get_day_lines(client, day=day, sucursal=suc)
+        if not day_result.get("success"):
+            return {"success": False, "error": day_result.get("error"),
+                    "day_at_failure": day}
+        if day_result.get("from_cache"):
+            days_from_cache += 1
+        else:
+            days_live += 1
+        for uk in day_result.get("rows") or []:
+            try:
+                pvp = float(uk.get("PVP_LINEA") or 0)
+            except (TypeError, ValueError):
+                pvp = 0.0
+            try:
+                inv_id = int(uk.get("VENT_FACT_VENT") or 0)
+            except (TypeError, ValueError):
+                inv_id = 0
+            daily_pvp[day] += pvp
+            if inv_id:
+                daily_facts[day].add(inv_id)
+            fc = uk.get("FECHA_CONTA")
+            if fc and "T" in str(fc):
+                try:
+                    dt_obj = _datetime.strptime(
+                        str(fc).replace("Z", "").split(".")[0],
+                        "%Y-%m-%dT%H:%M:%S",
+                    ) + timedelta(hours=offset_int)
+                    hour_lbl = f"{dt_obj.hour:02d}h00"
+                    day_x_hour[day][hour_lbl] += pvp
+                except ValueError:
+                    pass
+
+    total_pvp = sum(daily_pvp.values())
+    n_fact_total = sum(len(v) for v in daily_facts.values())
+
+    # Build period label.
+    from mcp_theos.sales_chart import (
+        _format_period_label,
+        build_single_day_hourly_png,
+        build_hourly_compare_png,
+        build_daily_trend_png,
+    )
+    period_label = _format_period_label(df, dt)
+
+    try:
+        if mode == "single_day_hourly":
+            single_day = days[0]
+            hourly_rows = [{"hora": h, "pvp": v} for h, v in
+                           sorted(day_x_hour.get(single_day, {}).items())]
+            png = build_single_day_hourly_png(
+                hourly=hourly_rows,
+                period_label=period_label,
+                total_pvp=daily_pvp.get(single_day, 0.0),
+                n_fact=len(daily_facts.get(single_day, set())),
+            )
+        elif mode == "multi_day_hourly_compare":
+            png = build_hourly_compare_png(
+                day_x_hour={d: dict(day_x_hour.get(d, {})) for d in days},
+                period_label=period_label,
+                totals_per_day=dict(daily_pvp),
+            )
+        else:  # daily_trend
+            daily_rows = [
+                {"day": d, "pvp": daily_pvp.get(d, 0.0),
+                 "n_facturas": len(daily_facts.get(d, set()))}
+                for d in days
+            ]
+            png = build_daily_trend_png(
+                daily=daily_rows,
+                period_label=period_label,
+                total_pvp=total_pvp,
+                n_fact_total=n_fact_total,
+            )
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"chart_render_failed: {exc}"}
+
+    from mcp_theos.telegram_delivery import (
+        send_photo as _send_photo, BotTokenMissing,
+    )
+    caption = f"<b>Evolución — {period_label}</b>\nTotal ${total_pvp:,.0f}  ·  {n_fact_total:,} fact"
+    try:
+        await _send_photo(
+            chat_id=str(deliver_to_chat),
+            data=png,
+            filename=f"evolucion_{mode}_{df}_a_{dt}.png",
+            caption=caption, parse_mode="HTML",
+        )
+    except BotTokenMissing as e:
+        return {"success": False, "error": "telegram_bot_token_missing",
+                "message": str(e)}
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "error": "telegram_upload_failed",
+                "message": str(e)}
+
+    return {
+        "success": True,
+        "delivered": True,
+        "delivered_to_chat": str(deliver_to_chat),
+        "mode_used": mode,
+        "n_days": len(days),
+        "png_size_kb": round(len(png) / 1024, 1),
+        "date_from": df,
+        "date_to": dt,
+        "totals": {
+            "pvp": round(total_pvp, 2),
+            "n_facturas": n_fact_total,
+        },
+        "daily_breakdown": [
+            {"day": d, "pvp": round(daily_pvp.get(d, 0.0), 2),
+             "n_facturas": len(daily_facts.get(d, set()))}
+            for d in days
+        ],
+        "cache_stats": {"days_from_cache": days_from_cache,
+                          "days_live": days_live},
+    }
+
+
+# ---------------------------------------------------------------------------
 # sales_dashboard_chart — PNG visual summary, sent inline to Telegram
 # ---------------------------------------------------------------------------
 

@@ -1061,6 +1061,50 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "sales_evolution_chart",
+        "description": (
+            "Genera un GRAFICO FOCALIZADO de EVOLUCION temporal (1 solo "
+            "panel, no el dashboard 2x2) y lo sube inline al chat. USAR "
+            "cuando el usuario pregunta como evolucionan las ventas en el "
+            "TIEMPO — 'como va el dia', 'ventas por hora', 'compara los "
+            "ultimos 3 dias', 'evolucion del mes', 'tendencia diaria', "
+            "'ayer vs anteayer'.\n\n"
+            "El tool detecta automaticamente la mejor forma del grafico "
+            "segun la cantidad de dias del rango (modo 'auto', default):\n"
+            "  - 1 dia                 -> barras por hora del dia\n"
+            "  - 2 a 7 dias             -> lineas por hora, una linea por "
+            "dia (ideal comparar patron intradia)\n"
+            "  - mas de 7 dias          -> barras por dia (tendencia)\n\n"
+            "Si el usuario pide explicitamente un modo (ej 'compara hora "
+            "por hora los 3 dias') pasa el mode correspondiente."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "month": {"type": "string", "description": "YYYY-MM"},
+                "year": {"type": "string", "description": "YYYY"},
+                "date_from": {"type": "string", "description": "ISO YYYY-MM-DD"},
+                "date_to": {"type": "string", "description": "ISO YYYY-MM-DD"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "single_day_hourly",
+                             "multi_day_hourly_compare", "daily_trend"],
+                    "default": "auto",
+                    "description": (
+                        "auto recommended. Override solo si el usuario "
+                        "pide explicitamente la forma."
+                    ),
+                },
+                "sucursal": {"type": "string"},
+                "deliver_to_chat": {
+                    "type": "string",
+                    "description": "REQUERIDO. Telegram chat_id.",
+                },
+            },
+            "required": ["deliver_to_chat"],
+        },
+    },
+    {
         "name": "sales_dashboard_chart",
         "description": (
             "Genera un dashboard visual PNG (2x2 paneles: familia, hora, "
@@ -1277,6 +1321,7 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "search_velneo": ("admin_search.search_velneo", admin_search.search_velneo),
     "sales_quick_summary": ("admin_ops.sales_quick_summary", admin_ops.sales_quick_summary),
     "sales_dashboard_chart": ("admin_ops.sales_dashboard_chart", admin_ops.sales_dashboard_chart),
+    "sales_evolution_chart": ("admin_ops.sales_evolution_chart", admin_ops.sales_evolution_chart),
     "generate_sales_report": ("admin_ops.generate_sales_report", admin_ops.generate_sales_report),
 }
 

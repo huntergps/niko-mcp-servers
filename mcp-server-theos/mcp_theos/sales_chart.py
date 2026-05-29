@@ -62,6 +62,174 @@ def _format_period_label(date_from: str, date_to: str) -> str:
     return f"{df.day:02d} {months_es[df.month - 1]} → {dt.day:02d} {months_es[dt.month - 1]} {df.year}"
 
 
+def build_single_day_hourly_png(
+    *,
+    hourly: list[dict[str, Any]],
+    period_label: str,
+    total_pvp: float,
+    n_fact: int,
+) -> bytes:
+    """Single-day evolution: bars per hour, peak highlighted."""
+    fig, ax = plt.subplots(figsize=(12, 6.5), dpi=110)
+    fig.patch.set_facecolor("white")
+    fig.suptitle(f"Evolución horaria — {period_label}", fontsize=17,
+                 fontweight="bold", color=COLOR_PRIMARY, y=0.97)
+    fig.text(0.5, 0.92,
+             f"Total ${total_pvp:,.0f}  ·  {n_fact:,} fact",
+             ha="center", fontsize=11, color=COLOR_SUBTLE)
+
+    if not hourly:
+        ax.text(0.5, 0.5, "sin datos", ha="center", va="center",
+                transform=ax.transAxes, color=COLOR_SUBTLE)
+        ax.axis("off")
+    else:
+        hrs = [d["hora"] for d in hourly]
+        vals = [float(d["pvp"]) for d in hourly]
+        bars = ax.bar(hrs, vals, color=COLOR_SECONDARY, edgecolor="none",
+                      width=0.7)
+        if vals:
+            peak_i = max(range(len(vals)), key=lambda i: vals[i])
+            bars[peak_i].set_color(COLOR_PRIMARY)
+            # Annotate peak value above the bar
+            ax.text(peak_i, vals[peak_i],
+                    f"  ${vals[peak_i]:,.0f}",
+                    ha="center", va="bottom", fontsize=10,
+                    fontweight="bold", color=COLOR_PRIMARY)
+        ax.yaxis.set_major_formatter(mtick.FuncFormatter(_fmt_dollar))
+        ax.tick_params(axis="x", labelsize=10, rotation=45)
+        ax.tick_params(axis="y", labelsize=10)
+        ax.grid(axis="y", color=COLOR_ZEBRA, linewidth=1)
+        ax.set_axisbelow(True)
+        ax.set_xlabel("Hora", fontsize=11, color=COLOR_SUBTLE)
+        ax.set_ylabel("PVP ($)", fontsize=11, color=COLOR_SUBTLE)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+    fig.tight_layout(rect=(0, 0, 1, 0.91))
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight",
+                facecolor="white", dpi=110)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def build_hourly_compare_png(
+    *,
+    day_x_hour: dict[str, dict[str, float]],
+    period_label: str,
+    totals_per_day: dict[str, float],
+) -> bytes:
+    """Multi-day evolution: one line per day, X axis = hours.
+
+    ``day_x_hour`` shape: ``{day_iso: {hora_label: pvp}}``.
+    """
+    fig, ax = plt.subplots(figsize=(13, 7), dpi=110)
+    fig.patch.set_facecolor("white")
+    fig.suptitle(f"Evolución por hora — {period_label}", fontsize=17,
+                 fontweight="bold", color=COLOR_PRIMARY, y=0.97)
+
+    # Build a sorted superset of hour labels across all days.
+    all_hours: set[str] = set()
+    for hours_dict in day_x_hour.values():
+        all_hours.update(hours_dict.keys())
+    sorted_hours = sorted(all_hours)
+
+    palette = [COLOR_PRIMARY, COLOR_GREEN, COLOR_ORANGE, COLOR_PURPLE,
+               COLOR_CYAN, COLOR_RED, COLOR_SECONDARY, "#404040"]
+
+    if not sorted_hours or not day_x_hour:
+        ax.text(0.5, 0.5, "sin datos", ha="center", va="center",
+                transform=ax.transAxes, color=COLOR_SUBTLE)
+        ax.axis("off")
+    else:
+        sorted_days = sorted(day_x_hour.keys())
+        for idx, day in enumerate(sorted_days):
+            y = [day_x_hour[day].get(h, 0.0) for h in sorted_hours]
+            color = palette[idx % len(palette)]
+            day_total = totals_per_day.get(day, sum(y))
+            # day label: "dd/mm  $total"
+            from datetime import date
+            try:
+                d = date.fromisoformat(day)
+                day_lbl = f"{d.day:02d}/{d.month:02d}  ${day_total:,.0f}"
+            except ValueError:
+                day_lbl = f"{day}  ${day_total:,.0f}"
+            ax.plot(sorted_hours, y, marker="o", linewidth=2.4,
+                    color=color, label=day_lbl, markersize=6)
+
+        ax.yaxis.set_major_formatter(mtick.FuncFormatter(_fmt_dollar))
+        ax.tick_params(axis="x", labelsize=10, rotation=45)
+        ax.tick_params(axis="y", labelsize=10)
+        ax.grid(axis="y", color=COLOR_ZEBRA, linewidth=1)
+        ax.set_axisbelow(True)
+        ax.set_xlabel("Hora", fontsize=11, color=COLOR_SUBTLE)
+        ax.set_ylabel("PVP ($)", fontsize=11, color=COLOR_SUBTLE)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        ax.legend(loc="best", fontsize=10, frameon=False)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight",
+                facecolor="white", dpi=110)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def build_daily_trend_png(
+    *,
+    daily: list[dict[str, Any]],
+    period_label: str,
+    total_pvp: float,
+    n_fact_total: int,
+) -> bytes:
+    """Daily trend: bars per day + secondary line for n_facturas."""
+    fig, ax = plt.subplots(figsize=(13, 7), dpi=110)
+    fig.patch.set_facecolor("white")
+    fig.suptitle(f"Tendencia diaria — {period_label}", fontsize=17,
+                 fontweight="bold", color=COLOR_PRIMARY, y=0.97)
+    fig.text(0.5, 0.92,
+             f"Total ${total_pvp:,.0f}  ·  {n_fact_total:,} fact",
+             ha="center", fontsize=11, color=COLOR_SUBTLE)
+
+    if not daily:
+        ax.text(0.5, 0.5, "sin datos", ha="center", va="center",
+                transform=ax.transAxes, color=COLOR_SUBTLE)
+        ax.axis("off")
+    else:
+        from datetime import date
+        labels = []
+        for d in daily:
+            try:
+                dd = date.fromisoformat(d["day"])
+                labels.append(f"{dd.day:02d}/{dd.month:02d}")
+            except (ValueError, KeyError):
+                labels.append(d.get("day", "?"))
+        vals = [float(d["pvp"]) for d in daily]
+        bars = ax.bar(labels, vals, color=COLOR_SECONDARY,
+                      edgecolor="none", width=0.65)
+        avg = sum(vals) / len(vals) if vals else 0
+        ax.axhline(avg, color=COLOR_ORANGE, linewidth=1.5, linestyle="--",
+                   label=f"Promedio ${avg:,.0f}", alpha=0.8)
+        if vals:
+            peak_i = max(range(len(vals)), key=lambda i: vals[i])
+            bars[peak_i].set_color(COLOR_PRIMARY)
+        ax.yaxis.set_major_formatter(mtick.FuncFormatter(_fmt_dollar))
+        ax.tick_params(axis="x", labelsize=10, rotation=45)
+        ax.tick_params(axis="y", labelsize=10)
+        ax.grid(axis="y", color=COLOR_ZEBRA, linewidth=1)
+        ax.set_axisbelow(True)
+        ax.set_xlabel("Fecha", fontsize=11, color=COLOR_SUBTLE)
+        ax.set_ylabel("PVP ($)", fontsize=11, color=COLOR_SUBTLE)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        ax.legend(loc="best", fontsize=10, frameon=False)
+    fig.tight_layout(rect=(0, 0, 1, 0.91))
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight",
+                facecolor="white", dpi=110)
+    plt.close(fig)
+    return buf.getvalue()
+
+
 def build_dashboard_png(
     summary: dict[str, Any],
     *,
