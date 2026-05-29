@@ -263,18 +263,75 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "get_quotation_pdf",
+        "name": "render_quotation_pdf",
         "description": (
             "Render a quotation (proforma) as a PDF and return it base64-"
             "encoded. The chat layer decodes the bytes and attaches the "
             "file to the customer's message. Call AFTER create_quotation "
             "succeeds, so the customer gets a clean record of what was "
-            "just quoted."
+            "just quoted. Tool name matches the canonical odoo name."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {"order_id": {"type": "integer"}},
             "required": ["order_id"],
+        },
+    },
+    {
+        "name": "add_quotation_line",
+        "description": (
+            "Append a single line to an existing quotation. Use this "
+            "when the customer says 'agrega también X', 'súmame Y', or "
+            "after browsing the catalog and picking another product to "
+            "the active quotation. Inherits EMP / SUC / INV_BODEGA / "
+            "INV_TARIFAS from the order header. Optional "
+            "``presentation_codbar`` picks a non-unit empaque (e.g. "
+            "'01PPQ' for QUINTAL); ``unit_price`` overrides the tariff "
+            "price (sets PRECIO_BRUTO_EMPAQUE + PRECIO_ACORDADO=true)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "integer"},
+                "product_id": {"type": "integer"},
+                "quantity": {"type": "number"},
+                "presentation_codbar": {"type": "string"},
+                "unit_price": {"type": "number"},
+            },
+            "required": ["order_id", "product_id", "quantity"],
+        },
+    },
+    {
+        "name": "update_quotation_line",
+        "description": (
+            "Update an existing quotation line — change the quantity "
+            "or the unit price. NOTE: not currently supported on "
+            "Mepriga (API key lacks PATCH on VENT_ORDEN_MOVIMIENTOS); "
+            "the tool returns ``error_code=not_supported_yet`` so the "
+            "assistant can tell the customer transparently."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "line_id": {"type": "integer"},
+                "quantity": {"type": "number"},
+                "unit_price": {"type": "number"},
+            },
+            "required": ["line_id"],
+        },
+    },
+    {
+        "name": "remove_quotation_line",
+        "description": (
+            "Remove a quotation line. NOTE: not currently supported on "
+            "Mepriga (API key lacks DELETE on VENT_ORDEN_MOVIMIENTOS); "
+            "the tool returns ``error_code=not_supported_yet`` so the "
+            "assistant can tell the customer transparently."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"line_id": {"type": "integer"}},
+            "required": ["line_id"],
         },
     },
     {
@@ -952,11 +1009,20 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "Por defecto trae HOY (Ecuador timezone) si no se pasa "
             "rango. Acepta ``date_from`` / ``date_to`` en ISO "
             "YYYY-MM-DD para cualquier ventana (día, semana, mes, "
-            "rango libre). Devuelve ``xlsx_base64`` + "
-            "``xlsx_filename`` — la capa de Telegram adjunta el archivo "
-            "al mensaje automáticamente. Cap de líneas: 5000 (suficiente "
-            "para 1 día; si pidieras un mes muy ocupado y truncated=true, "
-            "narrow el rango)."
+            "rango libre). Cap de líneas: 5000 (suficiente para 1 día; "
+            "si pidieras un mes muy ocupado y truncated=true, narrow "
+            "el rango).\n\n"
+            "**Entrega del archivo** — DOS modos:\n"
+            "1. RECOMENDADO para el agente: pasá "
+            "``deliver_to_chat=\"<telegram_chat_id>\"``. El tool sube el "
+            "XLSX DIRECTO al chat via Bot API sendDocument y devuelve "
+            "``{success, delivered: true, delivered_to_chat, totals, "
+            "n_lines, xlsx_filename, xlsx_size_kb}`` sin base64. El "
+            "usuario ve el archivo como adjunto real. Para Mepriga el "
+            "chat_id del grupo Soporte Mepriga es ``-5248384291``.\n"
+            "2. Sin ``deliver_to_chat`` (modo legacy / cron): devuelve "
+            "``xlsx_base64`` + ``xlsx_filename`` para que el caller "
+            "haga el upload."
         ),
         "inputSchema": {
             "type": "object",
@@ -967,6 +1033,16 @@ MCP_TOOLS: list[dict[str, Any]] = [
                             "description": "ISO YYYY-MM-DD. Default = date_from"},
                 "sucursal": {"type": "string"},
                 "max_rows": {"type": "integer", "default": 5000, "minimum": 100, "maximum": 20000},
+                "deliver_to_chat": {
+                    "type": "string",
+                    "description": (
+                        "Telegram chat_id donde subir el XLSX directamente "
+                        "(ej. '-5248384291' para el grupo Soporte Mepriga). "
+                        "Cuando se pasa, el tool entrega el archivo via Bot "
+                        "API y devuelve un resumen corto sin base64. Cuando "
+                        "se omite, el tool devuelve base64 (modo legacy / cron)."
+                    ),
+                },
             },
         },
     },
@@ -1037,7 +1113,10 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "create_quotation": ("sales.create_quotation", sales.create_quotation),
     "get_quotation": ("sales.get_quotation", sales.get_quotation),
     "list_quotations": ("sales.list_quotations", sales.list_quotations),
-    "get_quotation_pdf": ("sales.get_quotation_pdf", sales.get_quotation_pdf),
+    "render_quotation_pdf": ("sales.render_quotation_pdf", sales.render_quotation_pdf),
+    "add_quotation_line": ("sales.add_quotation_line", sales.add_quotation_line),
+    "update_quotation_line": ("sales.update_quotation_line", sales.update_quotation_line),
+    "remove_quotation_line": ("sales.remove_quotation_line", sales.remove_quotation_line),
     "request_otp": ("otp_tools.request_otp", otp_tools.request_otp),
     "verify_otp": ("otp_tools.verify_otp", otp_tools.verify_otp),
     "get_customer_invoices": ("invoices.get_customer_invoices", invoices.get_customer_invoices),

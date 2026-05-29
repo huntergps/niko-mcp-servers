@@ -877,6 +877,7 @@ async def generate_sales_report(
     date_to: str | None = None,
     sucursal: str | None = None,
     max_rows: int = 5000,
+    deliver_to_chat: str | None = None,
 ) -> dict[str, Any]:
     """Generate the "Informe de ventas diarias" XLSX for a date range.
 
@@ -890,9 +891,20 @@ async def generate_sales_report(
     Default range is today (Quito timezone) so "lila, dame el informe
     de ventas" without a date returns the report as of right now.
 
-    Returns ``{xlsx_base64, xlsx_filename, totals, message}``. Lila's
-    channel layer attaches the XLSX to Telegram automatically when it
-    sees ``xlsx_base64`` + ``xlsx_filename`` in the tool response.
+    Delivery modes:
+
+    * ``deliver_to_chat`` IS set (recommended for agent-driven calls):
+      the tool uploads the XLSX directly to the given Telegram chat_id
+      via the Bot API ``sendDocument`` and returns a short summary
+      (totals, line count, ``delivered_to_chat``) WITHOUT the base64.
+      Same path as the cron job — guaranteed delivery as a real file
+      attachment.  Requires ``LILA_TELEGRAM_BOT_TOKEN`` in the MCP
+      container env.
+
+    * ``deliver_to_chat`` is None (cron / programmatic callers): the
+      tool returns ``{xlsx_base64, xlsx_filename, totals, ...}`` as
+      before so the caller can do its own upload (e.g. with a custom
+      caption).
     """
     import base64
     from datetime import date, datetime, timezone, timedelta
@@ -931,10 +943,52 @@ async def generate_sales_report(
         }
 
     fname_range = df if df == dt else f"{df}_a_{dt}"
+    xlsx_filename = f"informe_ventas_mepriga_{fname_range}.xlsx"
+    base_payload = {k: v for k, v in result.items() if k != "xlsx_bytes"}
+
+    # Direct-delivery path — used by the agent when it knows the target
+    # chat. Skips the base64 round-trip entirely.
+    if deliver_to_chat:
+        from mcp_theos.telegram_delivery import (
+            send_document as _send_doc,
+            BotTokenMissing,
+        )
+        try:
+            await _send_doc(
+                chat_id=str(deliver_to_chat),
+                filename=xlsx_filename,
+                data=xlsx_bytes,
+            )
+        except BotTokenMissing as e:
+            return {
+                **base_payload,
+                "success": False,
+                "error": "telegram_bot_token_missing",
+                "message": str(e),
+            }
+        except Exception as e:
+            # Fallback: keep the base64 so the caller can retry.
+            return {
+                **base_payload,
+                "success": False,
+                "error": "telegram_upload_failed",
+                "message": f"Subida a Telegram fallo: {e}. XLSX devuelto en base64 como fallback.",
+                "xlsx_base64": base64.b64encode(xlsx_bytes).decode("ascii"),
+                "xlsx_filename": xlsx_filename,
+            }
+        return {
+            **base_payload,
+            "delivered": True,
+            "delivered_to_chat": str(deliver_to_chat),
+            "xlsx_filename": xlsx_filename,
+            "xlsx_size_kb": round(len(xlsx_bytes) / 1024, 1),
+        }
+
+    # Legacy / cron path: return base64.
     return {
-        **{k: v for k, v in result.items() if k != "xlsx_bytes"},
+        **base_payload,
         "xlsx_base64": base64.b64encode(xlsx_bytes).decode("ascii"),
-        "xlsx_filename": f"informe_ventas_mepriga_{fname_range}.xlsx",
+        "xlsx_filename": xlsx_filename,
         "mime_type": (
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         ),
