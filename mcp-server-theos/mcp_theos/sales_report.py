@@ -185,18 +185,34 @@ def _parse_invoice_name(name: str) -> dict[str, str]:
 
 
 def _fmt_datetime_es(value: Any) -> str:
-    """Velneo ISO timestamp → ``dd/mm/yyyy HH:MM:SS`` (Ecuador display)."""
+    """Velneo ISO timestamp → ``dd/mm/yyyy HH:MM:SS`` (Ecuador display).
+
+    Velneo emits ``...Z`` suffix on timestamps but the actual storage is
+    UTC; we convert to America/Guayaquil (fixed UTC-5, no DST). If the
+    convention turns out to be naive-local (Velneo's docs are unclear on
+    this), set ``VELNEO_TZ_OFFSET_HOURS=0`` on the MCP env to skip the
+    shift.
+    """
     if not value or value == "Invalid Date":
         return ""
     s = str(value)
-    # Velneo timestamps come tagged with Z but represent local Ecuador
-    # time already (Velneo is naive-local at the source). Strip the
-    # timezone marker and split into date + time.
     if "T" not in s:
         return _fmt_date_es(s[:10])
-    d, t = s.split("T", 1)
-    t = t.replace("Z", "").split(".")[0]  # drop millis + tz
-    return f"{_fmt_date_es(d)} {t[:8]}"
+    try:
+        dt = datetime.strptime(s.replace("Z", "").split(".")[0],
+                               "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        d, t = s.split("T", 1)
+        return f"{_fmt_date_es(d)} {t.replace('Z', '').split('.')[0][:8]}"
+    import os
+    try:
+        offset = float(os.environ.get("VELNEO_TZ_OFFSET_HOURS", "-5"))
+    except (TypeError, ValueError):
+        offset = -5.0
+    if offset:
+        from datetime import timedelta
+        dt = dt + timedelta(hours=offset)
+    return dt.strftime("%d/%m/%Y %H:%M:%S")
 
 
 def _short_date(value: Any) -> str:
