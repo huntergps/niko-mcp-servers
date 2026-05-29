@@ -77,6 +77,9 @@ _DEUD_FIELDS = [
     "DIAS", "DIAS_VENCIDOS",
     "CON_SALDO", "POR_VENCER", "COBRADO", "OFF",
     "REFERENCIA", "TIPO",
+    # DO NOT add VENT_PRE_FACT here either — same owner ruling
+    # 2026-05-28 captured in invoices.py:_FACT_FIELDS. The bot reports
+    # debts and invoices, never pre-facturas.
 ]
 
 _COBR_FIELDS = [
