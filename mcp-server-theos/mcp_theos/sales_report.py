@@ -2209,6 +2209,7 @@ async def summarize_sales(
     truncated = total_count > n_lineas
     n_facturas = len(facturas_all)
     ticket = round(total_pvp / n_facturas, 2) if n_facturas else 0.0
+    total_cantidad = sum(d["cantidad"] for d in by_producto.values())
 
     # Compute decision-relevant benchmarks (vs ayer, vs avg 7d, vs same
     # day last week). Reuses the same on-disk cache so past comparisons
@@ -2301,6 +2302,18 @@ async def summarize_sales(
              "cantidad": round(d["cantidad"], 2), "n_lineas": d["lineas"]}
             for p, d in sorted(by_producto.items(),
                                 key=lambda x: -x[1]["pvp"])[:top_n_productos]
+        ],
+        "top_productos_por_cantidad": [
+            {"nombre": p, "cod_bar": d["cod_bar"], "producto_id": d["producto_id"],
+             "cantidad": round(d["cantidad"], 2),
+             "pvp": round(d["pvp"], 2),
+             "pct_cant": (
+                 round(100 * d["cantidad"] / total_cantidad, 1)
+                 if total_cantidad else 0.0
+             ),
+             "n_lineas": d["lineas"]}
+            for p, d in sorted(by_producto.items(),
+                                key=lambda x: -x[1]["cantidad"])[:top_n_productos]
         ],
     }
     response["deltas"] = deltas
