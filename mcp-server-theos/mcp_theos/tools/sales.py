@@ -385,12 +385,17 @@ async def list_quotations(
     }
 
 
-async def get_quotation_pdf(
+async def render_quotation_pdf(
     client: VelneoClient,
     *,
     order_id: int,
 ) -> dict[str, Any]:
     """Render a quotation as PDF, return base64 + filename.
+
+    Tool name aligns with the canonical odoo name
+    (``render_quotation_pdf``) so the orchestrator's forced-tool-choice
+    and active-quotation logic work the same on both backends — see
+    docstring of :func:`mcp_theos.tools.sales.add_quotation_line`.
 
     Velneo's REST API has no print endpoint (the desktop ticket prints
     via Velneo's own report engine). We render the proforma here with
@@ -402,7 +407,9 @@ async def get_quotation_pdf(
         return data
 
     try:
-        from mcp_theos.pdf import render_quotation_pdf
+        # Alias the renderer so the tool function (also called
+        # render_quotation_pdf) doesn't shadow it.
+        from mcp_theos.pdf import render_quotation_pdf as _render_pdf
     except Exception as exc:  # noqa: BLE001
         return {
             "success": False,
@@ -415,7 +422,7 @@ async def get_quotation_pdf(
     brand = await _get_tenant_commercial_name(client.cfg.tenant_id)
 
     try:
-        pdf_bytes = render_quotation_pdf(data, brand=brand)
+        pdf_bytes = _render_pdf(data, brand=brand)
     except Exception as exc:  # noqa: BLE001
         return {
             "success": False,
@@ -428,4 +435,166 @@ async def get_quotation_pdf(
         "line_count": data.get("line_count"),
         "pdf_base64": base64.b64encode(pdf_bytes).decode("ascii"),
         "pdf_filename": f"proforma_{order_id}.pdf",
+    }
+
+
+async def add_quotation_line(
+    client: VelneoClient,
+    *,
+    order_id: int,
+    product_id: int,
+    quantity: float,
+    presentation_codbar: str | None = None,
+    unit_price: float | None = None,
+) -> dict[str, Any]:
+    """Append a line to an existing quotation (canonical odoo name).
+
+    create_quotation builds a header + N lines in one call. Once the
+    cotización is open and the customer says "agrega también X", the
+    orchestrator forces ``add_quotation_line`` — that name was odoo-
+    only until this commit; theos now exposes the same name so the
+    forced-tool-choice path resolves on both backends without a
+    backend-aware branch in :mod:`niko.agent.orchestrator`.
+
+    Same lookup chain as create_quotation: resolves
+    INV_PRESENT_PRODUCTO + INV_PRECIOS_PRODUCTO + cost/utility/discount
+    via :func:`_resolve_line_pricing` so Velneo's PVP formula evaluates
+    on the inserted row. ``NUM_LINEA`` is auto-incremented past the
+    highest existing line in the order — Velneo doesn't enforce
+    uniqueness, but the cashier UI sorts by it so collisions look
+    like duplicates.
+    """
+    if not order_id:
+        return {"success": False, "error": "order_id required"}
+    if not product_id or quantity is None:
+        return {"success": False, "error": "product_id + quantity required"}
+
+    # Fetch the header to inherit EMP / INV_BODEGA / INV_TARIFAS and to
+    # pick the next NUM_LINEA. If the order doesn't exist we surface a
+    # clear error instead of POSTing an orphan line.
+    header_resp = await get_quotation(client, order_id=order_id)
+    if not header_resp.get("success"):
+        return header_resp
+    header = header_resp.get("order") or {}
+    existing = header_resp.get("lines") or []
+    next_num = (max((int(l.get("NUM_LINEA") or 0) for l in existing), default=0)) + 1
+
+    eff_emp = header.get("EMP")
+    eff_bod = header.get("INV_BODEGA")
+    eff_tariff = header.get("INV_TARIFAS")
+
+    body: dict[str, Any] = {
+        "VENT_ORDEN_VENTA": order_id,
+        "NUM_LINEA": next_num,
+        "PRODUCTOS": product_id,
+        "CAN": quantity,
+    }
+
+    pricing = None
+    if eff_tariff:
+        try:
+            pricing = await _resolve_line_pricing(
+                client,
+                product_id=product_id,
+                tariff_id=eff_tariff,
+                presentation_codbar=presentation_codbar,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "success": False,
+                "error": (
+                    f"pricing lookup failed ({type(exc).__name__}: {exc}); "
+                    "line not added"
+                ),
+            }
+    if pricing:
+        body.update(pricing)
+
+    if unit_price is not None:
+        body["PRECIO_BRUTO_EMPAQUE"] = unit_price
+        body["PRECIO_ACORDADO"] = True
+
+    if eff_bod is not None:
+        body["INV_BODEGA"] = eff_bod
+    if eff_emp is not None:
+        body["EMP"] = eff_emp
+
+    try:
+        created = await client.post("VENT_ORDEN_MOVIMIENTOS", body)
+    except VelneoError as exc:
+        return {
+            "success": False,
+            "error": f"velneo {exc.status} {exc.message}",
+        }
+
+    return {
+        "success": True,
+        "order_id": order_id,
+        "line": created,
+        "line_count": len(existing) + 1,
+        "num_linea": next_num,
+        "applied": {
+            "company_id": eff_emp,
+            "warehouse_id": eff_bod,
+            "tariff_id": eff_tariff,
+            "presentation_codbar": pricing.get("COD_BAR") if pricing else None,
+        },
+    }
+
+
+async def update_quotation_line(
+    client: VelneoClient,
+    *,
+    line_id: int,
+    quantity: float | None = None,
+    unit_price: float | None = None,
+) -> dict[str, Any]:
+    """Update an existing quotation line (canonical odoo name).
+
+    The niko_saas API key on Velneo does not currently grant PATCH/PUT
+    on VENT_ORDEN_MOVIMIENTOS (verified 405). Returns the verbatim
+    not-supported-yet envelope the LLM is trained to forward to the
+    customer ("pídele a un asesor humano que modifique la línea desde
+    el ERP"), mirroring the update_partner stub. Lights up
+    transparently when an admin grants the method on the API key —
+    no code change needed beyond removing this guard.
+    """
+    _ = (client, line_id, quantity, unit_price)
+    return {
+        "success": False,
+        "error_code": "not_supported_yet",
+        "message": (
+            "La modificación de líneas de cotización vía API no está "
+            "habilitada todavía para Mepriga (API key niko_saas sin "
+            "permiso PATCH en VENT_ORDEN_MOVIMIENTOS). Por ahora, "
+            "borra la cotización con cancel_quotation y crea una nueva, "
+            "o pídele a un asesor que ajuste la línea desde Theos."
+        ),
+    }
+
+
+async def remove_quotation_line(
+    client: VelneoClient,
+    *,
+    line_id: int,
+) -> dict[str, Any]:
+    """Remove a quotation line (canonical odoo name).
+
+    Same situation as :func:`update_quotation_line`: the niko_saas API
+    key does not currently grant DELETE on VENT_ORDEN_MOVIMIENTOS
+    (verified 405). Returns a not-supported-yet envelope so the LLM
+    surfaces an honest message instead of pretending the line was
+    removed.
+    """
+    _ = (client, line_id)
+    return {
+        "success": False,
+        "error_code": "not_supported_yet",
+        "message": (
+            "El borrado de líneas de cotización vía API no está "
+            "habilitado todavía para Mepriga (API key niko_saas sin "
+            "permiso DELETE en VENT_ORDEN_MOVIMIENTOS). Por ahora, "
+            "borra la cotización con cancel_quotation y crea una nueva, "
+            "o pídele a un asesor que quite la línea desde Theos."
+        ),
     }
