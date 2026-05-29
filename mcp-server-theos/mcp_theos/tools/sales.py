@@ -25,6 +25,45 @@ _MOV_FIELDS = [
 ]
 
 
+def _resolve_default_warehouse(cfg: Any) -> dict[str, Any] | None:
+    """Pick the sellable warehouse to default the quotation to.
+
+    Reads ``tenants.erp_api_extra.warehouses`` (loaded into ``cfg.extra``
+    by the tenant resolver). Each entry has ``id``, ``suc``, ``emp`` and
+    optionally ``default: true``.
+
+    Order of preference:
+      1. the entry flagged ``default: true``;
+      2. otherwise the first entry as listed.
+
+    Future upgrade — once the API key gets GET on EXISTENCIAS, this
+    helper should aggregate stock across the lines and return the
+    bodega with the highest total. The picker contract (returns one
+    of the configured entries) stays the same, so callers don't
+    change.
+    """
+    if cfg is None:
+        return None
+    extra = getattr(cfg, "extra", None) or {}
+    warehouses = extra.get("warehouses") if isinstance(extra, dict) else None
+    if not warehouses:
+        return None
+    for w in warehouses:
+        if isinstance(w, dict) and w.get("default"):
+            return w
+    first = warehouses[0]
+    return first if isinstance(first, dict) else None
+
+
+def _resolve_quotation_defaults(cfg: Any) -> dict[str, Any]:
+    """Return ``tenants.erp_api_extra.quotation_defaults`` (or empty)."""
+    if cfg is None:
+        return {}
+    extra = getattr(cfg, "extra", None) or {}
+    qd = extra.get("quotation_defaults") if isinstance(extra, dict) else None
+    return qd if isinstance(qd, dict) else {}
+
+
 async def create_quotation(
     client: VelneoClient,
     *,
@@ -47,17 +86,50 @@ async def create_quotation(
     if not lines:
         return {"success": False, "error": "lines must be non-empty"}
 
+    # If the caller didn't pick a warehouse / company / branch, fall back
+    # to the tenant's default sellable warehouse (configured in
+    # ``tenants.erp_api_extra.warehouses``). Without these three the
+    # Velneo header lands without a fiscal context and the order can't
+    # be turned into an invoice from the cashier's session.
+    cfg = getattr(client, "cfg", None)
+    defaults = None
+    if warehouse_id is None and company_id is None and branch_id is None:
+        defaults = _resolve_default_warehouse(cfg)
+    qdefaults = _resolve_quotation_defaults(cfg)
+
     header: dict[str, Any] = {"ENT_ERP_CLI": client_id}
     if salesperson_id is not None:
         header["VENDEDOR"] = salesperson_id
-    if company_id is not None:
-        header["EMP"] = company_id
-    if branch_id is not None:
-        header["SUC"] = branch_id
-    if tariff_id is not None:
-        header["INV_TARIFAS"] = tariff_id
-    if warehouse_id is not None:
-        header["INV_BODEGA"] = warehouse_id
+
+    eff_emp = company_id if company_id is not None else (defaults or {}).get("emp")
+    eff_suc = branch_id if branch_id is not None else (defaults or {}).get("suc")
+    eff_bod = warehouse_id if warehouse_id is not None else (defaults or {}).get("id")
+    eff_tariff = tariff_id if tariff_id is not None else qdefaults.get("tariff_id")
+
+    if eff_emp is not None:
+        header["EMP"] = eff_emp
+    if eff_suc is not None:
+        header["SUC"] = eff_suc
+    if eff_tariff is not None:
+        header["INV_TARIFAS"] = eff_tariff
+    if eff_bod is not None:
+        header["INV_BODEGA"] = eff_bod
+
+    # Payment + fiscal-customer defaults — only filled when the tenant
+    # config provides them; never invented from thin air. Callers can
+    # still override by passing custom header fields via the future
+    # ``header_extra`` arg (not exposed yet).
+    pay_method = qdefaults.get("payment_method_id")
+    if pay_method is not None:
+        header["CAJ_FORM_PAGO1"] = pay_method
+        # PORC + NRO_PAGOS travel together: a single-installment plan
+        # (the only one the Niko bot will ever issue) is "100% en 1 pago".
+        header["PORC_PAGO1"] = qdefaults.get("payment_percent", 100)
+        header["NRO_PAGOS"] = qdefaults.get("payment_count", 1)
+    vte = qdefaults.get("vta_tipo_ent")
+    if vte is not None:
+        header["VTA_TIPO_ENT"] = vte
+
     if notes:
         header["NAME"] = notes.strip()[:80]
 
@@ -91,8 +163,16 @@ async def create_quotation(
             body["PVP"] = line.get("unit_price") or line.get("PVP")
         if line.get("factor") is not None:
             body["FACTOR"] = line["factor"]
-        if line.get("warehouse_id") is not None:
-            body["INV_BODEGA"] = line["warehouse_id"]
+        line_wh = line.get("warehouse_id")
+        if line_wh is None:
+            line_wh = eff_bod
+        if line_wh is not None:
+            body["INV_BODEGA"] = line_wh
+        # Each VENT_ORDEN_MOVIMIENTOS row also carries EMP — Velneo
+        # denormalises it from the header so the cashier's reports
+        # roll up by company without joining back to the order.
+        if eff_emp is not None:
+            body["EMP"] = eff_emp
         try:
             created = await client.post("VENT_ORDEN_MOVIMIENTOS", body)
             created_lines.append(created)
@@ -106,6 +186,15 @@ async def create_quotation(
         "lines_created": len(created_lines),
         "lines": created_lines,
         "errors": line_errors,
+        "applied": {
+            "company_id": eff_emp,
+            "branch_id": eff_suc,
+            "warehouse_id": eff_bod,
+            "tariff_id": eff_tariff,
+            "payment_method_id": pay_method,
+            "vta_tipo_ent": vte,
+            "warehouse_source": "explicit" if defaults is None else "tenant_default",
+        },
     }
 
 
