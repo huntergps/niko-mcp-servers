@@ -143,6 +143,10 @@ _KEEP_KEYS = frozenset({
     "EMP", "SUC",
     "CLT_ENT",
     "NAME",  # descriptor textual de la factura: id|#bill-id FAC-VTA estab-pto-sec cif-NOMBRE_CLIENTE
+    # Payment-type discriminator. True = contado (cobrado en el acto:
+    # efectivo, tarjeta, transferencia), False = venta a crédito.
+    # Available natively on every line — no header join required.
+    "CONTADO",
 })
 
 
@@ -1290,7 +1294,8 @@ def _write_detalle(
         "Costo Linea", "Precio Neto Linea", "IVA Linea",
         "Bodega", "Familia Principal", "SubFamilia",
         "Id Venta", "Establecimiento", "Pto Emision", "Secuencia",
-        "Fecha", "Fecha Hora", "Cliente", "CIF", "MES", "DIA", "AÑO",
+        "Fecha", "Fecha Hora", "Cliente", "CIF", "Forma Pago",
+        "MES", "DIA", "AÑO",
         # Auxiliary columns for the DASHBOARD sheet. Filled with Excel
         # formulas so the user can pivot/filter without re-running the
         # report. Refer to col J (PVP Linea), T (Id Venta), X (Fecha),
@@ -1299,14 +1304,15 @@ def _write_detalle(
     ]
 
     # Column widths — must be set BEFORE appending any row in write_only mode.
-    # 34 columns (matches headers above).
+    # 35 columns (matches headers above).
     widths = [16, 12, 34, 8, 8, 10,
               12, 10, 10, 12,
               12, 12, 10,
               12, 14, 10,
               22, 22, 22,
               10, 6, 6, 10,
-              12, 19, 28, 16, 6, 6, 6,
+              12, 19, 28, 16, 10,
+              6, 6, 6,
               6, 12, 9, 8]
     for j, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(j)].width = w
@@ -1384,6 +1390,15 @@ def _write_detalle(
 
         fecha_hora_str = _fmt_datetime_es(r.get("FECHA_CONTA"))
 
+        # Forma de pago — campo ``contado`` viene en cada línea (True =
+        # cobrado en el acto, False = venta a crédito). El detalle más
+        # fino (efectivo vs tarjeta vs cheque) está en la cabecera y
+        # requeriría join — no se incluye en esta versión.
+        contado_raw = r.get("CONTADO")
+        forma_pago = "Contado" if contado_raw is True else (
+            "Crédito" if contado_raw is False else ""
+        )
+
         familia_name = familia_names.get(fam_id, "")
         values = [
             r.get("COD_BAR") or "",
@@ -1413,6 +1428,7 @@ def _write_detalle(
             fecha_hora_str,
             cliente,
             cif,
+            forma_pago,
             int(mm) if mm else "",
             int(dd) if dd else "",
             int(yyyy) if yyyy else "",
@@ -1448,10 +1464,12 @@ def _write_detalle(
         )
         # HoraTxt: hora operativa extendida. Si Fecha Hora cayó en un día
         # posterior a Fecha (cierre pasada la medianoche), suma 24 a la
-        # hora para que se ordene linealmente después de 23h00.
+        # hora para que se ordene linealmente después de 23h00. La columna
+        # ``Hora`` (referenciada por su letra de columna) se desplazó a AF
+        # al introducir ``Forma Pago``.
         out_row.append(
             f'=IF(LEFT(Y{row_n},10)<>X{row_n},'
-            f'TEXT(AE{row_n}+24,"00"),TEXT(AE{row_n},"00"))&"h00"'
+            f'TEXT(AF{row_n}+24,"00"),TEXT(AF{row_n},"00"))&"h00"'
         )
         ws.append(out_row)
         data_row_idx += 1
@@ -1518,9 +1536,13 @@ async def summarize_sales(
         lambda: {"pvp": 0.0, "facturas": set(), "lineas": 0})
     by_cliente: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"pvp": 0.0, "facturas": set(), "lineas": 0, "cif": ""})
+    by_forma_pago: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"pvp": 0.0, "facturas": set(), "lineas": 0})
     facturas_all: set[int] = set()
     total_pvp = 0.0
     total_neto = 0.0
+    pvp_contado = 0.0
+    pvp_credito = 0.0
     n_lineas = 0
     total_count = 0
     page_num = 1
@@ -1639,6 +1661,22 @@ async def summarize_sales(
             if inv_id:
                 bc["facturas"].add(inv_id)
 
+            # Forma de pago — booleano CONTADO. True=contado, False=crédito.
+            contado_raw = uk.get("CONTADO")
+            if contado_raw is True:
+                forma = "Contado"
+                pvp_contado += pvp
+            elif contado_raw is False:
+                forma = "Crédito"
+                pvp_credito += pvp
+            else:
+                forma = "(sin dato)"
+            bfp = by_forma_pago[forma]
+            bfp["pvp"] += pvp
+            bfp["lineas"] += 1
+            if inv_id:
+                bfp["facturas"].add(inv_id)
+
         if n_lineas >= max_rows:
             break
         if len(page_rows) < PAGE_SIZE:
@@ -1664,6 +1702,10 @@ async def summarize_sales(
             "n_lineas": n_lineas,
             "n_facturas": n_facturas,
             "ticket_promedio_pvp": ticket,
+            "pvp_contado": round(pvp_contado, 2),
+            "pvp_credito": round(pvp_credito, 2),
+            "pct_contado": round(100 * pvp_contado / total_pvp, 1) if total_pvp else 0.0,
+            "pct_credito": round(100 * pvp_credito / total_pvp, 1) if total_pvp else 0.0,
         },
         "por_hora": [
             {"hora": h, "pvp": round(d["pvp"], 2),
@@ -1692,6 +1734,12 @@ async def summarize_sales(
              "n_facturas": len(d["facturas"]), "n_lineas": d["lineas"]}
             for c, d in sorted(by_cliente.items(),
                                 key=lambda x: -x[1]["pvp"])[:top_n_clientes]
+        ],
+        "por_forma_pago": [
+            {"forma": f, "pvp": round(d["pvp"], 2),
+             "pct": round(100 * d["pvp"] / total_pvp, 1) if total_pvp else 0.0,
+             "n_facturas": len(d["facturas"]), "n_lineas": d["lineas"]}
+            for f, d in sorted(by_forma_pago.items(), key=lambda x: -x[1]["pvp"])
         ],
     }
 
