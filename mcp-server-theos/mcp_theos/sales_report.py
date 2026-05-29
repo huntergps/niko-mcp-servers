@@ -33,8 +33,52 @@ from datetime import date, datetime
 from typing import Any
 
 from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
+
+# ---------------------------------------------------------------------------
+# Small helper for write_only mode — every styled cell needs a fresh
+# WriteOnlyCell instance bound to the sheet. We use this helper everywhere
+# so the call sites stay readable.
+# ---------------------------------------------------------------------------
+
+def _cell(ws, value=None, font=None, fill=None, alignment=None,
+          number_format=None, border=None):
+    """Build a styled ``WriteOnlyCell`` for ``ws``.
+
+    ``write_only`` worksheets can't be addressed via ``ws.cell(row, col)``
+    — rows are appended in order and each cell must be a fresh
+    ``WriteOnlyCell`` (so the styles aren't shared accidentally). This
+    wrapper keeps the call sites in :func:`_write_informe` /
+    :func:`_write_detalle` short.
+    """
+    c = WriteOnlyCell(ws, value=value)
+    if font:
+        c.font = font
+    if fill:
+        c.fill = fill
+    if alignment:
+        c.alignment = alignment
+    if number_format:
+        c.number_format = number_format
+    if border:
+        c.border = border
+    return c
+
+
+def _merge(ws, *, start_row: int, start_column: int,
+           end_row: int, end_column: int) -> None:
+    """Add a merge range to a write_only worksheet.
+
+    The normal :meth:`Worksheet.merge_cells` helper doesn't exist on
+    :class:`WriteOnlyWorksheet`. Instead the merged range goes directly
+    onto :attr:`ws.merged_cells` (a ``MultiCellRange``).
+    """
+    a = f"{get_column_letter(start_column)}{start_row}"
+    b = f"{get_column_letter(end_column)}{end_row}"
+    ws.merged_cells.add(f"{a}:{b}")
 
 from mcp_theos.velneo_http import VelneoClient, VelneoError, call_proceso_or_message
 
@@ -350,28 +394,44 @@ def _write_charts_data(
       Block 2 (cols E..F)           — Familia × Total.
       Block 3 (cols H..I)           — Bodega × Venta.
     """
-    # Block 1: Familia × Bodega
-    ws.cell(1, 1, "Familia")
+    # Write_only mode: rows must be appended in order. We assemble each
+    # row across the 3 side-by-side blocks (cols A, B..1+n_bodegas, gap,
+    # E, F, gap, H, I) and append once per row.
+    #
+    # Total cols used: max(1 + n_bodegas, 6, 9) = 9 (assuming n_bodegas<=8).
+    n_bodegas = len(bodegas)
+    max_col = max(1 + n_bodegas, 6, 9)
+    n_rows = max(1 + len(familias), 1 + n_bodegas)
+
+    # Header row
+    hdr = [None] * max_col
+    hdr[0] = "Familia"
     for j, bod in enumerate(bodegas, start=2):
-        ws.cell(1, j, bod)
-    for i, fam in enumerate(familias, start=2):
-        ws.cell(i, 1, fam)
-        for j, bod in enumerate(bodegas, start=2):
-            ws.cell(i, j, fam_x_bod.get(fam, {}).get(bod, 0))
+        hdr[j - 1] = bod
+    hdr[4] = "Familia"  # col E
+    hdr[5] = "Total"    # col F
+    hdr[7] = "Bodega"   # col H
+    hdr[8] = "Venta"    # col I
+    ws.append(hdr)
 
-    # Block 2: Familia × Total (cols E:F)
-    ws.cell(1, 5, "Familia")
-    ws.cell(1, 6, "Total")
-    for i, fam in enumerate(familias, start=2):
-        ws.cell(i, 5, fam)
-        ws.cell(i, 6, sum(fam_x_bod.get(fam, {}).get(b, 0) for b in bodegas))
-
-    # Block 3: Bodega × Venta (cols H:I)
-    ws.cell(1, 8, "Bodega")
-    ws.cell(1, 9, "Venta")
-    for i, bod in enumerate(bodegas, start=2):
-        ws.cell(i, 8, bod)
-        ws.cell(i, 9, bod_totals.get(bod, 0))
+    # Data rows — one row per index ``i`` from 0 to n_rows-2 (i.e. body).
+    # Each body row simultaneously holds: familia row in cols A..1+n_bodegas
+    # AND cols E-F (if i < len(familias)), AND bodega row in cols H-I
+    # (if i < n_bodegas).
+    for i in range(n_rows - 1):
+        row = [None] * max_col
+        if i < len(familias):
+            fam = familias[i]
+            row[0] = fam
+            for j, bod in enumerate(bodegas, start=2):
+                row[j - 1] = fam_x_bod.get(fam, {}).get(bod, 0)
+            row[4] = fam
+            row[5] = sum(fam_x_bod.get(fam, {}).get(b, 0) for b in bodegas)
+        if i < n_bodegas:
+            bod = bodegas[i]
+            row[7] = bod
+            row[8] = bod_totals.get(bod, 0)
+        ws.append(row)
 
     ws.sheet_state = "hidden"
 
@@ -553,6 +613,10 @@ def _write_informe(
 ) -> int:
     """Write the INFORME dashboard sheet using the corporate palette.
 
+    Uses openpyxl's ``write_only`` API throughout: rows are appended in
+    order via ``ws.append([list of WriteOnlyCells])``, column widths and
+    row heights and merged ranges are set before the row is written.
+
     Layout (top-down):
       Row 1     blank top margin
       Row 2-3   MEPRIGA banner (primary blue, white bold, 22pt)
@@ -578,7 +642,6 @@ def _write_informe(
     subtitle_font = Font(bold=True, size=12, color=PALETTE_WHITE, name="Calibri")
     caption_font = Font(size=11, color=PALETTE_SUBTLE, name="Calibri", italic=True)
     kpi_label_font = Font(bold=True, size=11, color=PALETTE_WHITE, name="Calibri")
-    kpi_value_font = Font(bold=True, size=20, color=PALETTE_PRIMARY, name="Calibri")
     kpi_value_font_total = Font(bold=True, size=20, color=PALETTE_WHITE, name="Calibri")
     section_font = Font(bold=True, size=13, color=PALETTE_PRIMARY, name="Calibri")
     hdr_font_white = Font(bold=True, size=11, color=PALETTE_WHITE, name="Calibri")
@@ -586,52 +649,80 @@ def _write_informe(
     date_marker_font = Font(bold=True, size=11, color=PALETTE_SECONDARY, name="Calibri")
     subtotal_font = Font(bold=True, size=11, color=PALETTE_WHITE, name="Calibri")
     grand_font = Font(bold=True, size=12, color=PALETTE_WHITE, name="Calibri")
+    bodega_total_font = Font(bold=True, size=11, color=PALETTE_PRIMARY, name="Calibri")
 
     thin = Side(border_style="thin", color="D0D7DE")
     box = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     n_bodegas = len(bodegas)
 
-    # ------------------------------------------------------------------
-    # Layout columns — matches the operator's reference template.
-    # ------------------------------------------------------------------
-    #
-    #   col A    -> 2-char margin
-    #   col B    -> Familia Principal label + family names (single col)
-    #   col C    -> visual extension of the family column (gap in the
-    #               body; coloured band in the header row so the table
-    #               header looks continuous)
-    #   col D..E -> ALMACEN, BODEGA (1 col each)
-    #   col F    -> TOTAL (1 col)
-    #
-    # For n_bodegas=2 (Mepriga's case): 5 visible cols (B..F).
-    #
-    # FAMILY_LABEL_COL = 2 (B)  — family text
-    # FAMILY_EXTRA_COL = 3 (C)  — header band extension; gap in body
-    # value_start_col  = 4 (D)  — first bodega
-    # total_col        = D + n_bodegas
+    # Layout columns (see module docstring above). For n_bodegas=2:
+    #   A    margin (2 chars)
+    #   B    Familia Principal label + family names
+    #   C    visual extension of family column (header band + zebra)
+    #   D-E  bodega values (ALMACEN, BODEGA)
+    #   F    TOTAL
     FAMILY_LABEL_COL = 2
     FAMILY_EXTRA_COL = 3
     value_start_col = 4
     total_col = value_start_col + n_bodegas
 
+    # In write_only mode, an ``empty`` row is a list of total_col Nones —
+    # the indexing below is 0-based against this list.
+    def _empty_row() -> list:
+        return [None] * total_col
+
+    # Column dimensions & sheet view — must be set BEFORE any append.
+    ws.column_dimensions["A"].width = 2
+    ws.column_dimensions[get_column_letter(FAMILY_LABEL_COL)].width = 28
+    ws.column_dimensions[get_column_letter(FAMILY_EXTRA_COL)].width = 16
+    for j in range(value_start_col, total_col + 1):
+        ws.column_dimensions[get_column_letter(j)].width = 22
+    ws.sheet_view.showGridLines = False
+
+    # Aggregate per-bodega and grand totals from the pivot table — used
+    # by both the KPI cards and the grand-total row at the bottom.
+    per_bodega_total: dict[str, float] = defaultdict(float)
+    grand_total_all = 0.0
+    for (_fecha, _fam), bodega_vals in table.items():
+        for bod, v in bodega_vals.items():
+            per_bodega_total[bod] += v
+            grand_total_all += v
+
     # ------------------------------------------------------------------
-    # 1. Banner row 2 (full width — merge B:total_col)
+    # Row 1: blank top margin
     # ------------------------------------------------------------------
-    ws.merge_cells(start_row=2, start_column=2, end_row=2, end_column=total_col)
-    banner = ws.cell(2, 2, f"MEPRIGA — {company_name}")
-    banner.font = title_font
-    banner.fill = primary_fill
-    banner.alignment = Alignment(horizontal="center", vertical="center")
+    ws.append(_empty_row())
+
+    # ------------------------------------------------------------------
+    # Row 2: MEPRIGA banner (merged B..total_col)
+    # ------------------------------------------------------------------
     ws.row_dimensions[2].height = 38
+    _merge(ws, start_row=2, start_column=2, end_row=2, end_column=total_col)
+    row_data = _empty_row()
+    row_data[FAMILY_LABEL_COL - 1] = _cell(
+        ws, value=f"MEPRIGA — {company_name}",
+        font=title_font, fill=primary_fill,
+        alignment=Alignment(horizontal="center", vertical="center"),
+    )
+    ws.append(row_data)
 
-    ws.merge_cells(start_row=3, start_column=2, end_row=3, end_column=total_col)
-    sub = ws.cell(3, 2, "Reporte de Ventas Diarias")
-    sub.font = subtitle_font
-    sub.fill = secondary_fill
-    sub.alignment = Alignment(horizontal="center", vertical="center")
+    # ------------------------------------------------------------------
+    # Row 3: subtitle
+    # ------------------------------------------------------------------
     ws.row_dimensions[3].height = 24
+    _merge(ws, start_row=3, start_column=2, end_row=3, end_column=total_col)
+    row_data = _empty_row()
+    row_data[FAMILY_LABEL_COL - 1] = _cell(
+        ws, value="Reporte de Ventas Diarias",
+        font=subtitle_font, fill=secondary_fill,
+        alignment=Alignment(horizontal="center", vertical="center"),
+    )
+    ws.append(row_data)
 
+    # ------------------------------------------------------------------
+    # Row 4: period caption
+    # ------------------------------------------------------------------
     if fechas:
         if len(fechas) == 1:
             periodo = f"Período: {_fmt_date_es(fechas[0])}"
@@ -639,94 +730,121 @@ def _write_informe(
             periodo = f"Período: {_fmt_date_es(fechas[0])} a {_fmt_date_es(fechas[-1])}"
     else:
         periodo = "Período: —"
-    ws.merge_cells(start_row=4, start_column=2, end_row=4, end_column=total_col)
-    cap = ws.cell(4, 2, periodo)
-    cap.font = caption_font
-    cap.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[4].height = 18
+    _merge(ws, start_row=4, start_column=2, end_row=4, end_column=total_col)
+    row_data = _empty_row()
+    row_data[FAMILY_LABEL_COL - 1] = _cell(
+        ws, value=periodo,
+        font=caption_font,
+        alignment=Alignment(horizontal="center", vertical="center"),
+    )
+    ws.append(row_data)
 
     # ------------------------------------------------------------------
-    # 2. KPI cards row 6 (one per bodega + total general)
+    # Row 5: blank gutter
     # ------------------------------------------------------------------
-    KPI_ROW_LABEL = 6
-    KPI_ROW_VALUE = 7
-    ws.row_dimensions[KPI_ROW_LABEL].height = 22
-    ws.row_dimensions[KPI_ROW_VALUE].height = 32
+    ws.append(_empty_row())
 
-    # Compute per-bodega and grand totals up front (needed by both KPIs
-    # and the table grand-total row later).
-    per_bodega_total: dict[str, float] = defaultdict(float)
-    grand_total_all = 0.0
-    for (fecha, fam), bodega_vals in table.items():
-        for bod, v in bodega_vals.items():
-            per_bodega_total[bod] += v
-            grand_total_all += v
-
-    # Layout: KPI cards mirror the operator's reference. Each bodega
-    # card spans 2 cols (label + value text fits comfortably). TOTAL
-    # GENERAL takes 1 col — intentionally narrower so it aligns with
-    # the TOTAL column of the table below. For n_bodegas=2 that's:
-    #   ALMACEN -> cols 2..3 (B..C)
-    #   BODEGA  -> cols 4..5 (D..E)
-    #   TOTAL   -> col 6     (F)
-    # which exactly matches the FAMILY_LABEL + FAMILY_EXTRA + bodegas +
-    # TOTAL layout of the table.
+    # ------------------------------------------------------------------
+    # KPI cards (rows 6-7)
+    # ------------------------------------------------------------------
+    # For n_bodegas=2, layout is:
+    #   ALMACEN   merged B-C
+    #   BODEGA    merged D-E
+    #   TOTAL     col F (single, intentionally narrower)
     cards = [(bod, per_bodega_total.get(bod, 0.0), _bodega_color(bod)) for bod in bodegas]
     cards.append(("TOTAL GENERAL", grand_total_all, PALETTE_PRIMARY))
-
     spans = [2] * n_bodegas + [1]
 
+    # Row 6: labels
+    ws.row_dimensions[6].height = 22
+    row_data = _empty_row()
+    col = 2
+    for (label, _value, color), span in zip(cards, spans):
+        end_col = col + span - 1
+        if span > 1:
+            _merge(ws, start_row=6, start_column=col, end_row=6, end_column=end_col)
+        row_data[col - 1] = _cell(
+            ws, value=label,
+            font=kpi_label_font,
+            fill=PatternFill("solid", fgColor=color),
+            alignment=center,
+        )
+        col = end_col + 1
+    ws.append(row_data)
+
+    # Row 7: values
+    ws.row_dimensions[7].height = 32
+    row_data = _empty_row()
     col = 2
     for (label, value, color), span in zip(cards, spans):
         end_col = col + span - 1
-        # Label band
-        ws.merge_cells(start_row=KPI_ROW_LABEL, start_column=col,
-                       end_row=KPI_ROW_LABEL, end_column=end_col)
-        lcell = ws.cell(KPI_ROW_LABEL, col, label)
-        lcell.font = kpi_label_font
-        lcell.fill = PatternFill("solid", fgColor=color)
-        lcell.alignment = center
-        # Value band
-        ws.merge_cells(start_row=KPI_ROW_VALUE, start_column=col,
-                       end_row=KPI_ROW_VALUE, end_column=end_col)
-        vcell = ws.cell(KPI_ROW_VALUE, col, value)
-        vcell.font = (kpi_value_font_total if label == "TOTAL GENERAL"
-                      else Font(bold=True, size=20, color=color, name="Calibri"))
+        if span > 1:
+            _merge(ws, start_row=7, start_column=col, end_row=7, end_column=end_col)
         if label == "TOTAL GENERAL":
-            vcell.fill = PatternFill("solid", fgColor=color)
-        vcell.alignment = Alignment(horizontal="center", vertical="center")
-        vcell.number_format = fmt
-        vcell.border = box
+            vfont = kpi_value_font_total
+            vfill = PatternFill("solid", fgColor=color)
+        else:
+            vfont = Font(bold=True, size=20, color=color, name="Calibri")
+            vfill = None
+        row_data[col - 1] = _cell(
+            ws, value=value,
+            font=vfont, fill=vfill,
+            alignment=Alignment(horizontal="center", vertical="center"),
+            number_format=fmt, border=box,
+        )
         col = end_col + 1
+    ws.append(row_data)
 
     # ------------------------------------------------------------------
-    # 3. Pivot table — Familia × Bodega with date subtotals
+    # Rows 8-9: blank gutters before the pivot table
+    # ------------------------------------------------------------------
+    ws.append(_empty_row())
+    ws.append(_empty_row())
+
+    # ------------------------------------------------------------------
+    # Row 10: section title "Ventas por Familia y Bodega"
     # ------------------------------------------------------------------
     SECTION_ROW = 10
-    ws.merge_cells(start_row=SECTION_ROW, start_column=2,
-                   end_row=SECTION_ROW, end_column=total_col)
-    sec = ws.cell(SECTION_ROW, 2, "Ventas por Familia y Bodega")
-    sec.font = section_font
-    sec.alignment = left
     ws.row_dimensions[SECTION_ROW].height = 22
+    _merge(ws, start_row=SECTION_ROW, start_column=2,
+                   end_row=SECTION_ROW, end_column=total_col)
+    row_data = _empty_row()
+    row_data[FAMILY_LABEL_COL - 1] = _cell(
+        ws, value="Ventas por Familia y Bodega",
+        font=section_font, alignment=left,
+    )
+    ws.append(row_data)
 
-    HDR_ROW = SECTION_ROW + 1
+    # ------------------------------------------------------------------
+    # Row 11: table header
+    # ------------------------------------------------------------------
+    HDR_ROW = 11
     ws.row_dimensions[HDR_ROW].height = 22
-    # "Familia Principal" header in col B only (matches reference).
-    # Col C is part of the header band but empty — fills with the same
-    # azul oscuro so the band looks continuous across the table.
-    h = ws.cell(HDR_ROW, FAMILY_LABEL_COL, "Familia Principal")
-    h.font = hdr_font_white; h.fill = table_hdr_fill; h.alignment = left
-    h.border = box
-    ws.cell(HDR_ROW, FAMILY_EXTRA_COL).fill = table_hdr_fill
+    row_data = _empty_row()
+    row_data[FAMILY_LABEL_COL - 1] = _cell(
+        ws, value="Familia Principal",
+        font=hdr_font_white, fill=table_hdr_fill,
+        alignment=left, border=box,
+    )
+    row_data[FAMILY_EXTRA_COL - 1] = _cell(ws, fill=table_hdr_fill)
     for j, bod in enumerate(bodegas, start=value_start_col):
-        c = ws.cell(HDR_ROW, j, bod)
-        c.font = hdr_font_white; c.fill = table_hdr_fill; c.alignment = center
-        c.border = box
-    ct = ws.cell(HDR_ROW, total_col, "TOTAL")
-    ct.font = hdr_font_white; ct.fill = table_hdr_fill; ct.alignment = center
-    ct.border = box
+        row_data[j - 1] = _cell(
+            ws, value=bod,
+            font=hdr_font_white, fill=table_hdr_fill,
+            alignment=center, border=box,
+        )
+    row_data[total_col - 1] = _cell(
+        ws, value="TOTAL",
+        font=hdr_font_white, fill=table_hdr_fill,
+        alignment=center, border=box,
+    )
+    ws.append(row_data)
 
+    # ------------------------------------------------------------------
+    # Rows 12+: family rows (with optional per-fecha date markers and
+    # subtotals when the range spans multiple days)
+    # ------------------------------------------------------------------
     row = HDR_ROW + 1
     grand_by_bod: dict[str, float] = defaultdict(float)
     grand_total_recompute = 0.0
@@ -734,12 +852,16 @@ def _write_informe(
 
     for fecha in fechas:
         if use_date_grouping:
-            # Date marker row
-            ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=total_col)
-            dm = ws.cell(row, 2, _fmt_date_es(fecha))
-            dm.font = date_marker_font
-            dm.alignment = left
+            # Date marker row (merged label across all visible cols).
             ws.row_dimensions[row].height = 20
+            _merge(ws, start_row=row, start_column=2,
+                           end_row=row, end_column=total_col)
+            row_data = _empty_row()
+            row_data[FAMILY_LABEL_COL - 1] = _cell(
+                ws, value=_fmt_date_es(fecha),
+                font=date_marker_font, alignment=left,
+            )
+            ws.append(row_data)
             row += 1
 
         familias = sorted({fam for (f, fam) in table if f == fecha})
@@ -748,92 +870,88 @@ def _write_informe(
 
         for idx, fam in enumerate(familias):
             zebra = (idx % 2 == 1)
-            # Familia name in col B only. Col C is empty (acts as visual
-            # gap before the value columns). Zebra fill covers B+C so the
-            # banding spans the full family-column area.
-            fc = ws.cell(row, FAMILY_LABEL_COL, fam)
-            fc.font = body_font
-            fc.alignment = left
+            row_data = _empty_row()
+            row_data[FAMILY_LABEL_COL - 1] = _cell(
+                ws, value=fam,
+                font=body_font, alignment=left,
+                fill=zebra_fill if zebra else None,
+            )
             if zebra:
-                ws.cell(row, FAMILY_LABEL_COL).fill = zebra_fill
-                ws.cell(row, FAMILY_EXTRA_COL).fill = zebra_fill
+                row_data[FAMILY_EXTRA_COL - 1] = _cell(ws, fill=zebra_fill)
             row_total = 0.0
             for j, bod in enumerate(bodegas, start=value_start_col):
                 v = table[(fecha, fam)].get(bod, 0.0)
-                c = ws.cell(row, j, v if v else None)
-                c.number_format = fmt
-                c.alignment = right
-                if zebra:
-                    c.fill = zebra_fill
+                row_data[j - 1] = _cell(
+                    ws, value=(v if v else None),
+                    alignment=right, number_format=fmt,
+                    fill=zebra_fill if zebra else None,
+                )
                 row_total += v
                 date_by_bod[bod] += v
                 grand_by_bod[bod] += v
-            tc = ws.cell(row, total_col, row_total)
-            tc.number_format = fmt
-            tc.alignment = right
-            tc.font = Font(bold=True, size=11, color=PALETTE_PRIMARY, name="Calibri")
-            tc.fill = total_col_fill
+            row_data[total_col - 1] = _cell(
+                ws, value=row_total,
+                font=bodega_total_font,
+                fill=total_col_fill,
+                alignment=right, number_format=fmt,
+            )
             date_total_all += row_total
             grand_total_recompute += row_total
+            ws.append(row_data)
             row += 1
 
         if use_date_grouping:
-            # Date subtotal row — label merged B-C (consistent with the
-            # grand total row below), values in D..F.
+            # Date subtotal row (label merged B-C; values in D..F).
             ws.row_dimensions[row].height = 22
-            ws.merge_cells(start_row=row, start_column=FAMILY_LABEL_COL,
+            _merge(ws, start_row=row, start_column=FAMILY_LABEL_COL,
                            end_row=row, end_column=FAMILY_EXTRA_COL)
-            stc = ws.cell(row, FAMILY_LABEL_COL, f"Subtotal {_fmt_date_es(fecha)}")
-            stc.font = subtotal_font; stc.fill = subtotal_fill; stc.alignment = left
-            ws.cell(row, FAMILY_EXTRA_COL).fill = subtotal_fill
+            row_data = _empty_row()
+            row_data[FAMILY_LABEL_COL - 1] = _cell(
+                ws, value=f"Subtotal {_fmt_date_es(fecha)}",
+                font=subtotal_font, fill=subtotal_fill, alignment=left,
+            )
+            row_data[FAMILY_EXTRA_COL - 1] = _cell(ws, fill=subtotal_fill)
             for j, bod in enumerate(bodegas, start=value_start_col):
-                c = ws.cell(row, j, date_by_bod[bod])
-                c.number_format = fmt
-                c.font = subtotal_font; c.fill = subtotal_fill; c.alignment = right
-            c = ws.cell(row, total_col, date_total_all)
-            c.number_format = fmt
-            c.font = subtotal_font; c.fill = subtotal_fill; c.alignment = right
+                row_data[j - 1] = _cell(
+                    ws, value=date_by_bod[bod],
+                    font=subtotal_font, fill=subtotal_fill,
+                    alignment=right, number_format=fmt,
+                )
+            row_data[total_col - 1] = _cell(
+                ws, value=date_total_all,
+                font=subtotal_font, fill=subtotal_fill,
+                alignment=right, number_format=fmt,
+            )
+            ws.append(row_data)
             row += 1
 
-    # Grand total row — label merged B-C (matches the reference template
-    # where "TOTAL GENERAL" sits under the family column band), values
-    # in D..F line up with the body rows above.
+    # ------------------------------------------------------------------
+    # Grand total row — label merged B-C, values D..F
+    # ------------------------------------------------------------------
     ws.row_dimensions[row].height = 26
+    _merge(ws, start_row=row, start_column=FAMILY_LABEL_COL,
+                   end_row=row, end_column=FAMILY_EXTRA_COL)
     grand_label_align = Alignment(horizontal="left", vertical="center", indent=1)
     grand_value_align = Alignment(horizontal="right", vertical="center", indent=1)
-    ws.merge_cells(start_row=row, start_column=FAMILY_LABEL_COL,
-                   end_row=row, end_column=FAMILY_EXTRA_COL)
-    gc = ws.cell(row, FAMILY_LABEL_COL, "TOTAL GENERAL")
-    gc.font = grand_font; gc.fill = grand_fill; gc.alignment = grand_label_align
-    ws.cell(row, FAMILY_EXTRA_COL).fill = grand_fill
+    row_data = _empty_row()
+    row_data[FAMILY_LABEL_COL - 1] = _cell(
+        ws, value="TOTAL GENERAL",
+        font=grand_font, fill=grand_fill, alignment=grand_label_align,
+    )
+    row_data[FAMILY_EXTRA_COL - 1] = _cell(ws, fill=grand_fill)
     for j, bod in enumerate(bodegas, start=value_start_col):
-        c = ws.cell(row, j, grand_by_bod[bod])
-        c.number_format = fmt
-        c.font = grand_font; c.fill = grand_fill; c.alignment = grand_value_align
-    c = ws.cell(row, total_col, grand_total_recompute)
-    c.number_format = fmt
-    c.font = grand_font; c.fill = grand_fill; c.alignment = grand_value_align
-
+        row_data[j - 1] = _cell(
+            ws, value=grand_by_bod[bod],
+            font=grand_font, fill=grand_fill,
+            alignment=grand_value_align, number_format=fmt,
+        )
+    row_data[total_col - 1] = _cell(
+        ws, value=grand_total_recompute,
+        font=grand_font, fill=grand_fill,
+        alignment=grand_value_align, number_format=fmt,
+    )
+    ws.append(row_data)
     last_row = row
-
-    # ------------------------------------------------------------------
-    # 4. Column widths — sized so the KPI cards and the table both
-    # line up cleanly:
-    #   A   = 2  (margin)
-    #   B   = 28 (family names + ALMACEN KPI label half)
-    #   C   = 16 (extension of family column; visual gap in body)
-    #   D-E = 22 (value columns + KPI label halves)
-    #   F   = 22 (TOTAL value + single-col TOTAL GENERAL KPI)
-    # With this, B+C (44) ≈ D+E (44), so the ALMACEN and BODEGA KPI
-    # cards visually match in width, and the TOTAL card (col F) is the
-    # narrower third card — matches the reference template exactly.
-    # ------------------------------------------------------------------
-    ws.column_dimensions["A"].width = 2
-    ws.column_dimensions[get_column_letter(FAMILY_LABEL_COL)].width = 28
-    ws.column_dimensions[get_column_letter(FAMILY_EXTRA_COL)].width = 16
-    for j in range(value_start_col, total_col + 1):
-        ws.column_dimensions[get_column_letter(j)].width = 22
-    ws.sheet_view.showGridLines = False
 
     return last_row
 
@@ -859,7 +977,6 @@ def _write_detalle(
     header_fill = PatternFill("solid", fgColor=PALETTE_TABLE_HEADER)
     header_font = Font(bold=True, color=PALETTE_WHITE, name="Calibri", size=11)
     header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    zebra_fill = PatternFill("solid", fgColor=PALETTE_ZEBRA)
 
     headers = [
         "CodBar", "Codigo", "Nombre", "Empaque", "Factor", "Cantidad",
@@ -870,18 +987,34 @@ def _write_detalle(
         "Id Venta", "Establecimiento", "Pto Emision", "Secuencia",
         "Fecha", "Cliente", "MES", "DIA", "AÑO", "Columna1",
     ]
-    for j, h in enumerate(headers, start=1):
-        c = ws.cell(1, j, h)
-        c.font = header_font
-        c.fill = header_fill
-        c.alignment = header_align
+
+    # Column widths — must be set BEFORE appending any row in write_only mode.
+    widths = [16, 12, 34, 8, 8, 10,
+              12, 10, 10, 12,
+              12, 12, 10,
+              12, 14, 10,
+              22, 22, 22,
+              10, 10, 10, 12,
+              12, 28, 6, 6, 6, 16]
+    for j, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(j)].width = w
     ws.row_dimensions[1].height = 32
     ws.freeze_panes = "A2"
 
     money_fmt = MONEY_FORMAT
-    money_cols = {7, 8, 9, 10, 11, 12, 14, 15, 16}  # 1-based
+    money_cols_idx0 = {6, 7, 8, 9, 10, 11, 13, 14, 15}  # 0-based for list indexing
 
-    row_i = 2
+    # Header row — appended via WriteOnlyCell so each header carries the
+    # corporate-blue band + white bold font.
+    hdr_row = [
+        _cell(ws, value=h, font=header_font, fill=header_fill, alignment=header_align)
+        for h in headers
+    ]
+    ws.append(hdr_row)
+
+    # Data rows — appended as plain Python lists, no per-cell styling.
+    # Money columns get their format from a single per-row WriteOnlyCell
+    # (cheaper than full styling on every cell).
     for r in rows:
         pid_raw = r.get("PRODUCTOS")
         try:
@@ -952,27 +1085,15 @@ def _write_detalle(
             int(yyyy) if yyyy else "",
             familia_name,
         ]
-        # Zebra row index: row_i starts at 2 (data starts below header at 1).
-        # Stripe odd offsets so the first data row stays white.
-        is_zebra = ((row_i - 2) % 2 == 1)
-        for j, v in enumerate(values, start=1):
-            c = ws.cell(row_i, j, v)
-            if j in money_cols:
-                c.number_format = money_fmt
-            if is_zebra:
-                c.fill = zebra_fill
-        row_i += 1
-
-    # Auto-ish widths
-    widths = [16, 12, 34, 8, 8, 10,
-              12, 10, 10, 12,
-              12, 12, 10,
-              12, 14, 10,
-              22, 22, 22,
-              10, 10, 10, 12,
-              12, 28, 6, 6, 6, 16]
-    for j, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(j)].width = w
+        # Wrap money columns in WriteOnlyCells so they keep the currency
+        # number format; other columns go as plain Python values (cheap).
+        out_row = []
+        for j, v in enumerate(values):
+            if j in money_cols_idx0:
+                out_row.append(_cell(ws, value=v, number_format=money_fmt))
+            else:
+                out_row.append(v)
+        ws.append(out_row)
 
 
 async def generate(
@@ -1117,9 +1238,12 @@ async def generate(
     else:
         factura_info = {}
 
-    # 3. Build XLSX.
-    wb = Workbook()
-    wb.remove(wb.active)
+    # 3. Build XLSX. ``write_only`` mode streams rows directly to disk
+    # (via the openpyxl internal LXML serializer) instead of building
+    # a Python tree of Cell objects in memory. Required to keep RAM
+    # bounded on rangos grandes — a normal Workbook with 100k×29 cells
+    # consumes ~700 MB; write_only keeps the same workload under ~10 MB.
+    wb = Workbook(write_only=True)
 
     informe_ws = wb.create_sheet("INFORME")
     bodegas, fechas, table = _pivot(rows, bodega_names, familia_names)
