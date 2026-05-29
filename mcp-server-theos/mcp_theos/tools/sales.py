@@ -135,21 +135,29 @@ async def _resolve_line_pricing(
     if not codbar or not inv_presentaciones:
         return None
 
+    # Velneo only indexes INV_PRODUCTOS + INV_TARIFAS on this table —
+    # combining filter[INV_PRESENTACIONES] silently returns zero rows
+    # even when matching data exists (verified empirically). So we
+    # fetch the (product, tariff) tuple and pick the empaque row in
+    # memory. Typical product has 1-3 prices per tariff so the cost
+    # is negligible.
     try:
         precios = await client.get(
             "INV_PRECIOS_PRODUCTO",
             params={
                 "INV_PRODUCTOS": product_id,
-                "INV_PRESENTACIONES": inv_presentaciones,
                 "INV_TARIFAS": tariff_id,
-                "pagesize": 1,
+                "pagesize": 20,
             },
         )
     except VelneoError:
         return None
-    if not precios.rows:
+    p = next(
+        (r for r in precios.rows if r.get("INV_PRESENTACIONES") == inv_presentaciones),
+        None,
+    )
+    if p is None:
         return None
-    p = precios.rows[0]
 
     return {
         "INV_PRESENT_PRODUCTO": codbar,
