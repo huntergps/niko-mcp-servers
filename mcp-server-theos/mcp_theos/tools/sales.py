@@ -64,6 +64,105 @@ def _resolve_quotation_defaults(cfg: Any) -> dict[str, Any]:
     return qd if isinstance(qd, dict) else {}
 
 
+async def _resolve_line_pricing(
+    client: VelneoClient,
+    *,
+    product_id: int,
+    tariff_id: int,
+    presentation_codbar: str | None = None,
+) -> dict[str, Any] | None:
+    """Resolve the FK chain Velneo needs to compute PVP on a line.
+
+    A VENT_ORDEN_MOVIMIENTOS row whose ``PVP`` and ``PVP_LINEA`` columns
+    are *formulas* — Velneo evaluates them from
+    ``COSTO_EMPAQUE × (1 + PORCENTAJE_UTILIDAD1 − PORCENTAJE_DSCTO_VTA)``.
+    The formula needs all four inputs PLUS the FK to ``INV_PRECIOS_PRODUCTO``
+    (the price-tier row) and ``INV_PRESENT_PRODUCTO`` (the codbar of the
+    empaque). Without them every POSTed line lands with PVP=0.
+
+    We don't try to *be* the formula — we look up the same source rows
+    Velneo's own ``AGREGAR_LINEA_ORDEN`` proceso looks up, then let
+    Velneo recompute. Path:
+
+      1. ``INV_PRESENT_PRODUCTO`` filtered by ``INV_PRODUCTOS=product_id``
+         → list of presentations for the product. Each row's ``ID`` IS
+         the codbar string (e.g. ``"01PP"``, ``"01PPQ"``) and carries
+         ``INV_PRESENTACIONES`` (FK to the global empaque dict) +
+         ``FACTOR``.
+      2. Pick the row whose codbar matches ``presentation_codbar`` (LLM
+         override); otherwise default to the one with ``FACTOR=1`` (the
+         unit empaque, what humans usually mean by "1 producto"); else
+         the first listed.
+      3. ``INV_PRECIOS_PRODUCTO`` filtered by
+         ``(INV_PRODUCTOS, INV_PRESENTACIONES, INV_TARIFAS)``
+         → the cost / utility / discount triple for that empaque on the
+         requested tariff.
+
+    Returns ``None`` if any lookup fails or yields no row — caller should
+    fall back to its previous behaviour and let the LLM/operator see
+    PVP=0 (instead of silently fabricating a price).
+    """
+    if not product_id or not tariff_id:
+        return None
+
+    try:
+        presents = await client.get(
+            "INV_PRESENT_PRODUCTO",
+            params={"INV_PRODUCTOS": product_id, "pagesize": 50},
+        )
+    except VelneoError:
+        return None
+    if not presents.rows:
+        return None
+
+    chosen = None
+    if presentation_codbar:
+        chosen = next(
+            (p for p in presents.rows if p.get("ID") == presentation_codbar),
+            None,
+        )
+    if chosen is None:
+        # Prefer the unit empaque (factor=1) — that is what humans mean
+        # by "uno" when they don't specify a packaging.
+        chosen = next(
+            (p for p in presents.rows if p.get("FACTOR") == 1),
+            presents.rows[0],
+        )
+
+    codbar = chosen.get("ID")
+    inv_presentaciones = chosen.get("INV_PRESENTACIONES")
+    factor = chosen.get("FACTOR") or 1
+    if not codbar or not inv_presentaciones:
+        return None
+
+    try:
+        precios = await client.get(
+            "INV_PRECIOS_PRODUCTO",
+            params={
+                "INV_PRODUCTOS": product_id,
+                "INV_PRESENTACIONES": inv_presentaciones,
+                "INV_TARIFAS": tariff_id,
+                "pagesize": 1,
+            },
+        )
+    except VelneoError:
+        return None
+    if not precios.rows:
+        return None
+    p = precios.rows[0]
+
+    return {
+        "INV_PRESENT_PRODUCTO": codbar,
+        "COD_BAR": codbar,
+        "INV_PRECIOS_PRODUCTO": p.get("ID"),
+        "FACTOR": factor,
+        "COSTO_EMPAQUE": p.get("COSTO_EMPAQUE"),
+        "PORCENTAJE_UTILIDAD1": p.get("PORCENTAJE_UTILIDAD1"),
+        "PORCENTAJE_DSCTO_VTA": p.get("PORCENTAJE_DSCTO") or 0,
+        "INV_TIPO_COSTE": p.get("INV_TIPO_COSTE") or "1",
+    }
+
+
 async def create_quotation(
     client: VelneoClient,
     *,
@@ -159,10 +258,39 @@ async def create_quotation(
             "PRODUCTOS": product_id,
             "CAN": quantity,
         }
-        if line.get("unit_price") is not None or line.get("PVP") is not None:
-            body["PVP"] = line.get("unit_price") or line.get("PVP")
+
+        # Resolve INV_PRESENT_PRODUCTO + INV_PRECIOS_PRODUCTO + the
+        # cost/utility/discount triple so Velneo's PVP formula has
+        # everything it needs. The LLM can opt out by passing
+        # ``presentation_codbar`` (a specific empaque). Without this
+        # lookup the line saves but PVP stays at 0 — useless for the
+        # cashier downstream.
+        pricing = None
+        if eff_tariff is not None:
+            try:
+                pricing = await _resolve_line_pricing(
+                    client,
+                    product_id=product_id,
+                    tariff_id=eff_tariff,
+                    presentation_codbar=line.get("presentation_codbar"),
+                )
+            except Exception as exc:  # noqa: BLE001 — never let pricing kill the line
+                line_errors.append(
+                    f"line {i}: pricing lookup failed ({type(exc).__name__}: {exc})"
+                )
+        if pricing:
+            body.update(pricing)
+
+        # Per-line override only after pricing — caller's explicit values
+        # win over the resolved defaults (matches Velneo's manual-price
+        # path: PRECIO_BRUTO_EMPAQUE + PRECIO_ACORDADO=true).
         if line.get("factor") is not None:
             body["FACTOR"] = line["factor"]
+        unit_price = line.get("unit_price") or line.get("PVP")
+        if unit_price is not None:
+            body["PRECIO_BRUTO_EMPAQUE"] = unit_price
+            body["PRECIO_ACORDADO"] = True
+
         line_wh = line.get("warehouse_id")
         if line_wh is None:
             line_wh = eff_bod

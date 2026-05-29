@@ -197,8 +197,13 @@ MCP_TOOLS: list[dict[str, Any]] = [
         "name": "create_quotation",
         "description": (
             "Create a sales quotation with N lines. Each line needs "
-            "``product_id`` and ``quantity``; ``unit_price`` is optional "
-            "(the ERP applies the tariff default when omitted)."
+            "``product_id`` and ``quantity``. Optional per-line: "
+            "``presentation_codbar`` (a specific empaque codbar like "
+            "``'01PPQ'`` for QUINTAL X 95 instead of the default unit "
+            "empaque), ``unit_price`` (overrides the tariff price — sets "
+            "PRECIO_BRUTO_EMPAQUE + PRECIO_ACORDADO=true). Header EMP / "
+            "SUC / INV_BODEGA / INV_TARIFAS / payment fields are filled "
+            "from the tenant's ``erp_api_extra`` config when omitted."
         ),
         "inputSchema": {
             "type": "object",
@@ -211,6 +216,14 @@ MCP_TOOLS: list[dict[str, Any]] = [
                         "properties": {
                             "product_id": {"type": "integer"},
                             "quantity": {"type": "number"},
+                            "presentation_codbar": {
+                                "type": "string",
+                                "description": (
+                                    "Optional empaque codbar (e.g. '01PPQ' "
+                                    "for QUINTAL). Default = the FACTOR=1 "
+                                    "empaque (single unit)."
+                                ),
+                            },
                             "unit_price": {"type": "number"},
                             "factor": {"type": "number"},
                             "warehouse_id": {"type": "integer"},
