@@ -1704,13 +1704,19 @@ async def summarize_credit_notes(
 ) -> dict[str, Any]:
     """Sum credit notes (VENT_NOTA_CRED) in the range.
 
-    NOTE on filtering: Velneo's REST API on this table does NOT honour
-    ``filter[FECHA][gte]/[lte]``. Confirmed empirically — those return 0
-    rows even when the data exists. Only ``filter[FECHA]=YYYY-MM-DD``
-    (exact match) works. So instead of constructing N exact-match calls
-    (one per day for multi-day ranges), we pull the entire NC universe
-    (≈1k–2k rows for Mepriga, ~3 paginated GETs) and filter by date in
-    memory. The cost is small and the code works for any range.
+    Two API quirks that drove this implementation:
+
+    1. Velneo's REST does NOT honour ``filter[FECHA][gte]/[lte]`` on
+       VENT_NOTA_CRED — they silently return 0 rows. Only the exact
+       form ``filter[FECHA]=YYYY-MM-DD`` works.
+    2. The convenience wrapper ``client.get(...)`` auto-wraps every
+       non-reserved param in ``filter[...]``, so passing ``sort`` or
+       ``page[number]`` through it gets mangled. We need the
+       low-level ``client._client.get()`` for sort + paging here.
+
+    Strategy: pull all NCs (≈1k–2k for Mepriga, 2-3 paginated GETs),
+    filter by date in memory. Works for any range without N day-by-day
+    calls.
     """
     page_size = 500
     page_num = 1
@@ -1722,71 +1728,79 @@ async def summarize_credit_notes(
     by_pto_emi: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"total": 0.0, "n_ncs": 0})
 
-    # Normalize the range bounds for in-memory comparison.
     df = date_from[:10] if date_from else ""
     dt = date_to[:10] if date_to else df
 
+    field_csv = ",".join([
+        "ID", "FECHA", "TOTAL", "SUBTOTAL", "IVA",
+        "ESTABLECIMIENTO", "PUNTOEMISION", "OFF",
+    ])
+
     while True:
         try:
-            resp = await client.get(
+            resp = await client._client.get(  # noqa: SLF001
                 "VENT_NOTA_CRED",
                 params={
-                    "pagesize": page_size,
-                    "sort": "-FECHA",
+                    "page[size]": page_size,
                     "page[number]": page_num,
+                    "sort": "-FECHA",
+                    "fields": field_csv,
                 },
-                fields=["ID", "FECHA", "TOTAL", "SUBTOTAL", "IVA",
-                        "ESTABLECIMIENTO", "PUNTOEMISION", "OFF"],
             )
-        except VelneoError as exc:
-            return {"success": False, "error": str(exc),
+            resp.raise_for_status()
+            body = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False,
+                    "error": f"{type(exc).__name__}: {exc}",
                     "total_nc": round(total, 2), "n_ncs": n_ncs}
-        rows = resp.rows or []
-        rows_in_range = 0
+
+        # Velneo returns plural collection under lowercase table name.
+        rows = (body.get("vent_nota_cred")
+                or body.get("vent_notas_cred")
+                or [])
+        if not rows:
+            break
+
         for r in rows:
-            f_raw = r.get("FECHA") or ""
-            f_day = str(f_raw)[:10]
+            # Velneo returns lowercase keys here.
+            f_day = str(r.get("fecha") or r.get("FECHA") or "")[:10]
             if not f_day:
                 continue
-            # In-range filter — strings compare lexicographically on ISO dates.
             if df and f_day < df:
-                # Sort=-FECHA means once we cross below df we're done.
-                # But the page may have multi-NC rows above/below at the
-                # very bottom; we keep scanning until we run out.
                 continue
             if dt and f_day > dt:
                 continue
-            rows_in_range += 1
-            if r.get("OFF"):
+            if r.get("off") or r.get("OFF"):
                 n_ncs_off += 1
                 continue
             try:
-                t = float(r.get("TOTAL") or 0)
+                t = float(r.get("total") or r.get("TOTAL") or 0)
             except (TypeError, ValueError):
                 t = 0.0
             try:
-                s = float(r.get("SUBTOTAL") or 0)
+                s = float(r.get("subtotal") or r.get("SUBTOTAL") or 0)
             except (TypeError, ValueError):
                 s = 0.0
             try:
-                v = float(r.get("IVA") or 0)
+                v = float(r.get("iva") or r.get("IVA") or 0)
             except (TypeError, ValueError):
                 v = 0.0
             total += t
             subtotal += s
             iva += v
             n_ncs += 1
-            est = r.get("ESTABLECIMIENTO") or ""
-            pto = r.get("PUNTOEMISION") or ""
+            est = r.get("establecimiento") or r.get("ESTABLECIMIENTO") or ""
+            pto = r.get("puntoemision") or r.get("PUNTOEMISION") or ""
             est_pto = f"{est}-{pto}" if est else "(sin caja)"
             by_pto_emi[est_pto]["total"] += t
             by_pto_emi[est_pto]["n_ncs"] += 1
 
         if len(rows) < page_size:
             break
-        # Early-out: if this whole page was below the requested range
-        # (sort desc by FECHA), we can stop — older pages are even older.
-        if df and rows and str(rows[-1].get("FECHA", ""))[:10] < df:
+        # Early-out: page is sorted by -FECHA. When the last row falls
+        # below the requested date_from, older pages are even older.
+        last_day = str(rows[-1].get("fecha") or rows[-1].get("FECHA") or "")[:10]
+        if df and last_day and last_day < df:
             break
         page_num += 1
 
