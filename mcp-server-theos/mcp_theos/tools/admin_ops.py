@@ -1115,16 +1115,40 @@ async def sales_evolution_chart(
     )
     period_label = _format_period_label(df, dt)
 
+    # Compute a benchmark — average PVP of the 7 days before the range
+    # starts. The chart draws a dashed reference line at this value so
+    # the user reads "above/below normal" visually.
+    from mcp_theos.sales_report import _compute_period_pvp as _period_pvp
+    from datetime import date as _date_mod, timedelta as _td
+    try:
+        _df_obj = _date_mod.fromisoformat(df)
+        bench_from = (_df_obj - _td(days=7)).isoformat()
+        bench_to = (_df_obj - _td(days=1)).isoformat()
+        bench = await _period_pvp(client, date_from=bench_from,
+                                   date_to=bench_to, sucursal=suc)
+        bench_avg_per_day = (bench["pvp"] / bench["n_days_present"]
+                              if bench["n_days_present"] else 0)
+    except Exception:  # noqa: BLE001
+        bench_avg_per_day = 0
+
     try:
         if mode == "single_day_hourly":
             single_day = days[0]
             hourly_rows = [{"hora": h, "pvp": v} for h, v in
                            sorted(day_x_hour.get(single_day, {}).items())]
+            # Reference line = avg-per-hour over the last 7 days (so the
+            # comparison is hour-to-hour, not full-day-to-bar). 18 hours
+            # of operation is the typical span at Mepriga.
+            ref_per_hour = (bench_avg_per_day / 18.0
+                             if bench_avg_per_day else None)
             png = build_single_day_hourly_png(
                 hourly=hourly_rows,
                 period_label=period_label,
                 total_pvp=daily_pvp.get(single_day, 0.0),
                 n_fact=len(daily_facts.get(single_day, set())),
+                reference_pvp=ref_per_hour,
+                reference_label=(f"Prom/hora últ 7d ${ref_per_hour:,.0f}"
+                                   if ref_per_hour else None),
             )
         elif mode == "multi_day_hourly_compare":
             png = build_hourly_compare_png(
@@ -1143,6 +1167,11 @@ async def sales_evolution_chart(
                 period_label=period_label,
                 total_pvp=total_pvp,
                 n_fact_total=n_fact_total,
+                benchmark_pvp=bench_avg_per_day or None,
+                benchmark_label=(
+                    f"Prom/día últ 7d ${bench_avg_per_day:,.0f}"
+                    if bench_avg_per_day else None
+                ),
             )
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": f"chart_render_failed: {exc}"}

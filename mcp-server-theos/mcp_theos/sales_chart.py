@@ -68,8 +68,15 @@ def build_single_day_hourly_png(
     period_label: str,
     total_pvp: float,
     n_fact: int,
+    reference_pvp: float | None = None,
+    reference_label: str | None = None,
 ) -> bytes:
-    """Single-day evolution: bars per hour, peak highlighted."""
+    """Single-day evolution: bars per hour, peak highlighted.
+
+    If ``reference_pvp`` is provided, a dashed horizontal line is drawn
+    at that value (e.g. avg-per-hour over the last 7 days) so the user
+    sees the bar-vs-benchmark relationship visually.
+    """
     fig, ax = plt.subplots(figsize=(12, 6.5), dpi=110)
     fig.patch.set_facecolor("white")
     fig.suptitle(f"Evolución horaria — {period_label}", fontsize=17,
@@ -95,6 +102,12 @@ def build_single_day_hourly_png(
                     f"  ${vals[peak_i]:,.0f}",
                     ha="center", va="bottom", fontsize=10,
                     fontweight="bold", color=COLOR_PRIMARY)
+        if reference_pvp is not None and reference_pvp > 0:
+            label = reference_label or f"Promedio ${reference_pvp:,.0f}"
+            ax.axhline(reference_pvp, color=COLOR_ORANGE,
+                       linestyle="--", linewidth=1.6, alpha=0.85,
+                       label=label, zorder=5)
+            ax.legend(loc="upper right", fontsize=9, frameon=False)
         ax.yaxis.set_major_formatter(mtick.FuncFormatter(_fmt_dollar))
         ax.tick_params(axis="x", labelsize=10, rotation=45)
         ax.tick_params(axis="y", labelsize=10)
@@ -180,6 +193,8 @@ def build_daily_trend_png(
     period_label: str,
     total_pvp: float,
     n_fact_total: int,
+    benchmark_pvp: float | None = None,
+    benchmark_label: str | None = None,
 ) -> bytes:
     """Daily trend: bars per day + secondary line for n_facturas."""
     fig, ax = plt.subplots(figsize=(13, 7), dpi=110)
@@ -208,7 +223,11 @@ def build_daily_trend_png(
                       edgecolor="none", width=0.65)
         avg = sum(vals) / len(vals) if vals else 0
         ax.axhline(avg, color=COLOR_ORANGE, linewidth=1.5, linestyle="--",
-                   label=f"Promedio ${avg:,.0f}", alpha=0.8)
+                   label=f"Prom. rango ${avg:,.0f}", alpha=0.85)
+        if benchmark_pvp is not None and benchmark_pvp > 0:
+            bench_lbl = benchmark_label or f"Prom. anterior ${benchmark_pvp:,.0f}"
+            ax.axhline(benchmark_pvp, color=COLOR_PRIMARY, linewidth=1.5,
+                       linestyle=":", label=bench_lbl, alpha=0.85)
         if vals:
             peak_i = max(range(len(vals)), key=lambda i: vals[i])
             bars[peak_i].set_color(COLOR_PRIMARY)

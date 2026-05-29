@@ -1690,6 +1690,185 @@ async def _iter_days(date_from: str, date_to: str) -> list[str]:
             for i in range((d_to - d_from).days + 1)]
 
 
+async def _compute_period_pvp(
+    client: VelneoClient,
+    *,
+    date_from: str,
+    date_to: str,
+    sucursal: str,
+) -> dict[str, Any]:
+    """Aggregate PVP over a date range using the per-day cache.
+
+    Used by the benchmarks (vs_yesterday / vs_avg_7d / vs_same_day_lw)
+    so they re-use the same on-disk cache as the main summary. Past
+    days are free, today is a live fetch.
+    """
+    days = await _iter_days(date_from, date_to)
+    pvp_total = 0.0
+    facturas: set[int] = set()
+    n_lineas = 0
+    n_days_present = 0
+    for day in days:
+        result = await _get_day_lines(client, day=day, sucursal=sucursal)
+        if not result.get("success"):
+            continue
+        rows = result.get("rows") or []
+        if rows:
+            n_days_present += 1
+        for r in rows:
+            try:
+                pvp = float(r.get("PVP_LINEA") or 0)
+            except (TypeError, ValueError):
+                pvp = 0.0
+            try:
+                inv = int(r.get("VENT_FACT_VENT") or 0)
+            except (TypeError, ValueError):
+                inv = 0
+            pvp_total += pvp
+            n_lineas += 1
+            if inv:
+                facturas.add(inv)
+    return {
+        "pvp": round(pvp_total, 2),
+        "n_facturas": len(facturas),
+        "n_lineas": n_lineas,
+        "n_days_present": n_days_present,
+    }
+
+
+def _make_delta(current: float, reference: float) -> dict[str, Any]:
+    """Build a ``{ref_pvp, delta_pct}`` dict; ``None`` pct if ref is 0."""
+    if reference == 0:
+        return {"ref_pvp": round(reference, 2), "delta_pct": None}
+    return {
+        "ref_pvp": round(reference, 2),
+        "delta_pct": round((current - reference) / reference * 100, 1),
+    }
+
+
+async def _compute_deltas(
+    client: VelneoClient,
+    *,
+    date_from: str,
+    date_to: str,
+    current_pvp: float,
+    sucursal: str,
+) -> dict[str, Any]:
+    """Side-by-side benchmarks for the executive summary.
+
+    Range = 1 day  →  vs_yesterday, vs_avg_last_7d, vs_same_day_last_week
+    Range > 1 day  →  vs_previous_equivalent_period
+    """
+    from datetime import date as _date, timedelta
+    try:
+        df = _date.fromisoformat(date_from[:10])
+        dt = _date.fromisoformat(date_to[:10])
+    except ValueError:
+        return {}
+    n_days = (dt - df).days + 1
+
+    if n_days == 1:
+        yest_iso = (df - timedelta(days=1)).isoformat()
+        avg_from = (df - timedelta(days=7)).isoformat()
+        avg_to = (df - timedelta(days=1)).isoformat()
+        sdlw_iso = (df - timedelta(days=7)).isoformat()
+
+        yest = await _compute_period_pvp(client, date_from=yest_iso,
+                                          date_to=yest_iso, sucursal=sucursal)
+        avg = await _compute_period_pvp(client, date_from=avg_from,
+                                         date_to=avg_to, sucursal=sucursal)
+        sdlw = await _compute_period_pvp(client, date_from=sdlw_iso,
+                                          date_to=sdlw_iso, sucursal=sucursal)
+
+        avg_per_day = (avg["pvp"] / avg["n_days_present"]
+                       if avg["n_days_present"] else 0)
+        return {
+            "vs_yesterday": _make_delta(current_pvp, yest["pvp"]),
+            "vs_avg_last_7d": _make_delta(current_pvp, avg_per_day),
+            "vs_same_day_last_week": _make_delta(current_pvp, sdlw["pvp"]),
+        }
+
+    # Multi-day: compare against the immediately-preceding equivalent
+    # period (same length). E.g. 26-28 May compares vs 23-25 May.
+    prev_to = (df - timedelta(days=1)).isoformat()
+    prev_from = (df - timedelta(days=n_days)).isoformat()
+    prev = await _compute_period_pvp(client, date_from=prev_from,
+                                       date_to=prev_to, sucursal=sucursal)
+    return {
+        "vs_previous_period": _make_delta(current_pvp, prev["pvp"]),
+        "avg_pvp_per_day": round(current_pvp / max(n_days, 1), 2),
+        "previous_period": f"{prev_from} a {prev_to}",
+    }
+
+
+def _detect_flags(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compute decision-relevant flags from a finalized summary.
+
+    Levels:
+      * ``warn`` — out of normal band, gerencia debe mirar.
+      * ``info`` — vale destacar, no urgente.
+
+    Skipped entirely when there isn't enough data (e.g. no deltas).
+    """
+    flags: list[dict[str, Any]] = []
+    totals = summary.get("totals") or {}
+    deltas = summary.get("deltas") or {}
+
+    # Total fuera de banda vs avg 7d (single-day mode)
+    avg = deltas.get("vs_avg_last_7d") or {}
+    avg_pct = avg.get("delta_pct")
+    if avg_pct is not None:
+        if avg_pct < -15:
+            flags.append({"level": "warn", "code": "below_avg",
+                          "msg": f"Total {avg_pct:.1f}% bajo promedio 7d"})
+        elif avg_pct > 15:
+            flags.append({"level": "info", "code": "above_avg",
+                          "msg": f"Total +{avg_pct:.1f}% sobre promedio 7d"})
+
+    # Total fuera de banda vs período anterior (multi-day mode)
+    prev = deltas.get("vs_previous_period") or {}
+    prev_pct = prev.get("delta_pct")
+    if prev_pct is not None:
+        if prev_pct < -15:
+            flags.append({"level": "warn", "code": "below_prev",
+                          "msg": f"Total {prev_pct:.1f}% vs período anterior"})
+        elif prev_pct > 15:
+            flags.append({"level": "info", "code": "above_prev",
+                          "msg": f"Total +{prev_pct:.1f}% vs período anterior"})
+
+    # Crédito alto (umbral 35%)
+    pct_credito = totals.get("pct_credito")
+    if pct_credito is not None and pct_credito > 35:
+        flags.append({
+            "level": "warn", "code": "credit_high",
+            "msg": f"Crédito {pct_credito}% (alto vs típico ~30%)",
+        })
+
+    # Concentración de caja
+    cajas = summary.get("por_pto_emision") or []
+    pvp_total = float(totals.get("pvp") or 0)
+    if cajas and pvp_total > 0:
+        top_caja = cajas[0]
+        pct_top = top_caja["pvp"] / pvp_total * 100
+        if pct_top > 30:
+            flags.append({
+                "level": "info", "code": "caja_concentration",
+                "msg": (f"Caja {top_caja['establecimiento_pto']} concentra "
+                        f"{pct_top:.0f}% del día"),
+            })
+
+    # NCs altas (>1% del total)
+    nc_total = float(totals.get("nc_total") or 0)
+    if pvp_total > 0 and nc_total > 0 and (nc_total / pvp_total * 100) > 1:
+        flags.append({
+            "level": "info", "code": "nc_high",
+            "msg": (f"NCs ${nc_total:.0f} ({nc_total / pvp_total * 100:.1f}% "
+                    f"del total — típico <1%)"),
+        })
+
+    return flags
+
+
 async def _fetch_invoice_credit_flags(
     client: VelneoClient,
     *,
@@ -1982,7 +2161,15 @@ async def summarize_sales(
     n_facturas = len(facturas_all)
     ticket = round(total_pvp / n_facturas, 2) if n_facturas else 0.0
 
-    return {
+    # Compute decision-relevant benchmarks (vs ayer, vs avg 7d, vs same
+    # day last week). Reuses the same on-disk cache so past comparisons
+    # are nearly free.
+    deltas = await _compute_deltas(
+        client, date_from=date_from, date_to=date_to,
+        current_pvp=total_pvp, sucursal=suc,
+    )
+
+    response = {
         "success": True,
         "date_from": date_from,
         "date_to": date_to,
@@ -2047,6 +2234,9 @@ async def summarize_sales(
                                 key=lambda x: -x[1]["pvp"])[:top_n_productos]
         ],
     }
+    response["deltas"] = deltas
+    response["flags"] = _detect_flags(response)
+    return response
 
 
 async def summarize_credit_notes(
