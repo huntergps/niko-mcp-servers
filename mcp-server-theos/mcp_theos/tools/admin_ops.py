@@ -1700,15 +1700,27 @@ _PROCESO_MOV_KEEP = frozenset({
     "ID", "NAME", "NUM_LINEA",
     "VENT_FACT_VENT", "VENT_NOTA_CRED", "CONT_COMPRAS",
     "PRODUCTOS", "INV_PRESENT_PRODUCTO",
+    # Product descriptors — let the agent aggregate / rank by product
+    # without an extra get_product_details round-trip. NOMBRE is the
+    # product's own name, ABREV is the presentation/empaque label, and
+    # COD_BAR is the line's barcode reference. These come native on
+    # every INV_MOVIMIENTOS row so projecting them costs nothing.
+    "NOMBRE", "ABREV", "COD_BAR",
+    "INV_FAMI",
     "CAN", "FACTOR",
     "PVP", "PVP_LINEA",
     "PRECIO_BRUTO_LINEA", "PRECIO_NETO_LINEA",
+    "COSTO_LINEA",
     "DCTO_VTAS_LINEA", "IVA_LINEA",
     "INV_BODEGA",
     "EMP", "SUC",
-    "CONTADO", "FECHA_CONTA",
+    "CONTADO", "FECHA", "FECHA_CONTA",
     "MOV_TIP", "ENTRADA",
     "CLI_ENT", "PRV_ENT",
+    # Customer / SRI block in the row's descriptor — useful for the
+    # downstream agent so it can answer "top clientes" without a
+    # follow-up join on VENT_FACT_VENT.
+    "CLT_ENT", "TIPO_DOC",
 })
 
 

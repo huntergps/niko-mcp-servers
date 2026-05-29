@@ -1565,6 +1565,7 @@ async def summarize_sales(
     sucursal: str | None = None,
     max_rows: int = 200000,
     top_n_clientes: int = 10,
+    top_n_productos: int = 10,
 ) -> dict[str, Any]:
     """Aggregate sales lines for a date range, no XLSX, JSON only.
 
@@ -1609,6 +1610,9 @@ async def summarize_sales(
         lambda: {"pvp": 0.0, "facturas": set(), "lineas": 0, "cif": ""})
     by_forma_pago: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"pvp": 0.0, "facturas": set(), "lineas": 0})
+    by_producto: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"pvp": 0.0, "cantidad": 0.0, "lineas": 0,
+                  "cod_bar": "", "producto_id": 0})
     facturas_all: set[int] = set()
     total_pvp = 0.0
     total_neto = 0.0
@@ -1739,6 +1743,24 @@ async def summarize_sales(
             if inv_id:
                 bc["facturas"].add(inv_id)
 
+            # Producto — el row carry both PRODUCTOS (id) and NOMBRE.
+            prod_name = (uk.get("NOMBRE") or "").strip()
+            try:
+                prod_id = int(uk.get("PRODUCTOS") or 0)
+            except (TypeError, ValueError):
+                prod_id = 0
+            try:
+                cantidad = float(uk.get("CAN") or 0)
+            except (TypeError, ValueError):
+                cantidad = 0.0
+            prod_key = prod_name or (f"ID#{prod_id}" if prod_id else "(sin nombre)")
+            bp_ = by_producto[prod_key]
+            bp_["pvp"] += pvp
+            bp_["cantidad"] += cantidad
+            bp_["lineas"] += 1
+            bp_["producto_id"] = prod_id or bp_["producto_id"]
+            bp_["cod_bar"] = (uk.get("COD_BAR") or bp_["cod_bar"]).strip()
+
             # Forma de pago — basada en VENTA_CREDITO de la cabecera
             # (swagger: "Fue Venta a Crédito"). Pre-cargada en
             # credit_flags por _fetch_invoice_credit_flags. True =
@@ -1821,6 +1843,14 @@ async def summarize_sales(
              "pct": round(100 * d["pvp"] / total_pvp, 1) if total_pvp else 0.0,
              "n_facturas": len(d["facturas"]), "n_lineas": d["lineas"]}
             for f, d in sorted(by_forma_pago.items(), key=lambda x: -x[1]["pvp"])
+        ],
+        "top_productos": [
+            {"nombre": p, "cod_bar": d["cod_bar"], "producto_id": d["producto_id"],
+             "pvp": round(d["pvp"], 2),
+             "pct": round(100 * d["pvp"] / total_pvp, 1) if total_pvp else 0.0,
+             "cantidad": round(d["cantidad"], 2), "n_lineas": d["lineas"]}
+            for p, d in sorted(by_producto.items(),
+                                key=lambda x: -x[1]["pvp"])[:top_n_productos]
         ],
     }
 
