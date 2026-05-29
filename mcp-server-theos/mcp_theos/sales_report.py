@@ -1637,12 +1637,12 @@ async def generate(
     _write_detalle(detalle_ws, rows, bodega_names, familia_names,
                    subfamilia_names, product_info, factura_info)
 
-    # DASHBOARD sheet — hourly evolution table + combo chart.
+    # "Evolucion de Ventas" sheet — hourly evolution table + combo chart.
     # Pre-computed in Python so the user gets values upon opening the
     # workbook without needing to refresh a pivot. AutoFilter on the
     # table provides per-hour interactive filtering. (openpyxl can't
     # write proper Excel slicers, so AutoFilter is the closest stand-in.)
-    dashboard_ws = wb.create_sheet("DASHBOARD")
+    dashboard_ws = wb.create_sheet("Evolucion de Ventas")
     hourly = _aggregate_by_hour(rows)
     _write_dashboard(dashboard_ws, hourly)
 
