@@ -94,7 +94,15 @@ async def _resolve_lookup(
         rid = r.get("ID")
         if rid is None:
             continue
-        out[int(rid)] = str(r.get(name_field) or "").strip()
+        try:
+            rid_i = int(rid)
+        except (TypeError, ValueError):
+            # Some catalog tables have alphanumeric IDs (e.g. INV_BODEGA
+            # may carry codes like "00000000U"). Skip — the row data
+            # already carries the bodega/familia NAME inline elsewhere
+            # if it matters.
+            continue
+        out[rid_i] = str(r.get(name_field) or "").strip()
     return out
 
 
