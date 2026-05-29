@@ -18,9 +18,11 @@ _ORDEN_FIELDS = [
 
 _MOV_FIELDS = [
     "ID", "VENT_ORDEN_VENTA", "NUM_LINEA", "PRODUCTOS",
-    "NAME", "CAN", "FACTOR",
+    "NAME", "NOMBRE", "COD_BAR", "INV_PRESENT_PRODUCTO",
+    "CAN", "FACTOR",
     "PVP", "PVP_LINEA",
     "PRECIO_BRUTO_LINEA", "DCTO_VTAS_LINEA", "PRECIO_NETO_LINEA", "IVA_LINEA",
+    "PORCENTAJE_DSCTO_VTA",
     "INV_BODEGA",
 ]
 
@@ -380,4 +382,50 @@ async def list_quotations(
         "count": len(resp.rows),
         "total_count": resp.total_count,
         "orders": resp.rows[:limit],
+    }
+
+
+async def get_quotation_pdf(
+    client: VelneoClient,
+    *,
+    order_id: int,
+) -> dict[str, Any]:
+    """Render a quotation as PDF, return base64 + filename.
+
+    Velneo's REST API has no print endpoint (the desktop ticket prints
+    via Velneo's own report engine). We render the proforma here with
+    reportlab so the bot can attach it directly to a Telegram /
+    WhatsApp message — same pattern as ``get_customer_statement_pdf``.
+    """
+    data = await get_quotation(client, order_id=order_id)
+    if not data.get("success"):
+        return data
+
+    try:
+        from mcp_theos.pdf import render_quotation_pdf
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "success": False,
+            "error": f"PDF renderer unavailable: {type(exc).__name__}: {exc}",
+        }
+
+    import base64
+
+    from mcp_theos.otp import _get_tenant_commercial_name
+    brand = await _get_tenant_commercial_name(client.cfg.tenant_id)
+
+    try:
+        pdf_bytes = render_quotation_pdf(data, brand=brand)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "success": False,
+            "error": f"PDF render failed: {type(exc).__name__}: {exc}",
+        }
+
+    return {
+        "success": True,
+        "order_id": order_id,
+        "line_count": data.get("line_count"),
+        "pdf_base64": base64.b64encode(pdf_bytes).decode("ascii"),
+        "pdf_filename": f"proforma_{order_id}.pdf",
     }

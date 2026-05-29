@@ -263,6 +263,21 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_quotation_pdf",
+        "description": (
+            "Render a quotation (proforma) as a PDF and return it base64-"
+            "encoded. The chat layer decodes the bytes and attaches the "
+            "file to the customer's message. Call AFTER create_quotation "
+            "succeeds, so the customer gets a clean record of what was "
+            "just quoted."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"order_id": {"type": "integer"}},
+            "required": ["order_id"],
+        },
+    },
+    {
         "name": "request_otp",
         "description": (
             "Send a 6-digit verification code to the customer's email "
@@ -1022,6 +1037,7 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "create_quotation": ("sales.create_quotation", sales.create_quotation),
     "get_quotation": ("sales.get_quotation", sales.get_quotation),
     "list_quotations": ("sales.list_quotations", sales.list_quotations),
+    "get_quotation_pdf": ("sales.get_quotation_pdf", sales.get_quotation_pdf),
     "request_otp": ("otp_tools.request_otp", otp_tools.request_otp),
     "verify_otp": ("otp_tools.verify_otp", otp_tools.verify_otp),
     "get_customer_invoices": ("invoices.get_customer_invoices", invoices.get_customer_invoices),
