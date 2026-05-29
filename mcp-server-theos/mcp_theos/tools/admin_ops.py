@@ -869,6 +869,98 @@ async def list_recent_stock_movements(
 
 
 # ---------------------------------------------------------------------------
+# sales_quick_summary — live analytics for "lila, como van las ventas"
+# ---------------------------------------------------------------------------
+
+
+async def sales_quick_summary(
+    client: VelneoClient,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    month: str | None = None,
+    year: str | int | None = None,
+    sucursal: str | None = None,
+    top_n_clientes: int = 10,
+    include_credit_notes: bool = True,
+) -> dict[str, Any]:
+    """Aggregate sales (and optionally NCs) and return JSON only — no XLSX.
+
+    Designed for the "live analytics" chat use case where the operator
+    wants Lila to read out totals + top-N breakdowns in the conversation
+    (por hora, por familia, por bodega, por punto de emisión, top
+    clientes) without waiting for the full XLSX. Synchronous and fast
+    enough to fit in the 120s MCP timeout for 1-3 day windows.
+
+    Date range resolution mirrors generate_sales_report:
+      year > month > date_from/date_to > today (ECU).
+
+    If ``include_credit_notes=True`` (default), also pulls NCs in the
+    same range and exposes ``credit_notes`` + ``totals.saldo_neto``
+    (PVP de ventas menos total de NCs).
+    """
+    import calendar
+    from datetime import date as _date, datetime as _datetime, timezone, timedelta
+
+    if year:
+        try:
+            y_int = int(str(year).strip())
+            if not (2000 <= y_int <= 2100):
+                raise ValueError
+        except (TypeError, ValueError):
+            return {"success": False, "error": "year must be YYYY"}
+        date_from = f"{y_int:04d}-01-01"
+        date_to = f"{y_int:04d}-12-31"
+    elif month:
+        try:
+            y_str, m_str = str(month).strip().split("-")
+            y_int = int(y_str)
+            m_int = int(m_str)
+            if not (1 <= m_int <= 12) or not (2000 <= y_int <= 2100):
+                raise ValueError
+        except (TypeError, ValueError):
+            return {"success": False, "error": "month must be YYYY-MM"}
+        last_day = calendar.monthrange(y_int, m_int)[1]
+        date_from = f"{y_int:04d}-{m_int:02d}-01"
+        date_to = f"{y_int:04d}-{m_int:02d}-{last_day:02d}"
+    elif not date_from and not date_to:
+        ec_now = _datetime.now(timezone.utc) - timedelta(hours=5)
+        today_iso = ec_now.date().isoformat()
+        date_from = today_iso
+        date_to = today_iso
+    if not date_from:
+        date_from = date_to
+    if not date_to:
+        date_to = date_from
+
+    df = _norm_velneo_date(date_from)
+    dt = _norm_velneo_date(date_to)
+    if not df or not dt:
+        return {"success": False, "error": "date_from / date_to must be ISO YYYY-MM-DD"}
+
+    from mcp_theos.sales_report import (
+        summarize_sales as _sum_sales,
+        summarize_credit_notes as _sum_ncs,
+    )
+
+    sales = await _sum_sales(client, date_from=df, date_to=dt,
+                             sucursal=sucursal, top_n_clientes=top_n_clientes)
+    if not sales.get("success"):
+        return sales
+
+    if include_credit_notes:
+        ncs = await _sum_ncs(client, date_from=df, date_to=dt)
+        sales["credit_notes"] = ncs
+        nc_total = float(ncs.get("total_nc") or 0)
+        sales["totals"]["nc_total"] = nc_total
+        sales["totals"]["saldo_neto"] = round(
+            sales["totals"]["pvp"] - nc_total, 2
+        )
+
+    return sales
+
+
+# ---------------------------------------------------------------------------
 # generate_sales_report — XLSX deliverable for the daily ops report
 # ---------------------------------------------------------------------------
 
@@ -982,16 +1074,23 @@ async def generate_sales_report(
         )
 
         # Estimate wait time so the agent can quote it to the user.
-        # Empirical: a busy Mepriga day at PAGE_SIZE=500 needs ~5
-        # paginated requests of ~5s each plus catalog lookups => ~30s
-        # per day. Round generously, floor at 1 min.
+        # Empirical (measured 2026-05-29 against Mepriga prod): a busy
+        # day at PAGE_SIZE=500 needs ~5 paginated requests, but each
+        # request against the Velneo proceso averages 15s including
+        # the upstream's internal seek. So ~75s per day of data.
+        # Add a 30s base for the family/bodega lookups + XLSX build.
+        # Round generously and floor at 1 min so even a 1-day report
+        # gets a non-zero estimate. We cap reported minutes at 90 to
+        # avoid scaring the user — past 90 we just say "más de 90".
         try:
             _d_from = _date.fromisoformat(df)
             _d_to = _date.fromisoformat(dt)
             n_days = max(1, (_d_to - _d_from).days + 1)
         except Exception:
             n_days = 1
-        estimated_minutes = max(1, int(round(n_days * 0.5)))
+        # 30s base + ~75s per day, then to minutes rounded up.
+        estimated_seconds = 30 + n_days * 75
+        estimated_minutes = max(1, (estimated_seconds + 59) // 60)
 
         cfg_snapshot = client.cfg
         df_local, dt_local = df, dt

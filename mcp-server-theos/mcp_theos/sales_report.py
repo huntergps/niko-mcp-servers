@@ -1468,6 +1468,312 @@ def _write_detalle(
         ws.auto_filter.ref = f"A1:{last_col}{last_row_n}"
 
 
+async def summarize_sales(
+    client: VelneoClient,
+    *,
+    date_from: str,
+    date_to: str,
+    sucursal: str | None = None,
+    max_rows: int = 200000,
+    top_n_clientes: int = 10,
+) -> dict[str, Any]:
+    """Aggregate sales lines for a date range, no XLSX, JSON only.
+
+    Re-uses the same VENT_FACT_MOV_BUSQ_3P pagination as ``generate``
+    but doesn't open an openpyxl workbook — agg counters only. Designed
+    for live chat analytics ("Lila, ¿cómo van las ventas de hoy?").
+
+    Returns dimensions:
+      * totals: pvp, neto, n_lineas, n_facturas, ticket_promedio_pvp
+      * por_hora: list of {hora, pvp, n_facturas, n_lineas}
+      * por_familia: list of {familia, pvp, pct, n_lineas} sorted desc
+      * por_bodega:  list of {bodega, pvp, pct, n_facturas, n_lineas}
+      * por_pto_emision: list of {establecimiento_pto, pvp, n_facturas, ...}
+      * top_clientes: top N {nombre, cif, pvp, n_facturas, n_lineas}
+    """
+    from mcp_theos.tools.admin_ops import _tenant_sucursal
+    from urllib.parse import quote
+    from mcp_theos.velneo_http import _upper_keys
+    from datetime import timedelta
+    import os
+
+    suc = sucursal or _tenant_sucursal(client)
+    base_params = {
+        "param[SUCURSAL]": suc,
+        "param[FCH_FACT]": "1",
+        "param[FCH_DES]": date_from,
+        "param[FCH_HST]": date_to,
+        "param[OFF]": "0",
+    }
+    PAGE_SIZE = 500
+
+    # In-memory aggregators (no row list).
+    by_hour: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"pvp": 0.0, "facturas": set(), "lineas": 0})
+    by_familia: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"pvp": 0.0, "lineas": 0})
+    by_bodega: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"pvp": 0.0, "facturas": set(), "lineas": 0})
+    by_pto_emi: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"pvp": 0.0, "facturas": set(), "lineas": 0})
+    by_cliente: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"pvp": 0.0, "facturas": set(), "lineas": 0, "cif": ""})
+    facturas_all: set[int] = set()
+    total_pvp = 0.0
+    total_neto = 0.0
+    n_lineas = 0
+    total_count = 0
+    page_num = 1
+
+    try:
+        offset = float(os.environ.get("VELNEO_TZ_OFFSET_HOURS", "-5"))
+    except (TypeError, ValueError):
+        offset = -5.0
+    offset_int = int(offset)
+
+    # Lookups (cached).
+    bodega_names = await _resolve_lookup(client, "INV_BODEGA")
+    familia_parent, _ = await _resolve_family_hierarchy(client)
+
+    while True:
+        page_params = {**base_params, "page[size]": PAGE_SIZE, "page[number]": page_num}
+        try:
+            resp = await client._client.get(  # noqa: SLF001
+                f"_process/{quote('VENT_FACT_MOV_BUSQ_3P')}",
+                params=page_params,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "success": False, "error_code": "transport",
+                "error": f"{type(exc).__name__}: {exc}",
+                "page_at_failure": page_num, "rows_collected": n_lineas,
+            }
+        if total_count == 0:
+            total_count = int(body.get("total_count") or 0)
+        page_rows = body.get("inv_movimientos") or []
+        if page_num == 1 and not page_rows and body.get("errors"):
+            first = body["errors"][0]
+            msg = first.get("message") if isinstance(first, dict) else str(first)
+            return {"success": False, "error_code": "proceso_denied", "error": msg}
+
+        for r in page_rows:
+            if not isinstance(r, dict):
+                continue
+            uk = _upper_keys(r)
+            try:
+                pvp = float(uk.get("PVP_LINEA") or 0)
+            except (TypeError, ValueError):
+                pvp = 0.0
+            try:
+                neto = float(uk.get("PRECIO_NETO_LINEA") or 0)
+            except (TypeError, ValueError):
+                neto = 0.0
+            try:
+                inv_id = int(uk.get("VENT_FACT_VENT") or 0)
+            except (TypeError, ValueError):
+                inv_id = 0
+            try:
+                fam_id = int(uk.get("INV_FAMI") or 0)
+            except (TypeError, ValueError):
+                fam_id = 0
+            try:
+                bod_id = int(uk.get("INV_BODEGA") or 0)
+            except (TypeError, ValueError):
+                bod_id = 0
+
+            total_pvp += pvp
+            total_neto += neto
+            n_lineas += 1
+            if inv_id:
+                facturas_all.add(inv_id)
+
+            # Hour bucket — convert FECHA_CONTA from UTC to local.
+            fc = uk.get("FECHA_CONTA")
+            if fc and "T" in str(fc):
+                try:
+                    dt = datetime.strptime(
+                        str(fc).replace("Z", "").split(".")[0],
+                        "%Y-%m-%dT%H:%M:%S",
+                    )
+                    dt = dt + timedelta(hours=offset_int)
+                    hour_lbl = f"{dt.hour:02d}h00"
+                    bh = by_hour[hour_lbl]
+                    bh["pvp"] += pvp
+                    bh["lineas"] += 1
+                    if inv_id:
+                        bh["facturas"].add(inv_id)
+                except ValueError:
+                    pass
+
+            fam_name = familia_parent.get(fam_id, f"FAM_{fam_id}") if fam_id else "(sin familia)"
+            bf = by_familia[fam_name]
+            bf["pvp"] += pvp
+            bf["lineas"] += 1
+
+            bod_name = bodega_names.get(bod_id, f"BOD_{bod_id}") if bod_id else "(sin bodega)"
+            bb = by_bodega[bod_name]
+            bb["pvp"] += pvp
+            bb["lineas"] += 1
+            if inv_id:
+                bb["facturas"].add(inv_id)
+
+            parsed = _parse_invoice_name(uk.get("NAME") or "")
+            est = parsed["establecimiento"]
+            pto = parsed["pto_emision"]
+            est_pto = f"{est}-{pto}" if est else "(sin caja)"
+            bp = by_pto_emi[est_pto]
+            bp["pvp"] += pvp
+            bp["lineas"] += 1
+            if inv_id:
+                bp["facturas"].add(inv_id)
+
+            cli_name = parsed["cliente"] or (
+                f"CIF {parsed['cif']}" if parsed["cif"] else "(sin cliente)"
+            )
+            bc = by_cliente[cli_name]
+            bc["pvp"] += pvp
+            bc["lineas"] += 1
+            bc["cif"] = parsed["cif"] or bc["cif"]
+            if inv_id:
+                bc["facturas"].add(inv_id)
+
+        if n_lineas >= max_rows:
+            break
+        if len(page_rows) < PAGE_SIZE:
+            break
+        if total_count and n_lineas >= total_count:
+            break
+        page_num += 1
+
+    truncated = total_count > n_lineas
+    n_facturas = len(facturas_all)
+    ticket = round(total_pvp / n_facturas, 2) if n_facturas else 0.0
+
+    return {
+        "success": True,
+        "date_from": date_from,
+        "date_to": date_to,
+        "total_lines": n_lineas,
+        "total_lines_in_range": total_count,
+        "truncated": truncated,
+        "totals": {
+            "pvp": round(total_pvp, 2),
+            "neto": round(total_neto, 2),
+            "n_lineas": n_lineas,
+            "n_facturas": n_facturas,
+            "ticket_promedio_pvp": ticket,
+        },
+        "por_hora": [
+            {"hora": h, "pvp": round(d["pvp"], 2),
+             "n_facturas": len(d["facturas"]), "n_lineas": d["lineas"]}
+            for h, d in sorted(by_hour.items())
+        ],
+        "por_familia": [
+            {"familia": f, "pvp": round(d["pvp"], 2),
+             "pct": round(100 * d["pvp"] / total_pvp, 1) if total_pvp else 0.0,
+             "n_lineas": d["lineas"]}
+            for f, d in sorted(by_familia.items(), key=lambda x: -x[1]["pvp"])
+        ],
+        "por_bodega": [
+            {"bodega": b, "pvp": round(d["pvp"], 2),
+             "pct": round(100 * d["pvp"] / total_pvp, 1) if total_pvp else 0.0,
+             "n_facturas": len(d["facturas"]), "n_lineas": d["lineas"]}
+            for b, d in sorted(by_bodega.items(), key=lambda x: -x[1]["pvp"])
+        ],
+        "por_pto_emision": [
+            {"establecimiento_pto": ep, "pvp": round(d["pvp"], 2),
+             "n_facturas": len(d["facturas"]), "n_lineas": d["lineas"]}
+            for ep, d in sorted(by_pto_emi.items(), key=lambda x: -x[1]["pvp"])
+        ],
+        "top_clientes": [
+            {"nombre": c, "cif": d["cif"], "pvp": round(d["pvp"], 2),
+             "n_facturas": len(d["facturas"]), "n_lineas": d["lineas"]}
+            for c, d in sorted(by_cliente.items(),
+                                key=lambda x: -x[1]["pvp"])[:top_n_clientes]
+        ],
+    }
+
+
+async def summarize_credit_notes(
+    client: VelneoClient,
+    *,
+    date_from: str,
+    date_to: str,
+) -> dict[str, Any]:
+    """Sum credit notes (VENT_NOTA_CRED) in the range. Returns totals
+    and per-pto-emision split. Pagination via the normal table list.
+    """
+    page_size = 500
+    page_num = 1
+    total = 0.0
+    subtotal = 0.0
+    iva = 0.0
+    n_ncs = 0
+    by_pto_emi: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"total": 0.0, "n_ncs": 0})
+
+    while True:
+        try:
+            resp = await client.get(
+                "VENT_NOTA_CRED",
+                params={
+                    "pagesize": page_size,
+                    "page[number]": page_num,
+                    "filter[FECHA][gte]": date_from,
+                    "filter[FECHA][lte]": date_to,
+                },
+                fields=["ID", "FECHA", "TOTAL", "SUBTOTAL", "IVA",
+                        "ESTABLECIMIENTO", "PUNTOEMISION", "OFF"],
+            )
+        except VelneoError as exc:
+            return {"success": False, "error": str(exc),
+                    "total_nc": round(total, 2), "n_ncs": n_ncs}
+        rows = resp.rows or []
+        for r in rows:
+            # Skip cancelled NCs (OFF=true)
+            if r.get("OFF"):
+                continue
+            try:
+                t = float(r.get("TOTAL") or 0)
+            except (TypeError, ValueError):
+                t = 0.0
+            try:
+                s = float(r.get("SUBTOTAL") or 0)
+            except (TypeError, ValueError):
+                s = 0.0
+            try:
+                v = float(r.get("IVA") or 0)
+            except (TypeError, ValueError):
+                v = 0.0
+            total += t
+            subtotal += s
+            iva += v
+            n_ncs += 1
+            est = r.get("ESTABLECIMIENTO") or ""
+            pto = r.get("PUNTOEMISION") or ""
+            est_pto = f"{est}-{pto}" if est else "(sin caja)"
+            by_pto_emi[est_pto]["total"] += t
+            by_pto_emi[est_pto]["n_ncs"] += 1
+        if len(rows) < page_size:
+            break
+        page_num += 1
+
+    return {
+        "success": True,
+        "total_nc": round(total, 2),
+        "subtotal_nc": round(subtotal, 2),
+        "iva_nc": round(iva, 2),
+        "n_ncs": n_ncs,
+        "por_pto_emision": [
+            {"establecimiento_pto": ep,
+             "total": round(d["total"], 2), "n_ncs": d["n_ncs"]}
+            for ep, d in sorted(by_pto_emi.items(), key=lambda x: -x[1]["total"])
+        ],
+    }
+
+
 async def generate(
     client: VelneoClient,
     *,

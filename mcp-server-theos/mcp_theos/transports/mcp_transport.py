@@ -1001,6 +1001,66 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "sales_quick_summary",
+        "description": (
+            "Resumen agregado de ventas (y opcionalmente notas de credito) "
+            "en JSON, SIN generar XLSX. USAR ESTE TOOL cuando el usuario "
+            "pida un analisis/resumen GERENCIAL EN VIVO en el chat — ej. "
+            "'como van las ventas de hoy', 'que cajas vendieron mas', "
+            "'top clientes de la semana', 'ventas por hora', 'familias "
+            "que mas vendieron', 'ventas vs notas de credito de hoy', "
+            "'saldo neto de hoy'.\n\n"
+            "**Cuando NO usar este tool**: si el usuario pide 'informe', "
+            "'reporte', 'detalle completo' o cualquier cosa que sugiera "
+            "un archivo descargable, usar ``generate_sales_report`` (que "
+            "produce XLSX adjuntado al chat).\n\n"
+            "**Dimensiones que devuelve**:\n"
+            "  totals: pvp, neto, n_lineas, n_facturas, ticket_promedio_pvp,\n"
+            "          nc_total, saldo_neto (si include_credit_notes=True)\n"
+            "  por_hora: [{hora, pvp, n_facturas, n_lineas}] (HH:00 ECU)\n"
+            "  por_familia: [{familia, pvp, pct, n_lineas}] desc\n"
+            "  por_bodega: [{bodega, pvp, pct, n_facturas, n_lineas}] desc\n"
+            "  por_pto_emision: [{establecimiento_pto, pvp, n_facturas}] desc\n"
+            "  top_clientes: [{nombre, cif, pvp, n_facturas, n_lineas}] (N=10)\n"
+            "  credit_notes: {total_nc, subtotal_nc, iva_nc, n_ncs,\n"
+            "                 por_pto_emision}\n\n"
+            "Sincronico (cabe en 120s para 1-3 dias). Para rangos mas "
+            "amplios va a tardar pero aun cabe; si truncated=true narrow."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "month": {
+                    "type": "string",
+                    "description": "YYYY-MM. Para 'ventas de mayo 2026'.",
+                },
+                "year": {
+                    "type": "string",
+                    "description": "YYYY. Para 'ventas de 2026'.",
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": "ISO YYYY-MM-DD. Default = today (ECU).",
+                },
+                "date_to": {
+                    "type": "string",
+                    "description": "ISO YYYY-MM-DD. Default = date_from.",
+                },
+                "sucursal": {"type": "string"},
+                "top_n_clientes": {
+                    "type": "integer", "default": 10, "minimum": 3, "maximum": 50,
+                },
+                "include_credit_notes": {
+                    "type": "boolean", "default": True,
+                    "description": (
+                        "Si True (default), incluye total de NCs del rango y "
+                        "expone saldo_neto = ventas_pvp - nc_total."
+                    ),
+                },
+            },
+        },
+    },
+    {
         "name": "generate_sales_report",
         "description": (
             "Genera el INFORME DE VENTAS DIARIAS (XLSX) que el operador "
@@ -1179,6 +1239,7 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "list_recent_stock_movements": ("admin_ops.list_recent_stock_movements", admin_ops.list_recent_stock_movements),
     "check_stock": ("products.check_stock", products.check_stock),
     "search_velneo": ("admin_search.search_velneo", admin_search.search_velneo),
+    "sales_quick_summary": ("admin_ops.sales_quick_summary", admin_ops.sales_quick_summary),
     "generate_sales_report": ("admin_ops.generate_sales_report", admin_ops.generate_sales_report),
 }
 
