@@ -282,7 +282,7 @@ async def reset_signature_queue_record(
         if isinstance(pre_rows, dict):
             pre_rows = [pre_rows]
         pre_state = (
-            (pre_rows[0].get("ESTADO_FEAP") if pre_rows else None) or ""
+            (pre_rows[0].get("estado_feap") if pre_rows else None) or ""
         ).strip()
     except Exception as exc:  # noqa: BLE001
         return {"success": False,
@@ -357,7 +357,7 @@ async def reset_signature_queue_record(
         if isinstance(post_rows, dict):
             post_rows = [post_rows]
         post_state = (
-            (post_rows[0].get("ESTADO_FEAP") if post_rows else None) or ""
+            (post_rows[0].get("estado_feap") if post_rows else None) or ""
         ).strip()
     except Exception as exc:  # noqa: BLE001
         # The write may have succeeded but we can't confirm — still
