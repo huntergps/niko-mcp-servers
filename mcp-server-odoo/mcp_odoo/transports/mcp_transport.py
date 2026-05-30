@@ -5714,6 +5714,26 @@ _INTENT_RULES: list[dict] = [
         "code_prefixes": ["IMP"],
         "name_excludes": ["tinta", "toner", "cartucho", "papel"],
     },
+    # PC chassis. Audit 2026-05-30 (Tecnosmart PC-build): a "case/
+    # gabinete" search pulled in "CASE COMBO ... TECLADO - MOUSE -
+    # PARLANTES" starter bundles (peripherals, NOT a PC chassis) because
+    # their name starts with "CASE". 51 of 776 CAS-prefixed products are
+    # such bundles. The LLM, mid PC-build, rewrote those combos into
+    # fabricated gaming cases ("CASE GAMER XTECH XT-100", keeping the real
+    # code/price) — inventing products and showing combo prices on a fake
+    # chassis. We drop the bundles so only real chassis reach the model;
+    # with clean candidates the model grounds verbatim (proven: the same
+    # tenant renders real monitors/products correctly). ``query_exclude_
+    # part`` keeps the bundle visible when the customer EXPLICITLY asks for
+    # a "case combo / con teclado y mouse".
+    {
+        "kind": "case_chassis",
+        "query_any": ["gabinete", "chasis", "chassis", "case"],
+        "query_exclude_part": ["combo", "teclado", "mouse", "parlante"],
+        "category_hints": ["gabinete", "chasis", "case", "torre", "tower"],
+        "code_prefixes": ["CAS"],
+        "name_excludes": ["combo", "teclado", "mouse", "parlante"],
+    },
     {
         "kind": "mouse",
         "query_any": ["mouse", "raton", "ratón"],
