@@ -136,7 +136,7 @@ async def signature_queue_status(
 
     by_state: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
-        st = (r.get("ESTADO_FEAP") or "").strip() or "(vacío)"
+        st = (r.get("estado_feap") or "").strip() or "(vacío)"
         by_state[st].append(r)
 
     breakdown = []
@@ -151,21 +151,21 @@ async def signature_queue_status(
             # Sample by most recent FECHA_DOC if present.
             sample = sorted(
                 items,
-                key=lambda x: str(x.get("FECHA_DOC") or ""),
+                key=lambda x: str(x.get("fecha_doc") or ""),
                 reverse=True,
             )[:max_examples_per_state]
             entry["examples"] = [
                 {
-                    "id": int(x.get("ID") or 0),
+                    "id": int(x.get("id") or 0),
                     "ref": (
-                        f"{(x.get('SRI_ESTABLECIMIENTO') or '').strip()}-"
-                        f"{(x.get('SRI_PUNTO_EMISION') or '').strip()}-"
-                        f"{(x.get('SRI_SECUENCIAL') or '').strip()}"
+                        f"{(x.get('sri_establecimiento') or '').strip()}-"
+                        f"{(x.get('sri_punto_emision') or '').strip()}-"
+                        f"{(x.get('sri_secuencial') or '').strip()}"
                     ).strip("-"),
-                    "valor": float(x.get("VALOR") or 0),
-                    "detalle": (x.get("NAME") or "").strip()[:80],
-                    "fecha_doc": str(x.get("FECHA_DOC") or "")[:10],
-                    "obser": (x.get("OBSER_DOC_SRI") or "").strip()[:200] or None,
+                    "valor": float(x.get("valor") or 0),
+                    "detalle": (x.get("name") or "").strip()[:80],
+                    "fecha_doc": str(x.get("fecha_doc") or "")[:10],
+                    "obser": (x.get("obser_doc_sri") or "").strip()[:200] or None,
                 }
                 for x in sample
             ]
@@ -205,28 +205,28 @@ async def list_signature_queue_errors(
             "VENT_FACT_VENT", "VENT_NOTA_CRED", "COMP_RETENCIONES",
         ],
     )
-    error_rows = [r for r in rows if (r.get("ESTADO_FEAP") or "").strip() == "I"]
+    error_rows = [r for r in rows if (r.get("estado_feap") or "").strip() == "I"]
 
     pats = [p.lower() for p in (patterns or DEFAULT_SAFE_RESET_PATTERNS)]
     safe = []
     other = []
     for r in error_rows:
-        obser = (r.get("OBSER_DOC_SRI") or "").lower()
+        obser = (r.get("obser_doc_sri") or "").lower()
         matches = any(p in obser for p in pats)
         item = {
-            "id": int(r.get("ID") or 0),
+            "id": int(r.get("id") or 0),
             "ref": (
                 f"{(r.get('SRI_ESTABLECIMIENTO') or '').strip()}-"
                 f"{(r.get('SRI_PUNTO_EMISION') or '').strip()}-"
                 f"{(r.get('SRI_SECUENCIAL') or '').strip()}"
             ).strip("-"),
-            "valor": float(r.get("VALOR") or 0),
-            "detalle": (r.get("NAME") or "").strip()[:80],
-            "fecha_doc": str(r.get("FECHA_DOC") or "")[:10],
-            "obser": (r.get("OBSER_DOC_SRI") or "").strip()[:300],
-            "vent_fact_vent": int(r.get("VENT_FACT_VENT") or 0) or None,
-            "vent_nota_cred": int(r.get("VENT_NOTA_CRED") or 0) or None,
-            "comp_retenciones": int(r.get("COMP_RETENCIONES") or 0) or None,
+            "valor": float(r.get("valor") or 0),
+            "detalle": (r.get("name") or "").strip()[:80],
+            "fecha_doc": str(r.get("fecha_doc") or "")[:10],
+            "obser": (r.get("obser_doc_sri") or "").strip()[:300],
+            "vent_fact_vent": int(r.get("vent_fact_vent") or 0) or None,
+            "vent_nota_cred": int(r.get("vent_nota_cred") or 0) or None,
+            "comp_retenciones": int(r.get("comp_retenciones") or 0) or None,
         }
         if matches:
             safe.append(item)
