@@ -1,5 +1,38 @@
 """Signature queue (COLA_DOCS_FIRMAR) — status, error listing and reset.
 
+OBSER_DOC_SRI format
+--------------------
+El campo OBSER_DOC_SRI es un JSON serializado con dos capas:
+
+  Capa 1 — wrapper de Datil (el broker de firma que Theos usa):
+    estado:  "CREADO" | "RECIBIDO" | "AUTORIZADO" | "NO AUTORIZADO"
+             | "ERROR_HTTP"   ← cuando hubo problema en la llamada
+    id:      uuid de Datil
+    error:   código HTTP cuando estado=ERROR_HTTP (ej. 302)
+    msn:     mensaje genérico del wrapper
+
+  Capa 2 — anidada en ``info.errors[*]`` (la respuesta real del SRI):
+    code:     INVALID_RECEIPT | INVALID_KEY | ...
+    message:  texto humano del SRI
+    details:  texto humano del SRI (a veces igual a message)
+    parameter:  campo afectado
+
+Ejemplo crítico (caso "ya autorizado, atorado"):
+  estado=ERROR_HTTP, error=302, msn="operación inválida..."
+  info.errors[0].code=INVALID_RECEIPT
+  info.errors[0].details="No es posible modificar un comprobante autorizado."
+
+El significado real: el SRI ya autorizó el comprobante, Datil intentó
+reenviarlo/modificarlo, el SRI le contestó "no se puede modificar".
+Resetear ESTADO_FEAP='1' hace que Theos vuelva a consultar al SRI,
+reciba AUTORIZADO, y cierre la fila. Sin re-envío ni duplicación.
+
+NUNCA reportar al operador "HTTP 302" como si fuera el verdadero
+problema — siempre extraer info.errors[*].details/message del JSON y
+clasificar humanamente (ver _classify_obser).
+
+
+
 The COLA_DOCS_FIRMAR table is Theos' electronic-signature queue: every
 invoice/credit-note/retention that has to be sent to SRI lands here
 first, with ``ESTADO_FEAP`` tracking its position in the SRI pipeline.
@@ -70,6 +103,148 @@ DEFAULT_SAFE_RESET_PATTERNS: tuple[str, ...] = (
     "No es posible modificar un comprobante autorizado",
     "INVALID_RECEIPT",  # SRI code that often pairs with the above
 )
+
+
+def _parse_obser(obser_raw: str | None) -> dict[str, Any]:
+    """Parse OBSER_DOC_SRI (JSON-as-string) into structured fields.
+
+    Returns ``{}`` if obser is empty / not JSON. Otherwise:
+      {
+        "datil_estado": str,          # CREADO / RECIBIDO / AUTORIZADO / NO AUTORIZADO / ERROR_HTTP
+        "datil_msn": str | None,      # mensaje genérico de Datil
+        "datil_http_error": int|None, # código HTTP cuando estado=ERROR_HTTP
+        "sri_errors": [
+            {"code": str, "message": str, "details": str, "parameter": str}, ...
+        ],
+        "sri_clave_acceso": str | None,
+        "sri_numero_autorizacion": str | None,
+      }
+    """
+    import json as _json
+    if not obser_raw or not isinstance(obser_raw, str):
+        return {}
+    s = obser_raw.strip()
+    if not s.startswith("{"):
+        return {}
+    try:
+        data = _json.loads(s)
+    except _json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    info = data.get("info") if isinstance(data.get("info"), dict) else {}
+    raw_errors = info.get("errors") if isinstance(info.get("errors"), list) else []
+    sri_errors = []
+    for e in raw_errors:
+        if not isinstance(e, dict):
+            continue
+        sri_errors.append({
+            "code": (e.get("code") or "").strip(),
+            "message": (e.get("message") or "").strip(),
+            "details": (e.get("details") or "").strip(),
+            "parameter": (e.get("parameter") or "").strip(),
+        })
+    return {
+        "datil_estado": (data.get("estado") or "").strip(),
+        "datil_msn": (data.get("msn") if isinstance(data.get("msn"), str) else None),
+        "datil_http_error": data.get("error") if isinstance(data.get("error"), int) else None,
+        "sri_errors": sri_errors,
+        "sri_clave_acceso": (data.get("clave_acceso") or "").strip() or None,
+        "sri_numero_autorizacion": (data.get("numero") or "").strip() or None,
+    }
+
+
+def _classify_obser(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Classify a parsed obser into a human-friendly summary + reset hint.
+
+    Categorías:
+      * ``already_authorized_at_sri`` — SRI ya autorizó, Datil quería
+        reenviar. SEGURO de resetear. → próximo ciclo cierra.
+      * ``sri_rejected`` — el SRI rechazó por datos inválidos (clave
+        repetida, RUC malo, cert vencido, etc.). Reset NO arregla.
+      * ``datil_http_other`` — error HTTP en Datil que no es el caso
+        target. Investigar manualmente. Reset NO se recomienda.
+      * ``in_pipeline`` — estado normal del flujo (CREADO, RECIBIDO,
+        AUTORIZADO sin error). NO hay nada que arreglar.
+      * ``unknown`` — no se pudo parsear o categorizar.
+    """
+    if not parsed:
+        return {"category": "unknown",
+                "summary": "Sin observación legible.",
+                "safe_to_reset": False}
+    datil = (parsed.get("datil_estado") or "").upper()
+    sri_errs = parsed.get("sri_errors") or []
+    first_err = sri_errs[0] if sri_errs else None
+
+    if datil == "AUTORIZADO" and not sri_errs:
+        return {
+            "category": "in_pipeline",
+            "summary": "Autorizado por el SRI — sin problema.",
+            "safe_to_reset": False,
+        }
+    if datil in ("CREADO", "RECIBIDO") and not sri_errs:
+        return {
+            "category": "in_pipeline",
+            "summary": f"En el flujo normal de Datil/SRI (estado {datil}).",
+            "safe_to_reset": False,
+        }
+    if datil == "NO AUTORIZADO":
+        msg = (first_err or {}).get("message") or (first_err or {}).get("details") \
+              or parsed.get("datil_msn") or "(sin detalle)"
+        return {
+            "category": "sri_rejected",
+            "summary": f"SRI NO AUTORIZÓ el comprobante. Motivo: {msg[:200]}",
+            "safe_to_reset": False,
+        }
+    if datil == "ERROR_HTTP":
+        if first_err:
+            code = first_err.get("code", "")
+            details = first_err.get("details") or first_err.get("message") or ""
+            if "comprobante autorizado" in details.lower() or code == "INVALID_RECEIPT":
+                return {
+                    "category": "already_authorized_at_sri",
+                    "summary": (
+                        "El SRI YA tiene este comprobante autorizado. Datil "
+                        "intentó re-enviarlo y el SRI lo rechazó porque no "
+                        "se puede modificar lo ya autorizado. Resetear "
+                        "ESTADO_FEAP='1' es seguro: el próximo ciclo "
+                        "consulta el SRI, confirma AUTORIZADO y cierra."
+                    ),
+                    "safe_to_reset": True,
+                    "sri_message": details,
+                    "sri_code": code,
+                }
+            return {
+                "category": "datil_http_other",
+                "summary": (
+                    f"Error HTTP en Datil (code {parsed.get('datil_http_error')}) "
+                    f"con respuesta del SRI: [{code}] {details[:200]}. "
+                    f"Investigar antes de cualquier acción — reset NO recomendado."
+                ),
+                "safe_to_reset": False,
+                "sri_code": code,
+                "sri_message": details,
+            }
+        # ERROR_HTTP sin info.errors[] — pura falla de transporte/red
+        return {
+            "category": "datil_http_other",
+            "summary": (
+                f"Error de transporte HTTP con Datil "
+                f"(error={parsed.get('datil_http_error')}, "
+                f"msn={parsed.get('datil_msn') or '(sin mensaje)'}). "
+                f"Reenviar manualmente desde el ERP — reset NO arregla "
+                f"problemas de conectividad."
+            ),
+            "safe_to_reset": False,
+        }
+    return {
+        "category": "unknown",
+        "summary": (
+            f"Estado Datil={datil or '(vacío)'} sin clasificación. "
+            f"Inspeccionar OBSER_DOC_SRI completo."
+        ),
+        "safe_to_reset": False,
+    }
 
 
 async def _fetch_all_pages(
@@ -207,28 +382,35 @@ async def list_signature_queue_errors(
     )
     error_rows = [r for r in rows if (r.get("estado_feap") or "").strip() == "I"]
 
-    pats = [p.lower() for p in (patterns or DEFAULT_SAFE_RESET_PATTERNS)]
+    pats = [p.lower() for p in (patterns or [])]
     safe = []
     other = []
     for r in error_rows:
-        obser = (r.get("obser_doc_sri") or "").lower()
-        matches = any(p in obser for p in pats)
+        obser_raw = (r.get("obser_doc_sri") or "").strip()
+        parsed = _parse_obser(obser_raw)
+        cls = _classify_obser(parsed)
+        if pats:
+            is_safe = any(p in obser_raw.lower() for p in pats)
+        else:
+            is_safe = cls.get("safe_to_reset", False)
         item = {
             "id": int(r.get("id") or 0),
             "ref": (
-                f"{(r.get('SRI_ESTABLECIMIENTO') or '').strip()}-"
-                f"{(r.get('SRI_PUNTO_EMISION') or '').strip()}-"
-                f"{(r.get('SRI_SECUENCIAL') or '').strip()}"
+                f"{(r.get('sri_establecimiento') or '').strip()}-"
+                f"{(r.get('sri_punto_emision') or '').strip()}-"
+                f"{(r.get('sri_secuencial') or '').strip()}"
             ).strip("-"),
             "valor": float(r.get("valor") or 0),
             "detalle": (r.get("name") or "").strip()[:80],
             "fecha_doc": str(r.get("fecha_doc") or "")[:10],
-            "obser": (r.get("obser_doc_sri") or "").strip()[:300],
             "vent_fact_vent": int(r.get("vent_fact_vent") or 0) or None,
             "vent_nota_cred": int(r.get("vent_nota_cred") or 0) or None,
             "comp_retenciones": int(r.get("comp_retenciones") or 0) or None,
+            "obser_parsed": parsed,
+            "classification": cls,
+            "obser_raw_truncated": obser_raw[:300] if obser_raw else None,
         }
-        if matches:
+        if is_safe:
             safe.append(item)
         else:
             other.append(item)
@@ -238,7 +420,8 @@ async def list_signature_queue_errors(
         "n_errors_total": len(error_rows),
         "n_safe_to_reset": len(safe),
         "n_other_errors": len(other),
-        "patterns_applied": list(pats),
+        "classification_basis": "patterns" if pats else "structured_obser_classification",
+        "patterns_applied": list(pats) if pats else None,
         "safe_to_reset": safe[:limit],
         "other_errors": (other[:limit] if include_all_errors else []),
     }
