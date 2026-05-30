@@ -345,76 +345,243 @@ def _build_negative_stock_xlsx(
     bodega_order: list[int],
     bodega_name_by_id: dict[int, str],
 ) -> bytes:
-    """Render the XLSX with corporate palette + AutoFilter + frozen header."""
+    """Render the XLSX matching the style of generate_sales_report:
+    title banner + subtitle banner + period caption + KPI cards +
+    section heading + zebra-striped table with AutoFilter.
+    """
     from openpyxl import Workbook
-    from openpyxl.styles import (
-        Font, PatternFill, Alignment, Border, Side, NamedStyle
-    )
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.cell import WriteOnlyCell as _C
+    from openpyxl.utils import get_column_letter
+
+    # Corporate palette (same constants as sales_report.py)
+    P_PRIMARY = "1F4E78"
+    P_SECONDARY = "2E75B6"
+    P_GREEN = "70AD47"
+    P_TABLE_HEADER = "305496"
+    P_ZEBRA = "F8F9FB"
+    P_TOTAL = "F2F2F2"
+    P_SUBTLE = "595959"
+    P_WHITE = "FFFFFF"
+
+    # Fonts
+    title_font = Font(bold=True, color=P_WHITE, size=22, name="Calibri")
+    subtitle_font = Font(bold=True, color=P_WHITE, size=12, name="Calibri")
+    caption_font = Font(italic=True, color=P_SUBTLE, size=11, name="Calibri")
+    kpi_header_font = Font(bold=True, color=P_WHITE, size=11, name="Calibri")
+    kpi_value_font = Font(bold=True, color=P_PRIMARY, size=18, name="Calibri")
+    section_font = Font(bold=True, color=P_PRIMARY, size=13, name="Calibri")
+    table_header_font = Font(bold=True, color=P_WHITE, size=10, name="Calibri")
+    body_font = Font(size=10, name="Calibri")
+    neg_font = Font(color="C00000", bold=True, size=10, name="Calibri")
+    total_row_font = Font(bold=True, color=P_WHITE, size=11, name="Calibri")
+
+    # Fills
+    primary_fill = PatternFill("solid", fgColor=P_PRIMARY)
+    secondary_fill = PatternFill("solid", fgColor=P_SECONDARY)
+    green_fill = PatternFill("solid", fgColor=P_GREEN)
+    table_header_fill = PatternFill("solid", fgColor=P_TABLE_HEADER)
+    zebra_fill = PatternFill("solid", fgColor=P_ZEBRA)
+    total_fill = PatternFill("solid", fgColor=P_TOTAL)
+
+    # Alignments
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left = Alignment(horizontal="left", vertical="center", wrap_text=False, indent=1)
+    right = Alignment(horizontal="right", vertical="center")
+
+    # Borders
+    thin = Side(border_style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    fixed_headers = [
+        "ID", "Familia", "Código", "Nombre",
+        "Costo\nPromedio", "Costo\nÚlt.Compra",
+        "PVP sin IVA", "% Utilidad", "Unidad Mínima",
+        "IVA en\nCompras", "IVA en\nVentas", "Existencia",
+    ]
+    bodega_headers = [
+        bodega_name_by_id.get(bid, f"BOD {bid}").upper()
+        for bid in bodega_order
+    ]
+    n_fixed = len(fixed_headers)
+    n_bodegas = len(bodega_order)
+    total_cols = n_fixed + n_bodegas  # NO margen column A en este reporte
 
     wb = Workbook(write_only=True)
     ws = wb.create_sheet(title="Saldos Negativos")
-    ws.freeze_panes = "A6"
+    ws.sheet_view.showGridLines = False
 
-    # Corporate palette (same as sales report)
-    PRIMARY = "1F4E78"
-    HEADER_FILL = PatternFill("solid", fgColor=PRIMARY)
-    HEADER_FONT = Font(bold=True, color="FFFFFF", size=10)
-    TITLE_FONT = Font(bold=True, color=PRIMARY, size=14)
-    SUBTITLE_FONT = Font(bold=True, color="404040", size=11)
-    NEG_FONT = Font(color="C00000", bold=True)
-    BODY_FONT = Font(size=10)
-    CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    LEFT = Alignment(horizontal="left", vertical="center", wrap_text=False)
-    RIGHT = Alignment(horizontal="right", vertical="center")
-    thin = Side(border_style="thin", color="BFBFBF")
-    BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
+    # Column widths — set BEFORE any append (write_only requirement)
+    widths = {
+        1: 9,    # ID
+        2: 10,   # Familia
+        3: 14,   # Código
+        4: 50,   # Nombre
+        5: 12,   # Costo Promedio
+        6: 12,   # Costo Ult.Compra
+        7: 12,   # PVP sin IVA
+        8: 11,   # % Utilidad
+        9: 16,   # Unidad Minima
+        10: 11,  # IVA Compras
+        11: 11,  # IVA Ventas
+        12: 13,  # Existencia
+    }
+    for c, w in widths.items():
+        ws.column_dimensions[get_column_letter(c)].width = w
+    # Bodega columns — uniform width 22 (igual que sales report)
+    for i in range(n_fixed + 1, total_cols + 1):
+        ws.column_dimensions[get_column_letter(i)].width = 22
 
-    from openpyxl.cell import WriteOnlyCell as _C
+    def _empty_row() -> list:
+        return [None] * total_cols
 
-    # Row 1: empty
-    ws.append([])
+    def _cell(value, font=None, fill=None, alignment=None, border_=None):
+        c = _C(ws, value=value)
+        if font: c.font = font
+        if fill: c.fill = fill
+        if alignment: c.alignment = alignment
+        if border_: c.border = border_
+        return c
 
-    # Row 2: company
-    c = _C(ws, value="MEGA PRIMAVERA GALÁPAGOS S.A.")
-    c.font = TITLE_FONT
-    c.alignment = LEFT
-    ws.append([c])
+    def _merge(start_row, start_col, end_row, end_col):
+        ws.merged_cells.ranges.add(
+            f"{get_column_letter(start_col)}{start_row}:"
+            f"{get_column_letter(end_col)}{end_row}"
+        )
 
-    # Row 3: subtitle
+    # =========================================================
+    # Row 1: blank top margin
+    # =========================================================
+    ws.append(_empty_row())
+
+    # =========================================================
+    # Row 2: MEPRIGA banner (merged across all cols)
+    # =========================================================
+    ws.row_dimensions[2].height = 38
+    _merge(2, 1, 2, total_cols)
+    row = _empty_row()
+    row[0] = _cell(
+        "MEPRIGA — Mega Primavera Galápagos",
+        font=title_font, fill=primary_fill,
+        alignment=Alignment(horizontal="center", vertical="center"),
+    )
+    ws.append(row)
+
+    # =========================================================
+    # Row 3: subtitle banner
+    # =========================================================
+    ws.row_dimensions[3].height = 24
+    _merge(3, 1, 3, total_cols)
+    row = _empty_row()
+    row[0] = _cell(
+        "Productos con Saldo Negativo",
+        font=subtitle_font, fill=secondary_fill,
+        alignment=Alignment(horizontal="center", vertical="center"),
+    )
+    ws.append(row)
+
+    # =========================================================
+    # Row 4: period caption
+    # =========================================================
     ec_now = datetime.now(timezone.utc) - timedelta(hours=5)
-    fecha_str = ec_now.strftime("%d/%m/%Y %H:%M")
-    c = _C(ws, value=f"DETALLE DE PRODUCTOS CON SALDOS EN NEGATIVO AL {fecha_str}")
-    c.font = SUBTITLE_FONT
-    c.alignment = LEFT
-    ws.append([c])
+    periodo = f"Al {ec_now.strftime('%d/%m/%Y %H:%M')} ECU"
+    ws.row_dimensions[4].height = 20
+    _merge(4, 1, 4, total_cols)
+    row = _empty_row()
+    row[0] = _cell(
+        periodo,
+        font=caption_font,
+        alignment=Alignment(horizontal="center", vertical="center"),
+    )
+    ws.append(row)
 
-    # Row 4: empty
-    ws.append([])
+    # =========================================================
+    # Row 5: blank gutter
+    # =========================================================
+    ws.append(_empty_row())
 
-    # Row 5: headers
-    fixed_headers = [
-        "ID", "Familia", "Código", "Nombre", "Promedio", "Ult.Compra",
-        "PVP sin IVA", "% Utilidad", "Unidad Minima",
-        "IVA en Compras", "IVA en Ventas", "Existencia",
+    # =========================================================
+    # Rows 6-7: KPI cards (productos, bodegas afectadas, total negativo)
+    # =========================================================
+    n_productos = len(rows)
+    bodegas_afectadas = sum(
+        1 for bid in bodega_order
+        if any(r["por_bodega"].get(bid, 0) < 0 for r in rows)
+    )
+    total_neg = sum(r["existencia"] for r in rows if r["existencia"] < 0)
+
+    kpis = [
+        ("PRODUCTOS EN NEGATIVO", f"{n_productos:,}", P_SECONDARY),
+        ("BODEGAS AFECTADAS", f"{bodegas_afectadas}", P_GREEN),
+        ("EXISTENCIA NETA NEG.", f"{total_neg:,.0f}", P_PRIMARY),
     ]
-    bodega_headers = [
-        bodega_name_by_id.get(bid, f"BOD {bid}").upper() for bid in bodega_order
-    ]
-    all_headers = fixed_headers + bodega_headers
+    # Distribute: 3 cards across total_cols columns evenly
+    span_per_card = max(2, total_cols // 3)
+    card_starts = [1, 1 + span_per_card, 1 + 2 * span_per_card]
+    card_ends = [card_starts[1] - 1, card_starts[2] - 1, total_cols]
 
+    # Row 6: KPI labels
+    ws.row_dimensions[6].height = 24
+    row = _empty_row()
+    for (label, _val, color), s, e in zip(kpis, card_starts, card_ends):
+        row[s - 1] = _cell(
+            label,
+            font=kpi_header_font,
+            fill=PatternFill("solid", fgColor=color),
+            alignment=Alignment(horizontal="center", vertical="center"),
+            border_=border,
+        )
+        _merge(6, s, 6, e)
+    ws.append(row)
+
+    # Row 7: KPI values
+    ws.row_dimensions[7].height = 38
+    row = _empty_row()
+    for (_l, val, _c), s, e in zip(kpis, card_starts, card_ends):
+        row[s - 1] = _cell(
+            val,
+            font=kpi_value_font,
+            alignment=Alignment(horizontal="center", vertical="center"),
+            border_=border,
+        )
+        _merge(7, s, 7, e)
+    ws.append(row)
+
+    # =========================================================
+    # Row 8: blank gutter
+    # =========================================================
+    ws.append(_empty_row())
+
+    # =========================================================
+    # Row 9: section heading
+    # =========================================================
+    ws.row_dimensions[9].height = 22
+    row = _empty_row()
+    row[0] = _cell(
+        "Detalle de Productos por Bodega",
+        font=section_font,
+        alignment=Alignment(horizontal="left", vertical="center"),
+    )
+    ws.append(row)
+
+    # =========================================================
+    # Row 10: table headers
+    # =========================================================
+    ws.row_dimensions[10].height = 50
     header_row = []
-    for h in all_headers:
-        c = _C(ws, value=h)
-        c.font = HEADER_FONT
-        c.fill = HEADER_FILL
-        c.alignment = CENTER
-        c.border = BORDER
-        header_row.append(c)
+    for h in fixed_headers + bodega_headers:
+        header_row.append(_cell(
+            h, font=table_header_font, fill=table_header_fill,
+            alignment=center, border_=border,
+        ))
     ws.append(header_row)
 
-    # Rows 6+: data
-    for r in rows:
-        cells = [
+    # =========================================================
+    # Rows 11+: data with zebra striping
+    # =========================================================
+    for idx, r in enumerate(rows):
+        zebra = zebra_fill if idx % 2 == 0 else None
+        cells_vals: list[Any] = [
             r["id"],
             r["familia"],
             r["codigo"],
@@ -422,57 +589,33 @@ def _build_negative_stock_xlsx(
             round(r["costo_promedio"], 4),
             round(r["costo_compra"], 4),
             round(r["pvp_sin_iva"], 4),
-            round(r["porc_utilidad"], 4),
+            round(r["porc_utilidad"], 2),
             r["unidad_minima"],
             r["iva_compras"],
             r["iva_ventas"],
             round(r["existencia"], 2),
         ]
         for bid in bodega_order:
-            cells.append(round(r["por_bodega"].get(bid, 0), 2))
+            cells_vals.append(round(r["por_bodega"].get(bid, 0), 2))
 
         wo_cells = []
-        for i, val in enumerate(cells):
-            c = _C(ws, value=val)
-            c.font = BODY_FONT
-            c.alignment = LEFT if i in (1, 2, 3, 8) else RIGHT
-            c.border = BORDER
-            if isinstance(val, (int, float)) and val < 0:
-                c.font = NEG_FONT
-            wo_cells.append(c)
+        for i, val in enumerate(cells_vals):
+            is_neg = isinstance(val, (int, float)) and val < 0
+            font_use = neg_font if is_neg else body_font
+            align = left if i in (1, 2, 3, 8) else right
+            wo_cells.append(_cell(
+                val, font=font_use, fill=zebra,
+                alignment=align, border_=border,
+            ))
         ws.append(wo_cells)
 
-    # Column widths
-    ws.column_dimensions["A"].width = 9   # ID
-    ws.column_dimensions["B"].width = 9   # Familia
-    ws.column_dimensions["C"].width = 14  # Código
-    ws.column_dimensions["D"].width = 52  # Nombre
-    ws.column_dimensions["E"].width = 11  # Promedio
-    ws.column_dimensions["F"].width = 11  # Ult.Compra
-    ws.column_dimensions["G"].width = 11  # PVP sin IVA
-    ws.column_dimensions["H"].width = 11  # % Utilidad
-    ws.column_dimensions["I"].width = 16  # Unidad Minima
-    ws.column_dimensions["J"].width = 11  # IVA Compras
-    ws.column_dimensions["K"].width = 11  # IVA Ventas
-    ws.column_dimensions["L"].width = 11  # Existencia total
-    # Bodega columns — wider to fit full names like "ALMACEN 01 - COMERCIAL"
-    from openpyxl.utils import get_column_letter
-    for i, bid in enumerate(bodega_order, start=13):
-        name = bodega_name_by_id.get(bid, "")
-        # Width based on longest word in the name (wrap_text handles
-        # the rest). Min 14, max 22 to avoid extreme cases.
-        longest_word = max((len(w) for w in name.split()), default=10)
-        width = max(14, min(22, longest_word + 4))
-        ws.column_dimensions[get_column_letter(i)].width = width
-
-    # Header row height taller so wrapped names fit (3 lines max)
-    ws.row_dimensions[5].height = 45
-
-    # AutoFilter
-    last_col = len(all_headers)
-    last_row = 5 + len(rows)
-    last_col_letter = get_column_letter(last_col)
-    ws.auto_filter.ref = f"A5:{last_col_letter}{last_row}"
+    # =========================================================
+    # Freeze panes & AutoFilter
+    # =========================================================
+    ws.freeze_panes = "A11"
+    last_row = 10 + len(rows)
+    last_col_letter = get_column_letter(total_cols)
+    ws.auto_filter.ref = f"A10:{last_col_letter}{last_row}"
 
     buf = io.BytesIO()
     wb.save(buf)
