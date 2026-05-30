@@ -142,7 +142,9 @@ async def generate_negative_stock_report(
                 "delivered": False,
                 "note": "No hay productos con saldo negativo."}
 
-    # 2) Bodega names for the per-bodega columns
+    # 2) Bodega names — fetch from INV_BODEGA. We still need them to
+    # show the bodega IDs hooked to the product (inv_bodega1..12) even
+    # if we cannot get the per-bodega EXS values yet.
     try:
         bodegas = await _fetch_all(
             client, "INV_BODEGA",
@@ -152,42 +154,74 @@ async def generate_negative_stock_report(
         bodegas = []
         logger.warning("INV_BODEGA fetch failed: %s — using IDs", exc)
     bodega_name_by_id = {
-        int(b.get("id") or 0): (b.get("name") or "").strip() or f"BOD {b.get('id')}"
-        for b in bodegas if b.get("id")
+        int(b["id"]): (b.get("name") or "").strip() or f"BOD {b['id']}"
+        for b in bodegas
+        if isinstance(b, dict) and b.get("id")
     }
-    # Sorted by ID for stable column order
-    bodega_order = sorted(bodega_name_by_id.keys())
 
-    # 3) Per-product, fetch EXISTENCIAS plural for per-bodega breakdown
+    # 3) Build rows. Use only the consolidated EXS field from the
+    # product. The per-bodega virtual fields (EXS_BOD1..12) return '0'
+    # in the JSON because they're computed by Velneo at the client
+    # layer, not by REST. Per-bodega breakdown requires direct GET on
+    # the EXISTENCIAS table, which currently returns empty under the
+    # niko_saas API key (not allow-listed). When the operator adds
+    # EXISTENCIAS to the API key (Seguridad → API key → Tablas), this
+    # code will pick up the breakdown automatically via fetch_existencias.
     rows: list[dict[str, Any]] = []
+    bodega_ids_used: set[int] = set()
     for p in products:
+        if not isinstance(p, dict):
+            continue
         pid = int(p.get("id") or 0)
         if not pid:
             continue
-        try:
-            exs_rows = await _fetch_plural(
-                client, "PRODUCTOS", pid,
-                "EXISTENCIAS_INV_PRODUCTOS",
-                fields=["INV_BODEGAS", "EXS", "AÑO"],
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("EXISTENCIAS plural failed for product %s: %s", pid, exc)
-            exs_rows = []
 
-        # Aggregate by bodega (sum if multiple years/rows)
-        by_bod: dict[int, float] = defaultdict(float)
-        for r in exs_rows:
+        # Bodega IDs linked to this product (slots 1..12)
+        product_bodega_ids: list[int] = []
+        for i in range(1, 13):
+            bid = p.get(f"inv_bodega{i}") or 0
             try:
-                bid = int(r.get("inv_bodegas") or 0)
-                exs = float(r.get("exs") or 0)
+                bid = int(bid)
             except (TypeError, ValueError):
-                continue
-            if bid:
-                by_bod[bid] += exs
-        total = sum(by_bod.values())
+                bid = 0
+            if bid > 0:
+                product_bodega_ids.append(bid)
+                bodega_ids_used.add(bid)
 
-        # Skip if filter not satisfied (the process already pre-filters
-        # to total<0; this is for the alt mode).
+        # Try to get per-bodega breakdown from EXISTENCIAS (returns 0
+        # rows today; will work once API key permits it).
+        by_bod: dict[int, float] = {}
+        try:
+            exs_rows = await _fetch_all(
+                client, "EXISTENCIAS",
+                filters={"INV_PRODUCTOS": pid},
+                page_size=100,
+                max_pages=2,
+            )
+            for r in exs_rows:
+                if not isinstance(r, dict):
+                    continue
+                try:
+                    bid = int(r.get("inv_bodegas") or 0)
+                    exs = float(r.get("exs") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if bid:
+                    by_bod[bid] = by_bod.get(bid, 0) + exs
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("EXISTENCIAS fetch failed for product %s: %s",
+                           pid, exc)
+
+        # Total existence: prefer the consolidated EXS from the product
+        # (it's the field the process filters on) but fall back to the
+        # sum of per-bodega rows if EXISTENCIAS works.
+        try:
+            total = float(p.get("exs") or 0)
+        except (TypeError, ValueError):
+            total = 0.0
+        if total == 0 and by_bod:
+            total = sum(by_bod.values())
+
         if include_zero_total_with_negative_bodega:
             keep = total < 0 or any(v < 0 for v in by_bod.values())
         else:
@@ -209,7 +243,12 @@ async def generate_negative_stock_report(
             "iva_ventas": int(p.get("imp_fis_impuestos_vta") or 0),
             "existencia": total,
             "por_bodega": by_bod,
+            "product_bodega_ids": product_bodega_ids,
         })
+
+    # Bodega column order: stable, sorted by ID, restricted to those
+    # actually linked to at least one product in the report.
+    bodega_order = sorted(bodega_ids_used)
 
     if not rows:
         return {"success": True,
