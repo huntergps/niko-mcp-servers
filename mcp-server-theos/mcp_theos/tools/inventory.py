@@ -167,7 +167,48 @@ async def generate_negative_stock_report(
                   or f"BOD {bid}")
         bodega_name_by_id[bid] = nombre.upper()
 
-    # 3) Build rows. Use only the consolidated EXS field from the
+    # 3) Precompute per-bodega breakdown by calling
+    # BUSCAR_EXISTENCIAS_NEGATIVAS. The process loads PRODUCTOS where
+    # #EXS<0, walks the EXISTENCIAS_INV_PRODUCTOS plural, and returns
+    # the EXISTENCIAS rows (one per product × bodega). Each row has
+    # inv_productos, inv_bodegas and exs — exactly what we need to
+    # pivot for the XLSX columns M..V. Required because the generic
+    # GET /EXISTENCIAS does not work on Histórico tables.
+    exs_by_product: dict[int, dict[int, float]] = defaultdict(dict)
+    try:
+        exs_resp = await client.process("BUSCAR_EXISTENCIAS_NEGATIVAS")
+        exs_rows = (
+            exs_resp.get("existencias")
+            or exs_resp.get("EXISTENCIAS")
+            or []
+        )
+        if not isinstance(exs_rows, list):
+            exs_rows = [exs_rows] if exs_rows else []
+        for r in exs_rows:
+            if not isinstance(r, dict):
+                continue
+            try:
+                pid_r = int(r.get("inv_productos") or 0)
+                bid_r = int(r.get("inv_bodegas") or 0)
+                exs_v = float(r.get("exs") or 0)
+            except (TypeError, ValueError):
+                continue
+            if pid_r and bid_r:
+                exs_by_product[pid_r][bid_r] = (
+                    exs_by_product[pid_r].get(bid_r, 0.0) + exs_v
+                )
+        logger.info(
+            "BUSCAR_EXISTENCIAS_NEGATIVAS returned %d rows across %d products",
+            len(exs_rows), len(exs_by_product),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "BUSCAR_EXISTENCIAS_NEGATIVAS failed (likely not enabled "
+            "in API key yet): %s — falling back to total-only report",
+            exc,
+        )
+
+    # 4) Build rows. Use only the consolidated EXS field from the
     # product. The per-bodega virtual fields (EXS_BOD1..12) return '0'
     # in the JSON because they're computed by Velneo at the client
     # layer, not by REST. Per-bodega breakdown requires direct GET on
@@ -196,29 +237,14 @@ async def generate_negative_stock_report(
                 product_bodega_ids.append(bid)
                 bodega_ids_used.add(bid)
 
-        # Try to get per-bodega breakdown from EXISTENCIAS (returns 0
-        # rows today; will work once API key permits it).
-        by_bod: dict[int, float] = {}
-        try:
-            exs_rows = await _fetch_all(
-                client, "EXISTENCIAS",
-                filters={"INV_PRODUCTOS": pid},
-                page_size=100,
-                max_pages=2,
-            )
-            for r in exs_rows:
-                if not isinstance(r, dict):
-                    continue
-                try:
-                    bid = int(r.get("inv_bodegas") or 0)
-                    exs = float(r.get("exs") or 0)
-                except (TypeError, ValueError):
-                    continue
-                if bid:
-                    by_bod[bid] = by_bod.get(bid, 0) + exs
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("EXISTENCIAS fetch failed for product %s: %s",
-                           pid, exc)
+        # Per-bodega breakdown comes from the precomputed `exs_by_product`
+        # dict, populated upfront from the BUSCAR_EXISTENCIAS_NEGATIVAS
+        # process. That process returns a list of EXISTENCIAS rows
+        # (already filtered to products with negative consolidated
+        # stock + their plurales). Direct GET /EXISTENCIAS doesn't work
+        # for Histórico tables (the generic API does load("ID", []) and
+        # Histórico has no ID — see memory feedback_velneo_historico_rest).
+        by_bod: dict[int, float] = exs_by_product.get(pid, {})
 
         # Total existence: prefer the consolidated EXS from the product
         # (it's the field the process filters on) but fall back to the
