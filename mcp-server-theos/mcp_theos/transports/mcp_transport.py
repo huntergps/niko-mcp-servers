@@ -21,6 +21,7 @@ from mcp_theos.tenant_resolver import get_tenant_config
 from mcp_theos.tools import (
     admin_ops,
     admin_search,
+    inventory,
     invoices,
     otp_tools,
     partners,
@@ -1378,6 +1379,70 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "generate_negative_stock_report",
+        "description": (
+            "Genera el XLSX 'PRODUCTOS CON SALDO NEGATIVO' (reporte al "
+            "momento, sin parametros de fecha) y lo sube DIRECTO al chat "
+            "de Telegram con paleta corporativa + AutoFilter + negativos "
+            "en rojo. Una fila por producto con saldo total <0, con "
+            "desglose por bodega (columnas dinamicas). Usa el proceso "
+            "Velneo BUSCAR_PRODUCTOS_SIN_EXISTENCIAS que filtra del lado "
+            "del servidor (no descarga millones de productos). "
+            "USAR cuando el usuario pide: 'productos con saldo negativo', "
+            "'detalle de saldos negativos', 'existencias en rojo', "
+            "'productos en negativo', 'productos sobrevendidos'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "deliver_to_chat": {
+                    "type": "string",
+                    "description": "REQUERIDO. Telegram chat_id. Para Mepriga: '-5248384291'.",
+                },
+                "include_zero_total_with_negative_bodega": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Si True, ademas de los productos con total <0, "
+                        "incluye productos cuyo total es 0 pero al menos "
+                        "una bodega tiene saldo negativo (sobreventa en "
+                        "una ubicacion compensada en otra)."
+                    ),
+                },
+            },
+            "required": ["deliver_to_chat"],
+        },
+    },
+    {
+        "name": "inventory_movements_window",
+        "description": (
+            "Devuelve movimientos de inventario (INV_MOVIMIENTOS) por "
+            "rango de fechas + tipo de documento. Wrapper del proceso "
+            "Velneo INV_DOC_MOV_BUSQ_JS. tipo_doc: 'V'=ventas, 'W'=NCs "
+            "ventas, 'C'=compras, 'D'=NCs compras, ''=todos. Filtros "
+            "opcionales: producto, bodega, sucursal."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "ISO YYYY-MM-DD"},
+                "date_to": {"type": "string", "description": "ISO YYYY-MM-DD"},
+                "tipo_doc": {
+                    "type": "string",
+                    "enum": ["", "V", "W", "C", "D"],
+                    "default": "",
+                    "description": "V=ventas, W=NCs vtas, C=compras, D=NCs compras, ''=todos",
+                },
+                "sucursal": {"type": "string"},
+                "producto": {"type": "integer", "default": 0, "description": "0=no filtrar"},
+                "bodega": {"type": "integer", "default": 0, "description": "0=no filtrar"},
+                "off": {"type": "integer", "default": 0, "description": "1=incluir desactivados"},
+                "limit": {"type": "integer", "default": 1000, "minimum": 1, "maximum": 5000},
+            },
+            "required": ["date_from", "date_to"],
+        },
+    },
+    {
         "name": "reset_signature_queue_record",
         "description": (
             "Cambia ESTADO_FEAP='1' en UNA fila de COLA_DOCS_FIRMAR "
@@ -1467,6 +1532,8 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "signature_queue_status": ("signature_queue.signature_queue_status", signature_queue.signature_queue_status),
     "list_signature_queue_errors": ("signature_queue.list_signature_queue_errors", signature_queue.list_signature_queue_errors),
     "reset_signature_queue_record": ("signature_queue.reset_signature_queue_record", signature_queue.reset_signature_queue_record),
+    "generate_negative_stock_report": ("inventory.generate_negative_stock_report", inventory.generate_negative_stock_report),
+    "inventory_movements_window": ("inventory.inventory_movements_window", inventory.inventory_movements_window),
 }
 
 
