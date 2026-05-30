@@ -160,10 +160,12 @@ async def generate_negative_stock_report(
             bid = 0
         if not bid:
             continue
-        # Prefer nombre_corto (e.g. "COMERCIAL", "VIVERES") over the
-        # full name ("ALMACEN 01 - COMERCIAL"). Fall back to NAME.
-        nombre = ((b.get("nombre_corto") or "").strip()
-                  or (b.get("name") or "").strip()
+        # Use the full NAME ("ALMACEN 01 - COMERCIAL", "BP-100 VIVERES")
+        # — looks more professional in the XLSX columns; we set wide
+        # enough widths + wrap_text so they fit. Fall back to
+        # nombre_corto if NAME is missing.
+        nombre = ((b.get("name") or "").strip()
+                  or (b.get("nombre_corto") or "").strip()
                   or f"BOD {bid}")
         bodega_name_by_id[bid] = nombre.upper()
 
@@ -361,7 +363,7 @@ def _build_negative_stock_xlsx(
     SUBTITLE_FONT = Font(bold=True, color="404040", size=11)
     NEG_FONT = Font(color="C00000", bold=True)
     BODY_FONT = Font(size=10)
-    CENTER = Alignment(horizontal="center", vertical="center")
+    CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
     LEFT = Alignment(horizontal="left", vertical="center", wrap_text=False)
     RIGHT = Alignment(horizontal="right", vertical="center")
     thin = Side(border_style="thin", color="BFBFBF")
@@ -441,22 +443,30 @@ def _build_negative_stock_xlsx(
         ws.append(wo_cells)
 
     # Column widths
-    ws.column_dimensions["A"].width = 10
-    ws.column_dimensions["B"].width = 10
-    ws.column_dimensions["C"].width = 14
-    ws.column_dimensions["D"].width = 50
-    ws.column_dimensions["E"].width = 11
-    ws.column_dimensions["F"].width = 11
-    ws.column_dimensions["G"].width = 11
-    ws.column_dimensions["H"].width = 11
-    ws.column_dimensions["I"].width = 14
-    ws.column_dimensions["J"].width = 11
-    ws.column_dimensions["K"].width = 11
-    ws.column_dimensions["L"].width = 11
-    # Bodega columns
+    ws.column_dimensions["A"].width = 9   # ID
+    ws.column_dimensions["B"].width = 9   # Familia
+    ws.column_dimensions["C"].width = 14  # Código
+    ws.column_dimensions["D"].width = 52  # Nombre
+    ws.column_dimensions["E"].width = 11  # Promedio
+    ws.column_dimensions["F"].width = 11  # Ult.Compra
+    ws.column_dimensions["G"].width = 11  # PVP sin IVA
+    ws.column_dimensions["H"].width = 11  # % Utilidad
+    ws.column_dimensions["I"].width = 16  # Unidad Minima
+    ws.column_dimensions["J"].width = 11  # IVA Compras
+    ws.column_dimensions["K"].width = 11  # IVA Ventas
+    ws.column_dimensions["L"].width = 11  # Existencia total
+    # Bodega columns — wider to fit full names like "ALMACEN 01 - COMERCIAL"
     from openpyxl.utils import get_column_letter
-    for i, _ in enumerate(bodega_order, start=13):
-        ws.column_dimensions[get_column_letter(i)].width = 13
+    for i, bid in enumerate(bodega_order, start=13):
+        name = bodega_name_by_id.get(bid, "")
+        # Width based on longest word in the name (wrap_text handles
+        # the rest). Min 14, max 22 to avoid extreme cases.
+        longest_word = max((len(w) for w in name.split()), default=10)
+        width = max(14, min(22, longest_word + 4))
+        ws.column_dimensions[get_column_letter(i)].width = width
+
+    # Header row height taller so wrapped names fit (3 lines max)
+    ws.row_dimensions[5].height = 45
 
     # AutoFilter
     last_col = len(all_headers)
