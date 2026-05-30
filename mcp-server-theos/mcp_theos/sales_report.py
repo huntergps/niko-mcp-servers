@@ -78,7 +78,7 @@ def _cache_path(tenant_id: str, sucursal: str, day: str) -> _Path:
 def _today_ecu_iso() -> str:
     """ISO date for "today" in Ecuador (UTC-5, no DST)."""
     from datetime import datetime, timezone, timedelta
-    ec = datetime.now(timezone.utc) - timedelta(hours=6)
+    ec = datetime.now(timezone.utc) - timedelta(hours=5)
     return ec.date().isoformat()
 
 
@@ -284,7 +284,7 @@ def _fmt_datetime_es(value: Any) -> str:
         return f"{_fmt_date_es(d)} {t.replace('Z', '').split('.')[0][:8]}"
     import os
     try:
-        offset = float(os.environ.get("VELNEO_TZ_OFFSET_HOURS", "-6"))
+        offset = float(os.environ.get("VELNEO_TZ_OFFSET_HOURS", "-5"))
     except (TypeError, ValueError):
         offset = -5.0
     if offset:
@@ -1122,7 +1122,7 @@ def _aggregate_by_hour(
     """
     import os
     try:
-        offset = float(os.environ.get("VELNEO_TZ_OFFSET_HOURS", "-6"))
+        offset = float(os.environ.get("VELNEO_TZ_OFFSET_HOURS", "-5"))
     except (TypeError, ValueError):
         offset = -5.0
     offset_int = int(offset)
@@ -2021,7 +2021,7 @@ async def summarize_sales(
     total_count = 0
 
     try:
-        offset = float(os.environ.get("VELNEO_TZ_OFFSET_HOURS", "-6"))
+        offset = float(os.environ.get("VELNEO_TZ_OFFSET_HOURS", "-5"))
     except (TypeError, ValueError):
         offset = -5.0
     offset_int = int(offset)
