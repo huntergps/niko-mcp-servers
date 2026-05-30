@@ -108,50 +108,102 @@ DEFAULT_SAFE_RESET_PATTERNS: tuple[str, ...] = (
 def _parse_obser(obser_raw: str | None) -> dict[str, Any]:
     """Parse OBSER_DOC_SRI (JSON-as-string) into structured fields.
 
-    Returns ``{}`` if obser is empty / not JSON. Otherwise:
-      {
-        "datil_estado": str,          # CREADO / RECIBIDO / AUTORIZADO / NO AUTORIZADO / ERROR_HTTP
-        "datil_msn": str | None,      # mensaje genérico de Datil
-        "datil_http_error": int|None, # código HTTP cuando estado=ERROR_HTTP
-        "sri_errors": [
-            {"code": str, "message": str, "details": str, "parameter": str}, ...
-        ],
-        "sri_clave_acceso": str | None,
-        "sri_numero_autorizacion": str | None,
-      }
+    The Velneo field is Alfa 800 — when Datil's response is large,
+    Velneo truncates and the JSON ends up unterminated. ``json.loads``
+    fails. We fall back to regex extraction of the critical fields,
+    which always live in the first ~500 chars (before the truncation).
+
+    Returns ``{}`` if obser is empty / not JSON-shaped. Otherwise the
+    structured dict (see classify_obser for the keys used).
     """
     import json as _json
+    import re
     if not obser_raw or not isinstance(obser_raw, str):
         return {}
     s = obser_raw.strip()
     if not s.startswith("{"):
         return {}
+
+    def _empty_result() -> dict[str, Any]:
+        return {
+            "datil_estado": "",
+            "datil_msn": None,
+            "datil_http_error": None,
+            "sri_errors": [],
+            "sri_clave_acceso": None,
+            "sri_numero_autorizacion": None,
+            "parse_mode": None,
+        }
+
+    out = _empty_result()
+
+    # Path A — full JSON parses cleanly.
     try:
         data = _json.loads(s)
+        if isinstance(data, dict):
+            info = data.get("info") if isinstance(data.get("info"), dict) else {}
+            raw_errors = info.get("errors") if isinstance(info.get("errors"), list) else []
+            sri_errors = []
+            for e in raw_errors:
+                if not isinstance(e, dict):
+                    continue
+                sri_errors.append({
+                    "code": (e.get("code") or "").strip(),
+                    "message": (e.get("message") or "").strip(),
+                    "details": (e.get("details") or "").strip(),
+                    "parameter": (e.get("parameter") or "").strip(),
+                })
+            out.update({
+                "datil_estado": (data.get("estado") or "").strip(),
+                "datil_msn": data.get("msn") if isinstance(data.get("msn"), str) else None,
+                "datil_http_error": data.get("error") if isinstance(data.get("error"), int) else None,
+                "sri_errors": sri_errors,
+                "sri_clave_acceso": (data.get("clave_acceso") or "").strip() or None,
+                "sri_numero_autorizacion": (data.get("numero") or "").strip() or None,
+                "parse_mode": "json",
+            })
+            return out
     except _json.JSONDecodeError:
+        pass
+
+    # Path B — regex fallback for truncated JSON. We only target the
+    # fields that matter; the rest (body_params, request, etc.) are
+    # discarded.
+    def _re_str(key: str) -> str | None:
+        m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', s)
+        return m.group(1) if m else None
+
+    def _re_int(key: str) -> int | None:
+        m = re.search(rf'"{key}"\s*:\s*(-?\d+)', s)
+        return int(m.group(1)) if m else None
+
+    out["datil_estado"] = (_re_str("estado") or "").strip()
+    out["datil_msn"] = _re_str("msn")
+    out["datil_http_error"] = _re_int("error")
+    out["sri_clave_acceso"] = (_re_str("clave_acceso") or "").strip() or None
+    out["sri_numero_autorizacion"] = (_re_str("numero") or "").strip() or None
+
+    # Extract first error object from info.errors[*] using regex.
+    # The block starts at "errors":[{ and we capture up to the next }.
+    err_block_match = re.search(
+        r'"errors"\s*:\s*\[\s*(\{[^}]*\})',
+        s,
+    )
+    if err_block_match:
+        eb = err_block_match.group(1)
+        out["sri_errors"] = [{
+            "code": (re.search(r'"code"\s*:\s*"([^"]*)"', eb) or [None, ""]).__getitem__(1),
+            "message": (re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', eb) or [None, ""]).__getitem__(1),
+            "details": (re.search(r'"details"\s*:\s*"((?:[^"\\]|\\.)*)"', eb) or [None, ""]).__getitem__(1),
+            "parameter": (re.search(r'"parameter"\s*:\s*"([^"]*)"', eb) or [None, ""]).__getitem__(1),
+        }]
+
+    # If we got nothing useful, treat as unparseable.
+    if not (out["datil_estado"] or out["sri_errors"]):
         return {}
-    if not isinstance(data, dict):
-        return {}
-    info = data.get("info") if isinstance(data.get("info"), dict) else {}
-    raw_errors = info.get("errors") if isinstance(info.get("errors"), list) else []
-    sri_errors = []
-    for e in raw_errors:
-        if not isinstance(e, dict):
-            continue
-        sri_errors.append({
-            "code": (e.get("code") or "").strip(),
-            "message": (e.get("message") or "").strip(),
-            "details": (e.get("details") or "").strip(),
-            "parameter": (e.get("parameter") or "").strip(),
-        })
-    return {
-        "datil_estado": (data.get("estado") or "").strip(),
-        "datil_msn": (data.get("msn") if isinstance(data.get("msn"), str) else None),
-        "datil_http_error": data.get("error") if isinstance(data.get("error"), int) else None,
-        "sri_errors": sri_errors,
-        "sri_clave_acceso": (data.get("clave_acceso") or "").strip() or None,
-        "sri_numero_autorizacion": (data.get("numero") or "").strip() or None,
-    }
+
+    out["parse_mode"] = "regex_truncated"
+    return out
 
 
 def _classify_obser(parsed: dict[str, Any]) -> dict[str, Any]:
