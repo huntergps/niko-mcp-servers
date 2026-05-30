@@ -27,6 +27,7 @@ from mcp_theos.tools import (
     payments,
     products,
     sales,
+    signature_queue,
 )
 from mcp_theos.velneo_http import VelneoClient, VelneoError
 
@@ -1318,6 +1319,93 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "required": ["table"],
         },
     },
+    {
+        "name": "signature_queue_status",
+        "description": (
+            "Cuenta TODAS las filas de COLA_DOCS_FIRMAR agrupadas por "
+            "ESTADO_FEAP, con label humano (Autorizado, Enviado al "
+            "servidor, Puesto en cola, Error, etc.) y conteo. Opcional: "
+            "incluye hasta N ejemplos por estado (los más recientes por "
+            "FECHA_DOC). USAR cuando el usuario pregunta 'estado de la "
+            "cola de documentos electrónicos', 'cómo está la cola de "
+            "firma', 'qué hay en la cola', 'cuántos documentos están "
+            "autorizados/enviados/pendientes/en error'. Devuelve "
+            "breakdown completo, no solo errores."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_examples": {"type": "boolean", "default": True},
+                "max_examples_per_state": {
+                    "type": "integer", "default": 3,
+                    "minimum": 0, "maximum": 10,
+                },
+            },
+        },
+    },
+    {
+        "name": "list_signature_queue_errors",
+        "description": (
+            "Lista los registros de COLA_DOCS_FIRMAR con "
+            "ESTADO_FEAP='I' (Error). Por defecto filtra solo los que "
+            "tienen mensajes ya identificados como SEGUROS de resetear "
+            "('No es posible modificar un comprobante autorizado', "
+            "'INVALID_RECEIPT'). El response separa 'safe_to_reset' de "
+            "'other_errors' — los other_errors son problemas reales de "
+            "datos que un reset NO arreglaría. Pasa "
+            "``include_all_errors=True`` para ver también los other. "
+            "USAR cuando el usuario pregunta 'qué hay en error en la "
+            "cola', 'qué se debe destrabar', 'comprobantes atorados', "
+            "'cuántos por arreglar'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "patterns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Substrings (case-insensitive) a buscar en "
+                        "OBSER_DOC_SRI. Default: los 2 patrones seguros."
+                    ),
+                },
+                "include_all_errors": {
+                    "type": "boolean", "default": False,
+                    "description": "Si True trae también los errores que NO son seguros de resetear (solo lectura).",
+                },
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+            },
+        },
+    },
+    {
+        "name": "reset_signature_queue_record",
+        "description": (
+            "Cambia ESTADO_FEAP='1' en UNA fila de COLA_DOCS_FIRMAR "
+            "por ID. Solo aplica si la fila está actualmente en estado "
+            "'I' (Error) — si está en otro estado el tool rechaza con "
+            "``error_code='not_in_error_state'`` para no romper un "
+            "flujo normal. Re-lee la fila tras el write para "
+            "confirmar. USAR después de que el usuario AUTORIZA "
+            "explícitamente el reset de un ID específico (o de una "
+            "lista — llamá el tool por cada ID en paralelo). NUNCA "
+            "ejecutar sin confirmación humana previa: mostrar primero "
+            "list_signature_queue_errors, pedir OK, después resetear. "
+            "El efecto es seguro: el próximo ciclo de verificación "
+            "consulta al SRI, recibe AUTORIZADO y cierra la fila. No "
+            "hay re-envío ni duplicación."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "record_id": {"type": "integer", "minimum": 1},
+                "reason": {
+                    "type": "string",
+                    "description": "Texto libre para audit log (quién autorizó, contexto).",
+                },
+            },
+            "required": ["record_id"],
+        },
+    },
 ]
 
 
@@ -1376,6 +1464,9 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "sales_dashboard_chart": ("admin_ops.sales_dashboard_chart", admin_ops.sales_dashboard_chart),
     "sales_evolution_chart": ("admin_ops.sales_evolution_chart", admin_ops.sales_evolution_chart),
     "generate_sales_report": ("admin_ops.generate_sales_report", admin_ops.generate_sales_report),
+    "signature_queue_status": ("signature_queue.signature_queue_status", signature_queue.signature_queue_status),
+    "list_signature_queue_errors": ("signature_queue.list_signature_queue_errors", signature_queue.list_signature_queue_errors),
+    "reset_signature_queue_record": ("signature_queue.reset_signature_queue_record", signature_queue.reset_signature_queue_record),
 }
 
 

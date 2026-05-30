@@ -926,7 +926,7 @@ async def sales_quick_summary(
         date_from = f"{y_int:04d}-{m_int:02d}-01"
         date_to = f"{y_int:04d}-{m_int:02d}-{last_day:02d}"
     elif not date_from and not date_to:
-        ec_now = _datetime.now(timezone.utc) - timedelta(hours=5)
+        ec_now = _datetime.now(timezone.utc) - timedelta(hours=6)
         today_iso = ec_now.date().isoformat()
         date_from = today_iso
         date_to = today_iso
@@ -1060,7 +1060,7 @@ async def sales_evolution_chart(
         date_from = f"{y_int:04d}-{m_int:02d}-01"
         date_to = f"{y_int:04d}-{m_int:02d}-{last_day:02d}"
     elif not date_from and not date_to:
-        ec_now = _datetime.now(timezone.utc) - timedelta(hours=5)
+        ec_now = _datetime.now(timezone.utc) - timedelta(hours=6)
         today_iso = ec_now.date().isoformat()
         date_from = today_iso
         date_to = today_iso
@@ -1100,7 +1100,7 @@ async def sales_evolution_chart(
                 "error": f"mode must be one of {sorted(valid)} or 'auto'"}
 
     try:
-        offset = float(os.environ.get("VELNEO_TZ_OFFSET_HOURS", "-5"))
+        offset = float(os.environ.get("VELNEO_TZ_OFFSET_HOURS", "-6"))
     except (TypeError, ValueError):
         offset = -5.0
     offset_int = int(offset)
@@ -1119,7 +1119,7 @@ async def sales_evolution_chart(
     # For the in-progress day, cap the hour axis at the current local
     # hour so the chart doesn't pretend we have $0 in 13h00–23h00 just
     # because we're talking at 12:30.
-    today_ecu = (_datetime.now(timezone.utc) - timedelta(hours=5))
+    today_ecu = (_datetime.now(timezone.utc) - timedelta(hours=6))
     today_iso = today_ecu.date().isoformat()
     current_hour_ecu = today_ecu.hour
 
@@ -1389,7 +1389,7 @@ async def sales_dashboard_chart(
         date_from = f"{y_int:04d}-{m_int:02d}-01"
         date_to = f"{y_int:04d}-{m_int:02d}-{last_day:02d}"
     elif not date_from and not date_to:
-        ec_now = _datetime.now(timezone.utc) - timedelta(hours=5)
+        ec_now = _datetime.now(timezone.utc) - timedelta(hours=6)
         today_iso = ec_now.date().isoformat()
         date_from = today_iso
         date_to = today_iso
@@ -1455,7 +1455,7 @@ async def sales_dashboard_chart(
         f"<b>{title}</b>\nTotal: ${pvp_total:,.2f}"
     )
     # Mark in-progress day so the reader knows the hourly panel is partial.
-    _today_ecu_obj = _datetime.now(timezone.utc) - timedelta(hours=5)
+    _today_ecu_obj = _datetime.now(timezone.utc) - timedelta(hours=6)
     _today_iso = _today_ecu_obj.date().isoformat()
     if df <= _today_iso <= dt:
         caption += (
@@ -1565,7 +1565,7 @@ async def generate_sales_report(
         date_from = f"{y_int:04d}-{m_int:02d}-01"
         date_to = f"{y_int:04d}-{m_int:02d}-{last_day:02d}"
     elif not date_from and not date_to:
-        ec_now = datetime.now(timezone.utc) - timedelta(hours=5)
+        ec_now = datetime.now(timezone.utc) - timedelta(hours=6)
         today_iso = ec_now.date().isoformat()
         date_from = today_iso
         date_to = today_iso
