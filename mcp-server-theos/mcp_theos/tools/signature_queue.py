@@ -252,13 +252,18 @@ async def reset_signature_queue_record(
 ) -> dict[str, Any]:
     """Set ESTADO_FEAP='1' on a single COLA_DOCS_FIRMAR row.
 
-    Velneo's niko_saas API key (as of 2026-05-29) does NOT grant PATCH
-    on COLA_DOCS_FIRMAR — only GET and POST. We try a POST-with-id
-    (``POST COLA_DOCS_FIRMAR/{id}`` with partial body) which Velneo
-    treats as upsert on existing records. If that returns ``405`` or
-    a ``"no es válido para este API Key"`` error, the response surfaces
-    ``error_code='patch_required'`` so the operator can enable PATCH
-    on the Seguridad → API key panel.
+    Velneo's REST API uses **POST /TABLE/{id}** to modify an existing
+    record (NOT PATCH). The Swagger documents the endpoint literally as
+    "Modify existing document":
+
+      POST  /cola_docs_firmar          → create new (full body)
+      POST  /cola_docs_firmar/{id}     → modify existing (partial body)
+
+    Confirmed empirically on 2026-05-29 with id=204 (factura García
+    Reyes Patricia 001-002-000644228): POST with body {"ESTADO_FEAP":
+    "1"} executed the update and the re-read confirmed the change. No
+    PATCH method needed — and no fallback either; this is the canonical
+    Velneo update pattern.
 
     Always re-reads the row after the write to confirm the new state.
     """
@@ -319,15 +324,23 @@ async def reset_signature_queue_record(
             else (str(first) if first else "")
         )
         if status == "405" or "no es válido" in str(first or "").lower():
+            # Esta rama no debería dispararse: el swagger documenta
+            # POST /COLA_DOCS_FIRMAR/{id} como "Modify existing
+            # document" y ya está habilitado para niko_saas. Si llega
+            # acá es porque el operador deshabilitó POST en el panel
+            # de Seguridad → API key. La solución es re-habilitar
+            # POST sobre la tabla, NO buscar habilitar PATCH (que es
+            # un método que Velneo no usa para esta semántica).
             return {
                 "success": False,
-                "error_code": "patch_required",
+                "error_code": "post_disabled",
                 "error": (
-                    "Velneo rechazó el POST upsert (405). El API key "
-                    "niko_saas necesita PATCH habilitado sobre "
-                    "COLA_DOCS_FIRMAR. Habílitalo en Velneo Server → "
+                    "Velneo rechazó el POST con id (405). El API key "
+                    "niko_saas necesita POST habilitado sobre "
+                    "COLA_DOCS_FIRMAR. Habilítalo en Velneo Server → "
                     "Seguridad → API key niko_saas → COLA_DOCS_FIRMAR "
-                    "→ marcar PATCH."
+                    "→ marcar POST. Velneo usa POST /TABLE/{id} para "
+                    "modificar registros (no PATCH)."
                 ),
                 "velneo_status": status,
                 "velneo_error": str(first),

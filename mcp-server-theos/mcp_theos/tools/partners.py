@@ -434,15 +434,17 @@ async def update_partner(
 ) -> dict[str, Any]:
     """Update a customer's contact info in ENT.
 
-    Note (2026-05-28): Mepriga's ``niko_saas`` API key currently
-    rejects PATCH / PUT against ENT with
-    ``"405 El método PATCH no es válido para este API Key"``. Until
-    the operator enables write access on Velneo's Seguridad → API
-    key panel, this tool returns ``error_code=not_supported_yet``
-    with a verbose message the LLM can verbalize to the customer
-    ("no puedo actualizar tu email desde aquí, por favor escribe a
-    soporte"). The interface stays in place so the moment write
-    access is enabled, only the inner HTTP call needs to change.
+    Note (2026-05-28): this tool currently uses PATCH which Velneo
+    rejects with ``"405 El método PATCH no es válido para este API
+    Key"``. **The correct Velneo pattern for modifying a record is
+    POST /TABLE/{id}** (NOT PATCH) — confirmed in the swagger as
+    "Modify existing document" and validated empirically on
+    COLA_DOCS_FIRMAR (see signature_queue.reset_signature_queue_record).
+
+    TODO: rewrite this function to use ``client._client.post(f"ENT/{id}",
+    json=fields)`` instead of PATCH. Until then, the tool returns
+    ``error_code=not_supported_yet`` with a verbose message the LLM
+    can verbalize to the customer.
     """
     fields: dict[str, Any] = {}
     if email is not None:
