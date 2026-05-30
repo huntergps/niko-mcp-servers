@@ -174,12 +174,18 @@ async def generate_negative_stock_report(
     # inv_productos, inv_bodegas and exs — exactly what we need to
     # pivot for the XLSX columns M..V. Required because the generic
     # GET /EXISTENCIAS does not work on Histórico tables.
-    # Current year in Ecuador timezone (UTC-5)
+    # Current year in Ecuador timezone (UTC-5). EXISTENCIAS is
+    # Histórico — keeps rows year by year. The process accepts an
+    # AÑO variable and filters server-side; we only pay for what we
+    # actually use.
     año_actual = (datetime.now(timezone.utc) - timedelta(hours=5)).year
 
     exs_by_product: dict[int, dict[int, float]] = defaultdict(dict)
     try:
-        exs_resp = await client.process("BUSCAR_EXISTENCIAS_NEGATIVAS")
+        exs_resp = await client.process(
+            "BUSCAR_EXISTENCIAS_NEGATIVAS",
+            {"AÑO": año_actual},
+        )
         exs_rows = (
             exs_resp.get("existencias")
             or exs_resp.get("EXISTENCIAS")
@@ -187,30 +193,23 @@ async def generate_negative_stock_report(
         )
         if not isinstance(exs_rows, list):
             exs_rows = [exs_rows] if exs_rows else []
-        skipped_year = 0
         for r in exs_rows:
             if not isinstance(r, dict):
                 continue
             try:
-                row_año = int(r.get("año") or 0)
                 pid_r = int(r.get("inv_productos") or 0)
                 bid_r = int(r.get("inv_bodegas") or 0)
                 exs_v = float(r.get("exs") or 0)
             except (TypeError, ValueError):
-                continue
-            # EXISTENCIAS is Histórico — keeps rows year by year. Only
-            # the current year reflects the live stock.
-            if row_año != año_actual:
-                skipped_year += 1
                 continue
             if pid_r and bid_r:
                 exs_by_product[pid_r][bid_r] = (
                     exs_by_product[pid_r].get(bid_r, 0.0) + exs_v
                 )
         logger.info(
-            "BUSCAR_EXISTENCIAS_NEGATIVAS: %d rows total, %d ignored "
-            "(other years), %d productos with breakdown for año=%d",
-            len(exs_rows), skipped_year, len(exs_by_product), año_actual,
+            "BUSCAR_EXISTENCIAS_NEGATIVAS(AÑO=%d): %d rows, "
+            "%d productos with per-bodega breakdown",
+            año_actual, len(exs_rows), len(exs_by_product),
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
