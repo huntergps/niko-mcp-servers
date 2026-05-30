@@ -142,22 +142,30 @@ async def generate_negative_stock_report(
                 "delivered": False,
                 "note": "No hay productos con saldo negativo."}
 
-    # 2) Bodega names — fetch from INV_BODEGA. We still need them to
-    # show the bodega IDs hooked to the product (inv_bodega1..12) even
-    # if we cannot get the per-bodega EXS values yet.
+    # 2) Bodega names — fetch from INV_BODEGA WITHOUT fields filter
+    # (verified working: returns 20 bodegas with full data including
+    # nombre_corto which makes nicer column headers than the long NAME).
     try:
-        bodegas = await _fetch_all(
-            client, "INV_BODEGA",
-            fields=["ID", "NAME"],
-        )
+        bodegas = await _fetch_all(client, "INV_BODEGA", page_size=200)
     except Exception as exc:  # noqa: BLE001
         bodegas = []
         logger.warning("INV_BODEGA fetch failed: %s — using IDs", exc)
-    bodega_name_by_id = {
-        int(b["id"]): (b.get("name") or "").strip() or f"BOD {b['id']}"
-        for b in bodegas
-        if isinstance(b, dict) and b.get("id")
-    }
+    bodega_name_by_id: dict[int, str] = {}
+    for b in bodegas:
+        if not isinstance(b, dict):
+            continue
+        try:
+            bid = int(b.get("id") or 0)
+        except (TypeError, ValueError):
+            bid = 0
+        if not bid:
+            continue
+        # Prefer nombre_corto (e.g. "COMERCIAL", "VIVERES") over the
+        # full name ("ALMACEN 01 - COMERCIAL"). Fall back to NAME.
+        nombre = ((b.get("nombre_corto") or "").strip()
+                  or (b.get("name") or "").strip()
+                  or f"BOD {bid}")
+        bodega_name_by_id[bid] = nombre.upper()
 
     # 3) Build rows. Use only the consolidated EXS field from the
     # product. The per-bodega virtual fields (EXS_BOD1..12) return '0'
