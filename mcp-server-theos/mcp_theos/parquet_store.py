@@ -215,29 +215,46 @@ def _glob(tenant_id: str, sucursal: str) -> str:
     return str(base / f"*.{_PARQUET_VERSION}.parquet")
 
 
-def query(tenant_id: str, sucursal: str, sql_where: str = "TRUE",
-          *, params: list[Any] | None = None) -> "Any":
-    """Devuelve un duckdb relation/cursor para SQL ad-hoc sobre el histórico.
+def query(tenant_id: str, sucursal: str, sql_where: str = "TRUE") -> "Any":
+    """Devuelve una conexión DuckDB con la vista ``movs`` sobre los Parquet.
+
+    ``sql_where`` se interpola directo en el ``CREATE VIEW`` — DuckDB NO acepta
+    parámetros preparados (``?``) en un CREATE VIEW. Por eso quien construya el
+    filtro debe usar literales ya validados (ver :func:`connect_range`, que
+    valida las fechas como ISO antes de inyectarlas). No pasar entrada de
+    usuario sin validar.
 
     Uso típico desde otro módulo:
-        con = pq_connect(tenant, suc, date_from, date_to)
+        con = connect_range(tenant, suc, date_from, date_to)
         con.execute("SELECT INV_FAMI, SUM(PVP_LINEA) FROM movs GROUP BY 1")
     """
     import duckdb
     con = duckdb.connect(database=":memory:")
     con.execute(
         f"CREATE VIEW movs AS SELECT * FROM read_parquet('{_glob(tenant_id, sucursal)}') "
-        f"WHERE {sql_where}",
-        params or [],
+        f"WHERE {sql_where}"
     )
     return con
+
+
+def _iso_or_raise(value: str) -> str:
+    """Valida que ``value`` sea una fecha ISO (YYYY-MM-DD) y la devuelve.
+
+    Defensa contra inyección: el resultado se interpola como literal SQL, así
+    que solo permitimos una fecha bien formada.
+    """
+    day = (value or "")[:10]
+    _date.fromisoformat(day)  # lanza ValueError si no es ISO
+    return day
 
 
 def connect_range(tenant_id: str, sucursal: str,
                   date_from: str, date_to: str) -> "Any":
     """Conexión DuckDB con la vista ``movs`` acotada al rango [from, to]."""
-    return query(tenant_id, sucursal, "DAY >= ? AND DAY <= ?",
-                 params=[date_from[:10], date_to[:10]])
+    d_from = _iso_or_raise(date_from)
+    d_to = _iso_or_raise(date_to)
+    return query(tenant_id, sucursal,
+                 f"DAY >= '{d_from}' AND DAY <= '{d_to}'")
 
 
 def coverage(tenant_id: str, sucursal: str) -> dict[str, Any]:
