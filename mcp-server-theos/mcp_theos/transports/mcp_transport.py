@@ -1241,23 +1241,69 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "cuando el usuario pida 'cuanto comprar', 'recomendacion/sugerencia "
             "de compra', 'que reponer', 'pedido de compra', 'productos a "
             "comprar', o 'productos mas vendidos vs existencias'. Requiere "
-            "``deliver_to_chat``. ``history_months`` (default 2) define la "
-            "ventana de demanda; ``top_n`` (default 30) cuantos productos; "
-            "``coverage_months`` (default 1.5) el 3er criterio. Devuelve "
-            "``{success, delivered, pdf_filename, resumen, n_productos}``. "
-            "Lee el historial dia por dia desde el cache; la 1a vez sobre meses "
-            "frios puede tardar."
+            "``deliver_to_chat``. Demanda: ``history_months`` (default 2) o "
+            "``date_from`` (ISO, ej '2026-01-01' para 'desde enero') hasta hoy. "
+            "``top_n`` (default 30, hasta 300) cuantos productos. ``familia`` "
+            "filtra a una familia (ej 'VIVERES'). ``coverage_months`` (1.5) el "
+            "3er criterio. Devuelve ``{success, delivered, pdf_filename, "
+            "resumen, n_productos}``. Lee el historial dia por dia desde el "
+            "cache; la 1a vez sobre meses frios puede tardar."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "history_months": {"type": "integer", "default": 2, "description": "meses de demanda base (1-6)"},
-                "top_n": {"type": "integer", "default": 30, "description": "cuantos productos analizar (5-100)"},
+                "history_months": {"type": "integer", "default": 2, "description": "meses de demanda base (1-12); ignorado si se pasa date_from"},
+                "date_from": {"type": "string", "description": "ISO YYYY-MM-DD: inicio del historial de demanda (ej '2026-01-01' = desde enero) hasta hoy"},
+                "top_n": {"type": "integer", "default": 30, "description": "cuantos productos analizar (5-300)"},
+                "familia": {"type": "string", "description": "filtrar a una familia de producto (substring, ej 'VIVERES')"},
                 "coverage_months": {"type": "number", "default": 1.5, "description": "meses de cobertura para el 3er criterio"},
                 "deliver_to_chat": {"type": "string", "description": "telegram chat_id destino (REQUERIDO para entregar)"},
                 "sucursal": {"type": "string"},
             },
             "required": ["deliver_to_chat"],
+        },
+    },
+    {
+        "name": "generate_custom_report",
+        "description": (
+            "Genera un PDF A MEDIDA cuando el informe pedido NO encaja en los "
+            "tools dedicados (ejecutivo / pronostico / compra). El agente pasa "
+            "``python_code`` que dibuja el PDF y opcionalmente ``datasets`` que "
+            "el MCP obtiene del ERP y entrega al codigo. USAR solo para "
+            "informes con formato no estandar; si encaja en un tool dedicado, "
+            "preferir ese.\n\n"
+            "DATASETS: lista de {name, tool, ...params}. tools validos: "
+            "'sales_summary' (month|year|date_from+date_to, include_cross_tabs), "
+            "'open_debts' (limit), 'invoice_lines' (date_from,date_to,limit), "
+            "'stock' (product_ids|codes). Quedan en el codigo como "
+            "datasets['<name>'].\n\n"
+            "CODIGO: corre en un sandbox restringido (SIN import/red/archivos) "
+            "con estos nombres ya disponibles: datasets, np, plt, mtick, io, "
+            "canvas, A4, landscape, HexColor, ImageReader; paleta PRIMARY/"
+            "SECONDARY/GREEN/RED/ORANGE/SUBTLE/ZEBRA, PAGE_W/PAGE_H/LM/RM/TM/BM, "
+            "H; helpers banner(c,titulo,sub,rango), footer(c,pag,total), "
+            "section(c,y,titulo)->y, kpi_cards(c,y,[{label,valor,icon,accent,sub}])"
+            "->y, table(c,y,headers,rows,widths,align)->y, text_block(c,y,[parr])"
+            "->y, chart(fig)->ImageReader, chart_barh(items,namekeys,valkeys,"
+            "titulo), money(v), k(v), G/L/fnum. El codigo DEBE asignar "
+            "``pdf_bytes`` (bytes que empiezan con %PDF-) y puede asignar "
+            "``resumen`` (str). Ejemplo: buf=io.BytesIO(); c=canvas.Canvas(buf,"
+            "pagesize=A4); banner(c,'Titulo','sub','rango'); c.showPage(); "
+            "c.save(); pdf_bytes=buf.getvalue()."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "python_code": {"type": "string", "description": "codigo Python que dibuja el PDF y asigna pdf_bytes"},
+                "datasets": {
+                    "type": "array",
+                    "description": "datos a obtener del ERP y pasar al codigo como datasets[name]",
+                    "items": {"type": "object"},
+                },
+                "filename": {"type": "string", "description": "nombre del archivo PDF (default informe-mepriga.pdf)"},
+                "deliver_to_chat": {"type": "string", "description": "telegram chat_id destino (REQUERIDO para entregar)"},
+            },
+            "required": ["python_code", "deliver_to_chat"],
         },
     },
     {
@@ -1597,6 +1643,7 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "generate_executive_report": ("admin_ops.generate_executive_report", admin_ops.generate_executive_report),
     "generate_forecast_report": ("admin_ops.generate_forecast_report", admin_ops.generate_forecast_report),
     "generate_purchase_report": ("admin_ops.generate_purchase_report", admin_ops.generate_purchase_report),
+    "generate_custom_report": ("admin_ops.generate_custom_report", admin_ops.generate_custom_report),
     "signature_queue_status": ("signature_queue.signature_queue_status", signature_queue.signature_queue_status),
     "list_signature_queue_errors": ("signature_queue.list_signature_queue_errors", signature_queue.list_signature_queue_errors),
     "reset_signature_queue_record": ("signature_queue.reset_signature_queue_record", signature_queue.reset_signature_queue_record),

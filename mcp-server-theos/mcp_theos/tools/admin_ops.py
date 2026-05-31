@@ -1648,34 +1648,45 @@ async def generate_purchase_report(
     history_months: int = 2,
     top_n: int = 30,
     coverage_months: float = 1.5,
+    date_from: str | None = None,
+    familia: str | None = None,
     deliver_to_chat: str | None = None,
     sucursal: str | None = None,
 ) -> dict[str, Any]:
     """Recomendación de compra: cruza productos más vendidos vs existencias y
     sugiere cuánto comprar para el próximo mes (PDF).
 
-    Lee la demanda de los últimos ``history_months`` meses (día por día,
-    reutilizando el caché en disco — no recarga el ERP en corridas repetidas)
-    y las existencias actuales (EXS) de PRODUCTOS en una sola pasada paginada.
-    Tres criterios por producto: reposición simple, +20% seguridad y cobertura
+    Demanda histórica: por defecto los últimos ``history_months`` meses, o
+    desde ``date_from`` (ISO YYYY-MM-DD, ej. '2026-01-01' para "desde enero")
+    hasta hoy. Lee día por día reutilizando el caché en disco. ``familia``
+    filtra los productos a una familia (substring, case-insensitive).
+    ``top_n`` hasta 300. Tres criterios: reposición, +20% seguridad, cobertura
     de ``coverage_months`` meses. Entrega via send_document o devuelve base64.
     """
     import base64
     import calendar
     from datetime import date as _date, datetime as _datetime, timezone, timedelta
 
-    hm = max(1, min(int(history_months or 2), 6))
-    topn = max(5, min(int(top_n or 30), 100))
+    hm = max(1, min(int(history_months or 2), 12))
+    topn = max(5, min(int(top_n or 30), 300))
     cov = float(coverage_months or 1.5)
+    fam_filter = (familia or "").strip().lower() or None
 
     ec_now = _datetime.now(timezone.utc) - timedelta(hours=5)
-    # Ventana histórica: hm meses completos previos al mes actual + lo que va
-    # del mes actual, para una tasa de venta reciente.
     end = ec_now.date()
-    sy, sm = end.year, end.month
-    for _ in range(hm):
-        sy, sm = (sy - 1, 12) if sm == 1 else (sy, sm - 1)
-    hist_start = _date(sy, sm, 1)
+    if date_from:
+        try:
+            hist_start = _date.fromisoformat(str(date_from)[:10])
+        except ValueError:
+            return {"success": False, "error": "date_from debe ser ISO YYYY-MM-DD"}
+        if hist_start > end:
+            return {"success": False, "error": "date_from en el futuro"}
+    else:
+        # Ventana: hm meses completos previos + lo que va del mes actual.
+        sy, sm = end.year, end.month
+        for _ in range(hm):
+            sy, sm = (sy - 1, 12) if sm == 1 else (sy, sm - 1)
+        hist_start = _date(sy, sm, 1)
     n_days_hist = (end - hist_start).days + 1
 
     # Mes objetivo (siguiente al actual) para el rótulo.
@@ -1688,10 +1699,13 @@ async def generate_purchase_report(
 
     # 1) Demanda: productos más vendidos por cantidad en la ventana.
     # summarize_sales directo (sales_quick_summary no forwarda top_n_productos).
+    # Con filtro de familia pedimos un pool más grande (la familia se conoce
+    # recién al traer el stock) y luego recortamos a topn.
     from mcp_theos.sales_report import summarize_sales as _sum_sales
+    pool = min(topn * 6, 1000) if fam_filter else topn
     sales = await _sum_sales(
         client, date_from=hist_start.isoformat(), date_to=end.isoformat(),
-        sucursal=sucursal, top_n_clientes=1, top_n_productos=topn,
+        sucursal=sucursal, top_n_clientes=1, top_n_productos=pool,
     )
     if sales.get("success") is False:
         return sales
@@ -1699,21 +1713,22 @@ async def generate_purchase_report(
     if not top:
         return {"success": False, "error": "no_sales_data",
                 "message": "No se encontraron productos vendidos en el periodo."}
-    top = top[:topn]
+    top = top[:pool]
 
     # 2) Existencias: SOLO de los productos del top (consulta puntual por
     # id, no paginar el catalogo entero — eso tardaba >300s y daba timeout).
     stock_by_id: dict[int, dict[str, Any]] = {}
     fields = ["ID", "NAME", "CODIGO", "INV_FAMI", "EXS", "COSTO_COMPRA", "COSTO_PROMEDIO"]
-    ids = []
+    top_filtrado: list = []  # productos que pasan el filtro de familia, en orden de demanda
     for p in top:
+        if len(top_filtrado) >= topn:
+            break
         try:
             pid = int(p.get("producto_id") or p.get("id") or 0)
         except (TypeError, ValueError):
             pid = 0
-        if pid:
-            ids.append(pid)
-    for pid in ids:
+        if not pid:
+            continue
         try:
             resp = await client.get("PRODUCTOS", record_id=pid, fields=fields)
         except VelneoError:
@@ -1721,23 +1736,35 @@ async def generate_purchase_report(
         if not resp.rows:
             continue
         r = resp.rows[0]
+        fam = (r.get("inv_fami") or r.get("INV_FAMI") or "").strip()
+        if fam_filter and fam_filter not in fam.lower():
+            continue
         stock_by_id[pid] = {
             "existencia": float(r.get("exs") or r.get("EXS") or 0),
             "costo": float(r.get("costo_compra") or r.get("COSTO_COMPRA")
                             or r.get("costo_promedio") or r.get("COSTO_PROMEDIO") or 0),
-            "familia": (r.get("inv_fami") or r.get("INV_FAMI") or "").strip(),
+            "familia": fam,
             "nombre": (r.get("name") or r.get("NAME") or "").strip(),
         }
+        top_filtrado.append(p)
+
+    if not top_filtrado:
+        return {"success": False, "error": "no_match",
+                "message": (f"No se encontraron productos vendidos de la familia '{familia}'."
+                            if fam_filter else "No se encontraron existencias para los productos vendidos.")}
 
     # 3) Calcular y armar el PDF.
     from mcp_theos.purchase import compute_purchase, build_purchase_report_pdf
-    pur = compute_purchase(top, stock_by_id, n_days_hist, coverage_months=cov)
+    pur = compute_purchase(top_filtrado, stock_by_id, n_days_hist, coverage_months=cov)
+    sub_extra = f" · familia: {familia}" if fam_filter else ""
     try:
-        pdf_bytes, resumen = build_purchase_report_pdf(pur, periodo_label, target_label)
+        pdf_bytes, resumen = build_purchase_report_pdf(
+            pur, periodo_label + sub_extra, target_label)
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": f"pdf_render_failed: {type(exc).__name__}: {exc}"}
 
-    fname = f"recomendacion-compra-mepriga-{ty:04d}-{tm:02d}.pdf"
+    fam_slug = ("-" + fam_filter.replace(" ", "")[:12]) if fam_filter else ""
+    fname = f"recomendacion-compra-mepriga{fam_slug}-{ty:04d}-{tm:02d}.pdf"
 
     if deliver_to_chat:
         from mcp_theos.telegram_delivery import send_document, BotTokenMissing
@@ -1761,6 +1788,122 @@ async def generate_purchase_report(
         "pdf_filename": fname, "resumen": resumen,
         "n_productos": pur["n_productos"], "target_month": f"{ty:04d}-{tm:02d}",
     }
+
+
+async def _fetch_dataset(client: VelneoClient, spec: dict) -> dict[str, Any]:
+    """Resuelve UN dataset para el sandbox. Tipos soportados (seguros):
+
+      {"tool":"sales_summary", "month"|"year"|"date_from"+"date_to",
+       "include_cross_tabs":bool}  -> salida de summarize_sales
+      {"tool":"open_debts", "limit":int}           -> get_open_debts
+      {"tool":"invoice_lines", "date_from","date_to","limit"} -> list_invoice_lines_window
+      {"tool":"stock", "product_ids":[..] | "codes":[..]}     -> check_stock
+
+    El MCP los obtiene con credenciales; el sandbox solo recibe el dict.
+    """
+    import calendar
+    from datetime import date as _date
+    from mcp_theos.sales_report import summarize_sales as _sum_sales
+    from mcp_theos.tools import products as _products
+
+    tool = str(spec.get("tool") or "").strip()
+    if tool == "sales_summary":
+        df = spec.get("date_from"); dt = spec.get("date_to")
+        month = spec.get("month"); year = spec.get("year")
+        if year:
+            y = int(str(year)); df = f"{y:04d}-01-01"; dt = f"{y:04d}-12-31"
+        elif month:
+            y, m = (int(p) for p in str(month).split("-"))
+            df = f"{y:04d}-{m:02d}-01"
+            dt = f"{y:04d}-{m:02d}-{calendar.monthrange(y, m)[1]:02d}"
+        if not df or not dt:
+            return {"error": "sales_summary requiere month/year o date_from+date_to"}
+        return await _sum_sales(client, date_from=df, date_to=dt,
+                                include_cross_tabs=bool(spec.get("include_cross_tabs")))
+    if tool == "open_debts":
+        return await get_open_debts(client, limit=int(spec.get("limit") or 500))
+    if tool == "invoice_lines":
+        return await list_invoice_lines_window(
+            client, date_from=spec.get("date_from"), date_to=spec.get("date_to"),
+            limit=int(spec.get("limit") or 1000))
+    if tool == "stock":
+        return await _products.check_stock(
+            client, product_ids=spec.get("product_ids"), codes=spec.get("codes"))
+    return {"error": f"tool de dataset desconocido: {tool}"}
+
+
+async def generate_custom_report(
+    client: VelneoClient,
+    *,
+    python_code: str,
+    datasets: list | None = None,
+    deliver_to_chat: str | None = None,
+    filename: str | None = None,
+) -> dict[str, Any]:
+    """Genera un PDF A MEDIDA: el agente pasa código Python que dibuja el PDF.
+
+    Para informes que NO encajan en los tools dedicados (ejecutivo, pronóstico,
+    compra). Flujo seguro:
+      1. El MCP obtiene los datos definidos en ``datasets`` (con credenciales).
+         Cada item: {"name": "...", "tool": "sales_summary"|"open_debts"|
+         "invoice_lines"|"stock", ...params} (ver _fetch_dataset). Quedan en el
+         sandbox como ``datasets["<name>"]``.
+      2. ``python_code`` corre en un SANDBOX restringido (sin import/red/archivos)
+         con los datos + matplotlib/reportlab + los helpers de dibujo Mepriga
+         (banner, kpi_cards, table, chart_barh, money, k, paleta...). El código
+         DEBE asignar ``pdf_bytes`` (bytes del PDF) y puede asignar ``resumen``.
+      3. El PDF se entrega a Telegram (deliver_to_chat) o se devuelve base64.
+
+    Usar cuando el usuario pide un informe/PDF sin formato fijo. Si encaja en
+    ejecutivo/pronóstico/compra, preferir esos tools.
+    """
+    import base64
+
+    if not python_code or not python_code.strip():
+        return {"success": False, "error": "python_code es requerido"}
+
+    # 1) Obtener datasets (con credenciales, fuera del sandbox).
+    data: dict[str, Any] = {}
+    for spec in (datasets or []):
+        if not isinstance(spec, dict):
+            continue
+        name = str(spec.get("name") or spec.get("tool") or f"ds{len(data)}")
+        try:
+            data[name] = await _fetch_dataset(client, spec)
+        except Exception as exc:  # noqa: BLE001
+            data[name] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    # 2) Render en sandbox.
+    from mcp_theos.sandbox import run_pdf_code
+    res = run_pdf_code(python_code, data, timeout_s=90.0)
+    if not res.get("ok"):
+        return {"success": False, "error": res.get("error"),
+                "trace": res.get("trace"),
+                "datasets_keys": list(data.keys())}
+
+    pdf_bytes = res["pdf_bytes"]
+    resumen = res.get("resumen") or "Informe generado."
+    fname = (filename or "informe-mepriga").strip()
+    if not fname.lower().endswith(".pdf"):
+        fname += ".pdf"
+
+    # 3) Entrega.
+    if deliver_to_chat:
+        from mcp_theos.telegram_delivery import send_document, BotTokenMissing
+        try:
+            await send_document(chat_id=str(deliver_to_chat), filename=fname,
+                                data=pdf_bytes, caption=resumen, parse_mode=None)
+        except BotTokenMissing as e:
+            return {"success": False, "error": "telegram_bot_token_missing", "message": str(e)}
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "error": "telegram_upload_failed", "message": str(e)}
+        return {"success": True, "delivered": True,
+                "delivered_to_chat": str(deliver_to_chat),
+                "pdf_filename": fname, "resumen": resumen}
+
+    return {"success": True,
+            "pdf_base64": base64.b64encode(pdf_bytes).decode(),
+            "pdf_filename": fname, "resumen": resumen}
 
 
 # ---------------------------------------------------------------------------
