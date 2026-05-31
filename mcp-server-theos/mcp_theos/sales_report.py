@@ -1910,7 +1910,14 @@ async def _fetch_invoice_credit_flags(
     days = [(d_from + timedelta(days=i)).isoformat()
             for i in range((d_to - d_from).days + 1)]
 
-    async def fetch_day(day_str: str) -> dict[int, bool]:
+    today_iso = _today_ecu_iso()
+
+    def _cf_cache_path(day_str: str) -> _Path:
+        safe_t = client.cfg.tenant_id.replace("/", "_")
+        return (_cache_root() / safe_t / "_credit_flags"
+                / f"{day_str}.{_CACHE_VERSION}.json")
+
+    async def _fetch_day_live(day_str: str) -> dict[int, bool]:
         flags: dict[int, bool] = {}
         page_num = 1
         page_size = 500
@@ -1942,6 +1949,34 @@ async def _fetch_invoice_credit_flags(
             if len(rows) < page_size:
                 break
             page_num += 1
+        return flags
+
+    async def fetch_day(day_str: str) -> dict[int, bool]:
+        # Días pasados son inmutables → cacheamos el mapa {inv_id: is_credit}
+        # en disco (mismo bind-mount persistente que el caché de líneas). HOY
+        # siempre se baja en vivo. Elimina ~1 GET/día al ERP en históricos —
+        # era el 62% del tiempo de un informe de 3 meses.
+        is_past = day_str < today_iso
+        if is_past:
+            cp = _cf_cache_path(day_str)
+            try:
+                with cp.open("r", encoding="utf-8") as f:
+                    return {int(k): bool(v) for k, v in _json.load(f).items()}
+            except (FileNotFoundError, ValueError, OSError):
+                pass
+        flags = await _fetch_day_live(day_str)
+        if is_past and flags:
+            try:
+                cp = _cf_cache_path(day_str)
+                cp.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cp.with_suffix(cp.suffix + ".tmp")
+                with tmp.open("w", encoding="utf-8") as f:
+                    _json.dump({str(k): (1 if v else 0)
+                                for k, v in flags.items()}, f,
+                               separators=(",", ":"))
+                tmp.replace(cp)
+            except OSError:
+                pass
         return flags
 
     # Run all days in parallel. asyncio.gather caps at the event loop's
