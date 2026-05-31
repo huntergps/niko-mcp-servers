@@ -1701,36 +1701,33 @@ async def generate_purchase_report(
                 "message": "No se encontraron productos vendidos en el periodo."}
     top = top[:topn]
 
-    # 2) Existencias: traer PRODUCTOS con EXS en una pasada paginada.
+    # 2) Existencias: SOLO de los productos del top (consulta puntual por
+    # id, no paginar el catalogo entero — eso tardaba >300s y daba timeout).
     stock_by_id: dict[int, dict[str, Any]] = {}
     fields = ["ID", "NAME", "CODIGO", "INV_FAMI", "EXS", "COSTO_COMPRA", "COSTO_PROMEDIO"]
-    page = 1
-    while page <= 200:
+    ids = []
+    for p in top:
         try:
-            resp = await client.get("PRODUCTOS",
-                                    params={"pagesize": 500, "page": page, "sort": "ID"},
-                                    fields=fields)
+            pid = int(p.get("producto_id") or p.get("id") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid:
+            ids.append(pid)
+    for pid in ids:
+        try:
+            resp = await client.get("PRODUCTOS", record_id=pid, fields=fields)
         except VelneoError:
-            break
-        batch = resp.rows
-        if not batch:
-            break
-        for r in batch:
-            try:
-                pid = int(r.get("id") or r.get("ID") or 0)
-            except (TypeError, ValueError):
-                pid = 0
-            if not pid:
-                continue
-            stock_by_id[pid] = {
-                "existencia": float(r.get("exs") or 0),
-                "costo": float(r.get("costo_compra") or r.get("costo_promedio") or 0),
-                "familia": (r.get("inv_fami") or "").strip(),
-                "nombre": (r.get("name") or "").strip(),
-            }
-        if len(batch) < 500:
-            break
-        page += 1
+            continue
+        if not resp.rows:
+            continue
+        r = resp.rows[0]
+        stock_by_id[pid] = {
+            "existencia": float(r.get("exs") or r.get("EXS") or 0),
+            "costo": float(r.get("costo_compra") or r.get("COSTO_COMPRA")
+                            or r.get("costo_promedio") or r.get("COSTO_PROMEDIO") or 0),
+            "familia": (r.get("inv_fami") or r.get("INV_FAMI") or "").strip(),
+            "nombre": (r.get("name") or r.get("NAME") or "").strip(),
+        }
 
     # 3) Calcular y armar el PDF.
     from mcp_theos.purchase import compute_purchase, build_purchase_report_pdf
