@@ -14,6 +14,7 @@ dependencies = [
     "reportlab>=4.0",
     "openpyxl>=3.1",
     "matplotlib>=3.8",
+    "pywaffle>=1.1",
 ]
 
 [project.optional-dependencies]
