@@ -384,7 +384,8 @@ def build_executive_report_pdf(summary: dict[str, Any]) -> tuple[bytes, str]:
     totals = summary.get("totals") or {}
     por_familia = _list(summary, "por_familia")
     por_hora = _list(summary, "por_hora")
-    por_pto = _list(summary, "por_pto_emision", "por_bodega")
+    por_pto = _list(summary, "por_pto_emision")
+    por_bodega = _list(summary, "por_bodega")
     por_dia = _list(summary, "por_dia_combinado", "por_dia")
     top_cli = _list(summary, "top_clientes")
     cnotes = summary.get("credit_notes") or {}
@@ -456,25 +457,34 @@ def build_executive_report_pdf(summary: dict[str, Any]) -> tuple[bytes, str]:
     c.showPage()
 
     # ---- Página 2 ----
-    _banner(c, "Operacion del periodo", "Horas, sucursales y clientes", rango)
+    _banner(c, "Operacion del periodo", "Horas y clientes", rango)
     y = PAGE_H - 118
     y = _section(c, y, "Ventas por hora")
-    c.drawImage(_chart_hora(por_hora), LM, y - 150, width=PAGE_W - LM - RM, height=150, preserveAspectRatio=True, mask="auto")
-    y -= 166
-    y = _section(c, y, "Ventas por sucursal / punto de emision")
-    c.drawImage(_chart_barh(por_pto, ["establecimiento_pto", "bodega", "pto", "name"], ["pvp"], "Ventas por punto de emision"),
-                LM, y - 160, width=PAGE_W - LM - RM, height=160, preserveAspectRatio=True, mask="auto")
-    y -= 176
+    c.drawImage(_chart_hora(por_hora), LM, y - 200, width=PAGE_W - LM - RM, height=200, preserveAspectRatio=True, mask="auto")
+    y -= 216
     if top_cli:
         y = _section(c, y, "Top clientes")
         rows = [[i, str(_g(cl, "cliente", "nombre", "name", default="?"))[:38],
                  f"{int(_fnum(_g(cl, 'n_facturas')))}", _money(_g(cl, "pvp", "ticket", "total"))]
-                for i, cl in enumerate(top_cli[:8], 1)]
+                for i, cl in enumerate(top_cli[:10], 1)]
         _table(c, y, ["#", "Cliente", "Fact.", "Monto"], rows, [26, 320, 50, 123], align=["l", "l", "r", "r"])
     _footer(c, 2, TP)
     c.showPage()
 
-    # ---- Página 3 ----
+    # ---- Página 3: desgloses por punto de emision (sucursal) y por bodega ----
+    _banner(c, "Sucursales y bodegas", "Desglose de ventas por ubicacion", rango)
+    y = PAGE_H - 118
+    y = _section(c, y, "Ventas por punto de emision (sucursal / caja)")
+    c.drawImage(_chart_barh(por_pto, ["establecimiento_pto", "pto", "name"], ["pvp"], "Por punto de emision"),
+                LM, y - 250, width=PAGE_W - LM - RM, height=250, preserveAspectRatio=True, mask="auto")
+    y -= 268
+    y = _section(c, y, "Ventas por bodega")
+    c.drawImage(_chart_barh(por_bodega, ["bodega", "name", "nombre"], ["pvp"], "Por bodega"),
+                LM, y - 250, width=PAGE_W - LM - RM, height=250, preserveAspectRatio=True, mask="auto")
+    _footer(c, 3, TP)
+    c.showPage()
+
+    # ---- Página 4 ----
     _banner(c, "Tendencia y proyeccion", "Lectura del periodo", rango)
     y = PAGE_H - 118
     y = _section(c, y, "Tendencia diaria y proyeccion")
@@ -502,7 +512,7 @@ def build_executive_report_pdf(summary: dict[str, Any]) -> tuple[bytes, str]:
         f"2. <b>Reforzar caja/personal</b> en la franja pico ({pico_txt}).",
         f"3. <b>Gestionar devoluciones</b> ({_money(nc_tot)} en NC): revisar causas para reducir el impacto en el neto.",
     ])
-    _footer(c, 3, TP)
+    _footer(c, 4, TP)
     c.showPage()
     c.save()
 
