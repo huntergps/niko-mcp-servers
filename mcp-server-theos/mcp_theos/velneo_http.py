@@ -287,10 +287,21 @@ class VelneoClient:
         name: str,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Invoke a Velneo process: ``GET /_process/<name>?param[...]=...``."""
+        """Invoke a Velneo process: ``GET /_process/<name>?param[...]=...``.
+
+        Las claves de proceso van envueltas en ``param[VAR]``. PERO las claves
+        reservadas del API REST (``page[number]``, ``page[size]``) NO se
+        envuelven — son paginación estándar que el motor v1.js aplica a la
+        lista de salida del proceso (`listaFiltrarOrdenarPaginar`). Si se
+        envolvieran (``param[page[number]]``) el API las ignora y siempre
+        devuelve la primera página. (Bug detectado 2026-05-31.)
+        """
         q: dict[str, Any] = {}
         for k, v in (params or {}).items():
-            q[f"param[{k}]"] = v
+            if k.startswith("page[") or k in ("sort", "fields"):
+                q[k] = v          # reservada del API: sin envolver
+            else:
+                q[f"param[{k}]"] = v
         resp = await self._client.get(f"_process/{quote(name)}", params=q)
         resp.raise_for_status()
         return resp.json()

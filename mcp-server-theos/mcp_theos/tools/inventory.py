@@ -777,19 +777,37 @@ async def inventory_movements_window(
     if empresa:
         params["EMPRESA"] = empresa
 
-    try:
-        resp = await client.process("INV_DOC_MOV_BUSQ_JS", params)
-    except Exception as exc:  # noqa: BLE001
-        return {"success": False,
-                "error": f"INV_DOC_MOV_BUSQ_JS failed: {exc}"}
+    # El API REST topa la respuesta en 1000 filas (hardcode en v1.js:
+    # paginaSize>1000 -> 1000). Un día de Mepriga tiene ~1344 movimientos, así
+    # que paginamos: pedimos page[number]=1,2,3... (1000 c/u) hasta que una
+    # página venga con <1000 filas (= última). Tope de seguridad: max_pages.
+    _API_PAGE = 1000
+    max_pages = 200  # 200k movimientos cap duro — más que cualquier rango real
+    all_rows: list[dict[str, Any]] = []
+    page = 1
+    while page <= max_pages:
+        page_params = dict(params)
+        page_params["page[number]"] = page
+        page_params["page[size]"] = _API_PAGE
+        try:
+            resp = await client.process("INV_DOC_MOV_BUSQ_JS", page_params)
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False,
+                    "error": f"INV_DOC_MOV_BUSQ_JS failed (page {page}): {exc}",
+                    "rows_collected": len(all_rows)}
+        # OJO: salida de un PROCESO viene con keys lowercase (ver memoria
+        # velneo-lowercase-fields). El envelope también: "inv_movimientos".
+        chunk = resp.get("inv_movimientos") or resp.get("INV_MOVIMIENTOS") or []
+        if not isinstance(chunk, list):
+            chunk = [chunk] if chunk else []
+        all_rows.extend(chunk)
+        if len(chunk) < _API_PAGE:
+            break  # última página
+        page += 1
+    pages_hit_cap = page > max_pages
 
-    # OJO: salida de un PROCESO viene con keys lowercase (ver memoria
-    # velneo-lowercase-fields). El envelope también: "inv_movimientos".
-    rows = resp.get("inv_movimientos") or resp.get("INV_MOVIMIENTOS") or []
-    if not isinstance(rows, list):
-        rows = [rows] if rows else []
-
-    # Truncate response to LIMIT to avoid blowing up the LLM context
+    rows = all_rows
+    # ``limit`` acota lo que se DEVUELVE al LLM (contexto), no lo que se cuenta.
     truncated = len(rows) > limit
     head = rows[:limit]
 
@@ -803,6 +821,8 @@ async def inventory_movements_window(
             "proveedor": proveedor, "empresa": empresa,
         }.items() if v},
         "n_movimientos": len(rows),
+        "pages_fetched": page if not pages_hit_cap else max_pages,
+        "pages_hit_cap": pages_hit_cap,
         "truncated": truncated,
         "returned": len(head),
         "rows": head,
