@@ -31,6 +31,44 @@ def _strip(d):
     return d
 
 
+_MONEY_TOL = 0.01  # tolerancia: artefacto de no-asociatividad de punto flotante
+
+
+def _deep_equal(a, b, path="", diffs=None):
+    """Compara tolerando <=1 centavo en floats (float non-associativity).
+    Acumula en ``diffs`` los caminos con diferencia REAL (>1 centavo o
+    estructural). Devuelve (igual_bool, max_money_delta)."""
+    if diffs is None:
+        diffs = []
+    maxd = 0.0
+    if isinstance(a, float) or isinstance(b, float):
+        try:
+            delta = abs(float(a) - float(b))
+        except (TypeError, ValueError):
+            diffs.append((path, a, b)); return False, maxd
+        maxd = delta
+        if delta > _MONEY_TOL:
+            diffs.append((path, a, b))
+        return delta <= _MONEY_TOL, maxd
+    if isinstance(a, dict) and isinstance(b, dict):
+        ok = True
+        for k in set(a) | set(b):
+            e, d = _deep_equal(a.get(k), b.get(k), f"{path}.{k}", diffs)
+            ok = ok and e; maxd = max(maxd, d)
+        return ok, maxd
+    if isinstance(a, list) and isinstance(b, list):
+        if len(a) != len(b):
+            diffs.append((f"{path}[len]", len(a), len(b))); return False, maxd
+        ok = True
+        for i, (x, y) in enumerate(zip(a, b)):
+            e, d = _deep_equal(x, y, f"{path}[{i}]", diffs)
+            ok = ok and e; maxd = max(maxd, d)
+        return ok, maxd
+    if a != b:
+        diffs.append((path, a, b)); return False, maxd
+    return True, maxd
+
+
 async def _run(client, df, dt, disable_pq):
     if disable_pq:
         os.environ["MOV_PARQUET_DISABLE"] = "1"
@@ -57,23 +95,17 @@ async def main():
         r_js, t_js = await _run(client, df, dt, disable_pq=True)
         print(f"[jsonl]   {t_js:.2f}s  stats={r_js.get('cache_stats')}")
 
-        a = json.dumps(_strip(r_pq), sort_keys=True, ensure_ascii=False)
-        b = json.dumps(_strip(r_js), sort_keys=True, ensure_ascii=False)
-
-        if a == b:
-            speedup = (t_js / t_pq) if t_pq else float("inf")
-            print(f"IDENTICOS ✓   speedup parquet={speedup:.1f}x  "
-                  f"total_pvp={r_pq['totals']['pvp']:,.2f}")
+        diffs: list = []
+        ok, maxd = _deep_equal(_strip(r_pq), _strip(r_js), diffs=diffs)
+        speedup = (t_js / t_pq) if t_pq else float("inf")
+        if ok:
+            print(f"IDENTICOS ✓ (tol<=1cent)  speedup parquet={speedup:.1f}x  "
+                  f"max_delta=${maxd:.4f}  total_pvp={r_pq['totals']['pvp']:,.2f}")
         else:
-            print("DIFIEREN ✗ — buscando primer campo distinto...")
-            da, db = _strip(r_pq), _strip(r_js)
-            for k in sorted(set(da) | set(db)):
-                va = json.dumps(da.get(k), sort_keys=True, ensure_ascii=False)
-                vb = json.dumps(db.get(k), sort_keys=True, ensure_ascii=False)
-                if va != vb:
-                    print(f"  campo '{k}':")
-                    print(f"    parquet: {va[:300]}")
-                    print(f"    jsonl:   {vb[:300]}")
+            print(f"DIFIEREN ✗  speedup={speedup:.1f}x  max_delta=${maxd:.4f}  "
+                  f"diffs_reales={len(diffs)}")
+            for path, va, vb in diffs[:15]:
+                print(f"  {path}: parquet={va!r}  jsonl={vb!r}")
 
 
 if __name__ == "__main__":

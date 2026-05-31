@@ -351,9 +351,9 @@ def aggregate_accumulators(
     con.execute(f"""
         CREATE VIEW m AS
         SELECT
-            CAST(PVP_LINEA AS DOUBLE)          AS pvp,
-            CAST(PRECIO_NETO_LINEA AS DOUBLE)  AS neto,
-            CAST(CAN AS DOUBLE)                AS can,
+            CAST(PVP_LINEA AS DECIMAL(18,4))          AS pvp,
+            CAST(PRECIO_NETO_LINEA AS DECIMAL(18,4))  AS neto,
+            CAST(CAN AS DECIMAL(18,4))                AS can,
             CAST(VENT_FACT_VENT AS BIGINT)     AS inv_id,
             CAST(INV_FAMI AS BIGINT)           AS fam_id,
             CAST(INV_BODEGA AS BIGINT)         AS bod_id,
@@ -384,7 +384,8 @@ def aggregate_accumulators(
         "SELECT COALESCE(SUM(pvp),0), COALESCE(SUM(neto),0), COUNT(*), "
         "COUNT(DISTINCT CASE WHEN inv_id<>0 THEN inv_id END) FROM m"
     ).fetchone()
-    total_pvp, total_neto, n_lineas, n_facturas = tot[0], tot[1], int(tot[2]), int(tot[3])
+    total_pvp, total_neto, n_lineas, n_facturas = (
+        float(tot[0]), float(tot[1]), int(tot[2]), int(tot[3]))
 
     # facturas_all como set (para len y consistencia con el otro camino).
     facturas_all = {int(r[0]) for r in con.execute(
@@ -402,6 +403,7 @@ def aggregate_accumulators(
     by_forma_pago: dict[str, dict[str, Any]] = {}
     pvp_contado = pvp_credito = 0.0
     for forma, s_pvp, n_lin, ids in fp:
+        s_pvp = float(s_pvp)
         by_forma_pago[forma] = {"pvp": s_pvp, "lineas": int(n_lin),
                                 "facturas": {int(x) for x in (ids or []) if x}}
         if forma == "Contado":
@@ -415,7 +417,8 @@ def aggregate_accumulators(
         SELECT day_key, COALESCE(SUM(pvp),0), COALESCE(SUM(neto),0), COUNT(*),
                list(DISTINCT CASE WHEN inv_id<>0 THEN inv_id END)
         FROM m GROUP BY 1""").fetchall():
-        by_day[day] = {"pvp": s_pvp, "neto": s_neto, "lineas": int(n_lin),
+        by_day[day] = {"pvp": float(s_pvp), "neto": float(s_neto),
+                       "lineas": int(n_lin),
                        "facturas": {int(x) for x in (ids or []) if x}}
 
     # ----- por_hora (solo HOUR_ECU >= 0) -----
@@ -425,7 +428,7 @@ def aggregate_accumulators(
                list(DISTINCT CASE WHEN inv_id<>0 THEN inv_id END)
         FROM m WHERE HOUR_ECU >= 0 GROUP BY 1""").fetchall():
         by_hour[f"{int(h):02d}h00"] = {
-            "pvp": s_pvp, "lineas": int(n_lin),
+            "pvp": float(s_pvp), "lineas": int(n_lin),
             "facturas": {int(x) for x in (ids or []) if x}}
 
     # ----- por_familia (map id→nombre padre en Python) -----
@@ -438,7 +441,7 @@ def aggregate_accumulators(
         name = (familia_parent.get(fam_id, f"FAM_{fam_id}") if fam_id
                 else "(sin familia)")
         b = by_familia[name]
-        b["pvp"] += s_pvp
+        b["pvp"] += float(s_pvp)
         b["lineas"] += int(n_lin)
 
     # ----- por_bodega -----
@@ -452,7 +455,7 @@ def aggregate_accumulators(
         name = (bodega_names.get(bod_id, f"BOD_{bod_id}") if bod_id
                 else "(sin bodega)")
         b = by_bodega[name]
-        b["pvp"] += s_pvp
+        b["pvp"] += float(s_pvp)
         b["lineas"] += int(n_lin)
         b["facturas"].update(int(x) for x in (ids or []) if x)
 
@@ -462,7 +465,7 @@ def aggregate_accumulators(
         SELECT EST_PTO, COALESCE(SUM(pvp),0), COUNT(*),
                list(DISTINCT CASE WHEN inv_id<>0 THEN inv_id END)
         FROM m GROUP BY 1""").fetchall():
-        by_pto_emi[ep] = {"pvp": s_pvp, "lineas": int(n_lin),
+        by_pto_emi[ep] = {"pvp": float(s_pvp), "lineas": int(n_lin),
                           "facturas": {int(x) for x in (ids or []) if x}}
 
     # ----- top_clientes (cliente + cif) -----
@@ -471,7 +474,8 @@ def aggregate_accumulators(
         SELECT CLIENTE, MAX(CIF), COALESCE(SUM(pvp),0), COUNT(*),
                list(DISTINCT CASE WHEN inv_id<>0 THEN inv_id END)
         FROM m GROUP BY CLIENTE""").fetchall():
-        by_cliente[cli] = {"pvp": s_pvp, "lineas": int(n_lin), "cif": cif or "",
+        by_cliente[cli] = {"pvp": float(s_pvp), "lineas": int(n_lin),
+                           "cif": cif or "",
                            "facturas": {int(x) for x in (ids or []) if x}}
 
     # ----- top_productos (clave = NOMBRE o ID#id o (sin nombre)) -----
@@ -488,8 +492,8 @@ def aggregate_accumulators(
             b = {"pvp": 0.0, "cantidad": 0.0, "lineas": 0,
                  "cod_bar": "", "producto_id": 0}
             by_producto[key] = b
-        b["pvp"] += s_pvp
-        b["cantidad"] += s_can
+        b["pvp"] += float(s_pvp)
+        b["cantidad"] += float(s_can)
         b["lineas"] += int(n_lin)
         b["producto_id"] = prod_id or b["producto_id"]
         b["cod_bar"] = (cod_bar or b["cod_bar"]).strip()
@@ -505,7 +509,7 @@ def aggregate_accumulators(
         fam_id = int(fam_id)
         name = (familia_parent.get(fam_id, f"FAM_{fam_id}") if fam_id
                 else "(sin familia)")
-        by_fam_pto[(name, ep)] += s_pvp
+        by_fam_pto[(name, ep)] += float(s_pvp)
     for fam_id, bod_id, s_pvp in con.execute(
         "SELECT fam_id, bod_id, COALESCE(SUM(pvp),0) FROM m GROUP BY 1,2"
     ).fetchall():
@@ -514,11 +518,11 @@ def aggregate_accumulators(
                  else "(sin familia)")
         bname = (bodega_names.get(bod_id, f"BOD_{bod_id}") if bod_id
                  else "(sin bodega)")
-        by_fam_bod[(fname, bname)] += s_pvp
+        by_fam_bod[(fname, bname)] += float(s_pvp)
     for day, ep, s_pvp in con.execute(
         "SELECT day_key, EST_PTO, COALESCE(SUM(pvp),0) FROM m GROUP BY 1,2"
     ).fetchall():
-        by_day_pto[(day, ep)] += s_pvp
+        by_day_pto[(day, ep)] += float(s_pvp)
     for ep, ids in con.execute("""
         SELECT EST_PTO, list(DISTINCT CASE WHEN inv_id<>0 THEN inv_id END)
         FROM m GROUP BY 1""").fetchall():
