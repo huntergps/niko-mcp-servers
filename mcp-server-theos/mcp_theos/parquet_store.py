@@ -50,14 +50,32 @@ from mcp_theos.sales_report import (
 #   numéricas las que se suman/cuentan; texto el resto.
 _NUM_COLS = ("PVP_LINEA", "PRECIO_NETO_LINEA", "CAN")
 _INT_COLS = ("VENT_FACT_VENT", "INV_FAMI", "INV_BODEGA", "PRODUCTOS")
-# El orden de columnas del Parquet es estable (sorted) para que el esquema no
-# dependa del orden de iteración del frozenset.
-_COLS = tuple(sorted(_KEEP_KEYS)) + ("DAY",)  # DAY = día ISO de la partición
+
+# Columnas DERIVADAS (v2) — calculadas UNA vez al escribir el Parquet con las
+# mismas funciones que usa summarize_sales, para que la agregación SQL sea un
+# GROUP BY limpio sin tocar Python por fila:
+#   DAY       día ISO de la partición (= día de captura del caché)
+#   LINE_DAY  día ISO derivado de FECHA_CONTA + offset ECU (lo que usa por_dia)
+#   HOUR_ECU  hora entera de FECHA_CONTA + offset ECU (-1 si no parseable)
+#   EST_PTO   "establecimiento-pto" parseado del NAME ("(sin caja)" si no)
+#   CIF       cif del cliente (parseado del NAME)
+#   CLIENTE   nombre del cliente (parseado del NAME)
+_DERIVED_COLS = ("DAY", "LINE_DAY", "HOUR_ECU", "EST_PTO", "CIF", "CLIENTE")
+# El orden de columnas del Parquet es estable (sorted crudas + derivadas).
+_COLS = tuple(sorted(_KEEP_KEYS)) + _DERIVED_COLS
 
 _PARQUET_DIR_ENV = _os.environ.get(
     "MOV_PARQUET_DIR", "/var/cache/mcp-theos/parquet",
 )
-_PARQUET_VERSION = "v1"
+# v2: Parquet enriquecido con columnas derivadas. Bumpear invalida los v1
+# (se regeneran del jsonl con build_all, sin tocar el caché jsonl).
+_PARQUET_VERSION = "v2"
+
+# Offset horario Ecuador (UTC-5). Mismo que summarize_sales (VELNEO_TZ_OFFSET_HOURS).
+try:
+    _TZ_OFFSET = int(float(_os.environ.get("VELNEO_TZ_OFFSET_HOURS", "-5")))
+except (TypeError, ValueError):
+    _TZ_OFFSET = -5
 
 
 def parquet_root() -> _Path:
@@ -95,8 +113,30 @@ def _to_int(v: Any) -> int:
         return 0
 
 
+def _derive_day_hour(fecha_conta: Any) -> tuple[str, int]:
+    """Replica EXACTA de la lógica de summarize_sales para LINE_DAY/HOUR_ECU.
+
+    Parsea ``FECHA_CONTA`` (ISO con 'T') + offset ECU. Devuelve ("", -1) si no
+    es parseable — igual que el bucle Python descarta esas líneas del por_dia.
+    """
+    fc = str(fecha_conta or "")
+    if "T" not in fc:
+        return "", -1
+    try:
+        dt = _datetime.strptime(
+            fc.replace("Z", "").split(".")[0], "%Y-%m-%dT%H:%M:%S"
+        ) + _timedelta(hours=_TZ_OFFSET)
+        return dt.date().isoformat(), dt.hour
+    except ValueError:
+        return "", -1
+
+
 def _normalize_row(raw: dict[str, Any], day: str) -> dict[str, Any]:
-    """Proyecta una fila cruda al esquema tipado del Parquet."""
+    """Proyecta una fila cruda al esquema tipado del Parquet, con columnas
+    derivadas (día/hora ECU + parseo de NAME) pre-calculadas."""
+    # Import diferido para evitar ciclo a nivel de módulo.
+    from mcp_theos.sales_report import _parse_invoice_name
+
     out: dict[str, Any] = {}
     for k in sorted(_KEEP_KEYS):
         v = raw.get(k)
@@ -106,7 +146,20 @@ def _normalize_row(raw: dict[str, Any], day: str) -> dict[str, Any]:
             out[k] = _to_int(v)
         else:
             out[k] = "" if v is None else str(v)
+
     out["DAY"] = day
+    line_day, hour = _derive_day_hour(raw.get("FECHA_CONTA"))
+    out["LINE_DAY"] = line_day
+    out["HOUR_ECU"] = hour
+
+    parsed = _parse_invoice_name(raw.get("NAME") or "")
+    est = parsed["establecimiento"]
+    pto = parsed["pto_emision"]
+    out["EST_PTO"] = f"{est}-{pto}" if est else "(sin caja)"
+    out["CIF"] = parsed["cif"] or ""
+    out["CLIENTE"] = parsed["cliente"] or (
+        f"CIF {parsed['cif']}" if parsed["cif"] else "(sin cliente)"
+    )
     return out
 
 
