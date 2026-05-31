@@ -885,6 +885,7 @@ async def sales_quick_summary(
     include_credit_notes: bool = True,
     cutoff_hour: int | None = None,
     match_current_hour: bool = False,
+    include_cross_tabs: bool = False,
 ) -> dict[str, Any]:
     """Aggregate sales (and optionally NCs) and return JSON only — no XLSX.
 
