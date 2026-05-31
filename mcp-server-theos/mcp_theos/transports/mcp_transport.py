@@ -1566,6 +1566,7 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "sales_evolution_chart": ("admin_ops.sales_evolution_chart", admin_ops.sales_evolution_chart),
     "generate_sales_report": ("admin_ops.generate_sales_report", admin_ops.generate_sales_report),
     "generate_executive_report": ("admin_ops.generate_executive_report", admin_ops.generate_executive_report),
+    "generate_forecast_report": ("admin_ops.generate_forecast_report", admin_ops.generate_forecast_report),
     "signature_queue_status": ("signature_queue.signature_queue_status", signature_queue.signature_queue_status),
     "list_signature_queue_errors": ("signature_queue.list_signature_queue_errors", signature_queue.list_signature_queue_errors),
     "reset_signature_queue_record": ("signature_queue.reset_signature_queue_record", signature_queue.reset_signature_queue_record),
