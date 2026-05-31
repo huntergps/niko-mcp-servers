@@ -2013,6 +2013,11 @@ async def summarize_sales(
                   "cod_bar": "", "producto_id": 0})
     by_day: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"pvp": 0.0, "neto": 0.0, "facturas": set(), "lineas": 0})
+    # Cross-tabs (solo se llenan si include_cross_tabs). Claves = tuplas.
+    by_fam_pto: dict[tuple, float] = defaultdict(float)
+    by_fam_bod: dict[tuple, float] = defaultdict(float)
+    by_day_pto: dict[tuple, float] = defaultdict(float)
+    fact_por_pto: dict[str, set] = defaultdict(set)
     facturas_all: set[int] = set()
     total_pvp = 0.0
     total_neto = 0.0
