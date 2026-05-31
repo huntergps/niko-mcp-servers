@@ -310,6 +310,236 @@ def connect_range(tenant_id: str, sucursal: str,
                  f"DAY >= '{d_from}' AND DAY <= '{d_to}'")
 
 
+def aggregate_accumulators(
+    tenant_id: str, sucursal: str, date_from: str, date_to: str,
+    *,
+    credit_flags: dict[int, bool],
+    familia_parent: dict[int, str],
+    bodega_names: dict[int, str],
+    cutoff_hour: int | None = None,
+    today_iso: str | None = None,
+    current_hour: int | None = None,
+) -> dict[str, Any]:
+    """Agrega el rango con GROUP BY en DuckDB y devuelve los MISMOS acumuladores
+    que produce el bucle Python de summarize_sales, para que el armado de la
+    respuesta quede idéntico.
+
+    El mapeo familia_id→nombre y bodega_id→nombre se aplica en Python sobre los
+    POCOS grupos (≈85 familias, ≈10 bodegas), no sobre las 476k filas — ahí está
+    el speedup. credit_flags se registra como tabla para el JOIN contado/crédito.
+
+    Devuelve un dict con: total_pvp, total_neto, n_lineas, total_count,
+    pvp_contado, pvp_credito, facturas_all (set), by_day, by_hour, by_familia,
+    by_bodega, by_pto_emi, by_cliente, by_forma_pago, by_producto,
+    by_fam_pto, by_fam_bod, by_day_pto, fact_por_pto.
+    """
+    from collections import defaultdict
+
+    con = connect_range(tenant_id, sucursal, date_from, date_to)
+
+    # Filtros que replican el cutoff y la defensa del día en curso del bucle.
+    filters = []
+    if cutoff_hour is not None:
+        filters.append(f"HOUR_ECU >= 0 AND HOUR_ECU <= {int(cutoff_hour)}")
+    if today_iso and current_hour is not None:
+        filters.append(
+            f"NOT (COALESCE(NULLIF(LINE_DAY,''), DAY) = '{_iso_or_raise(today_iso)}' "
+            f"AND HOUR_ECU > {int(current_hour)})")
+    where = " AND ".join(filters) if filters else "TRUE"
+
+    # Vista de trabajo con columnas derivadas listas para agrupar.
+    con.execute(f"""
+        CREATE VIEW m AS
+        SELECT
+            CAST(PVP_LINEA AS DOUBLE)          AS pvp,
+            CAST(PRECIO_NETO_LINEA AS DOUBLE)  AS neto,
+            CAST(CAN AS DOUBLE)                AS can,
+            CAST(VENT_FACT_VENT AS BIGINT)     AS inv_id,
+            CAST(INV_FAMI AS BIGINT)           AS fam_id,
+            CAST(INV_BODEGA AS BIGINT)         AS bod_id,
+            CAST(PRODUCTOS AS BIGINT)          AS prod_id,
+            NOMBRE, COD_BAR, EST_PTO, CIF, CLIENTE, HOUR_ECU,
+            COALESCE(NULLIF(LINE_DAY,''), DAY) AS day_key
+        FROM movs
+        WHERE {where}
+    """)
+
+    # credit_flags como tabla para el JOIN de forma de pago.
+    con.execute("CREATE TABLE cf (inv BIGINT, is_credit BOOLEAN)")
+    if credit_flags:
+        con.executemany("INSERT INTO cf VALUES (?, ?)",
+                        [(int(k), bool(v)) for k, v in credit_flags.items()])
+
+    def _facset(rel_sql: str) -> dict[Any, set]:
+        """Ejecuta una query (clave, lista_de_inv_ids) y vuelve {clave: set(ids)}."""
+        out: dict[Any, set] = {}
+        for row in con.execute(rel_sql).fetchall():
+            ids = row[-1] or []
+            out[row[0] if len(row) == 2 else tuple(row[:-1])] = {
+                int(x) for x in ids if x}
+        return out
+
+    # ----- Totales -----
+    tot = con.execute(
+        "SELECT COALESCE(SUM(pvp),0), COALESCE(SUM(neto),0), COUNT(*), "
+        "COUNT(DISTINCT CASE WHEN inv_id<>0 THEN inv_id END) FROM m"
+    ).fetchone()
+    total_pvp, total_neto, n_lineas, n_facturas = tot[0], tot[1], int(tot[2]), int(tot[3])
+
+    # facturas_all como set (para len y consistencia con el otro camino).
+    facturas_all = {int(r[0]) for r in con.execute(
+        "SELECT DISTINCT inv_id FROM m WHERE inv_id<>0").fetchall()}
+
+    # ----- Contado / crédito (JOIN con cf) -----
+    fp = con.execute("""
+        SELECT CASE WHEN cf.inv IS NULL THEN '(sin dato)'
+                    WHEN cf.is_credit THEN 'Crédito' ELSE 'Contado' END AS forma,
+               COALESCE(SUM(m.pvp),0), COUNT(*),
+               list(DISTINCT CASE WHEN m.inv_id<>0 THEN m.inv_id END)
+        FROM m LEFT JOIN cf ON m.inv_id = cf.inv
+        GROUP BY 1
+    """).fetchall()
+    by_forma_pago: dict[str, dict[str, Any]] = {}
+    pvp_contado = pvp_credito = 0.0
+    for forma, s_pvp, n_lin, ids in fp:
+        by_forma_pago[forma] = {"pvp": s_pvp, "lineas": int(n_lin),
+                                "facturas": {int(x) for x in (ids or []) if x}}
+        if forma == "Contado":
+            pvp_contado += s_pvp
+        elif forma == "Crédito":
+            pvp_credito += s_pvp
+
+    # ----- por_día -----
+    by_day: dict[str, dict[str, Any]] = {}
+    for day, s_pvp, s_neto, n_lin, ids in con.execute("""
+        SELECT day_key, COALESCE(SUM(pvp),0), COALESCE(SUM(neto),0), COUNT(*),
+               list(DISTINCT CASE WHEN inv_id<>0 THEN inv_id END)
+        FROM m GROUP BY 1""").fetchall():
+        by_day[day] = {"pvp": s_pvp, "neto": s_neto, "lineas": int(n_lin),
+                       "facturas": {int(x) for x in (ids or []) if x}}
+
+    # ----- por_hora (solo HOUR_ECU >= 0) -----
+    by_hour: dict[str, dict[str, Any]] = {}
+    for h, s_pvp, n_lin, ids in con.execute("""
+        SELECT HOUR_ECU, COALESCE(SUM(pvp),0), COUNT(*),
+               list(DISTINCT CASE WHEN inv_id<>0 THEN inv_id END)
+        FROM m WHERE HOUR_ECU >= 0 GROUP BY 1""").fetchall():
+        by_hour[f"{int(h):02d}h00"] = {
+            "pvp": s_pvp, "lineas": int(n_lin),
+            "facturas": {int(x) for x in (ids or []) if x}}
+
+    # ----- por_familia (map id→nombre padre en Python) -----
+    by_familia: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"pvp": 0.0, "lineas": 0})
+    for fam_id, s_pvp, n_lin in con.execute(
+        "SELECT fam_id, COALESCE(SUM(pvp),0), COUNT(*) FROM m GROUP BY 1"
+    ).fetchall():
+        fam_id = int(fam_id)
+        name = (familia_parent.get(fam_id, f"FAM_{fam_id}") if fam_id
+                else "(sin familia)")
+        b = by_familia[name]
+        b["pvp"] += s_pvp
+        b["lineas"] += int(n_lin)
+
+    # ----- por_bodega -----
+    by_bodega: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"pvp": 0.0, "lineas": 0, "facturas": set()})
+    for bod_id, s_pvp, n_lin, ids in con.execute("""
+        SELECT bod_id, COALESCE(SUM(pvp),0), COUNT(*),
+               list(DISTINCT CASE WHEN inv_id<>0 THEN inv_id END)
+        FROM m GROUP BY 1""").fetchall():
+        bod_id = int(bod_id)
+        name = (bodega_names.get(bod_id, f"BOD_{bod_id}") if bod_id
+                else "(sin bodega)")
+        b = by_bodega[name]
+        b["pvp"] += s_pvp
+        b["lineas"] += int(n_lin)
+        b["facturas"].update(int(x) for x in (ids or []) if x)
+
+    # ----- por_pto_emision -----
+    by_pto_emi: dict[str, dict[str, Any]] = {}
+    for ep, s_pvp, n_lin, ids in con.execute("""
+        SELECT EST_PTO, COALESCE(SUM(pvp),0), COUNT(*),
+               list(DISTINCT CASE WHEN inv_id<>0 THEN inv_id END)
+        FROM m GROUP BY 1""").fetchall():
+        by_pto_emi[ep] = {"pvp": s_pvp, "lineas": int(n_lin),
+                          "facturas": {int(x) for x in (ids or []) if x}}
+
+    # ----- top_clientes (cliente + cif) -----
+    by_cliente: dict[str, dict[str, Any]] = {}
+    for cli, cif, s_pvp, n_lin, ids in con.execute("""
+        SELECT CLIENTE, MAX(CIF), COALESCE(SUM(pvp),0), COUNT(*),
+               list(DISTINCT CASE WHEN inv_id<>0 THEN inv_id END)
+        FROM m GROUP BY CLIENTE""").fetchall():
+        by_cliente[cli] = {"pvp": s_pvp, "lineas": int(n_lin), "cif": cif or "",
+                           "facturas": {int(x) for x in (ids or []) if x}}
+
+    # ----- top_productos (clave = NOMBRE o ID#id o (sin nombre)) -----
+    by_producto: dict[str, dict[str, Any]] = {}
+    for nombre, prod_id, cod_bar, s_pvp, s_can, n_lin in con.execute("""
+        SELECT NOMBRE, prod_id, MAX(COD_BAR), COALESCE(SUM(pvp),0),
+               COALESCE(SUM(can),0), COUNT(*)
+        FROM m GROUP BY NOMBRE, prod_id""").fetchall():
+        nombre = (nombre or "").strip()
+        prod_id = int(prod_id)
+        key = nombre or (f"ID#{prod_id}" if prod_id else "(sin nombre)")
+        b = by_producto.get(key)
+        if b is None:
+            b = {"pvp": 0.0, "cantidad": 0.0, "lineas": 0,
+                 "cod_bar": "", "producto_id": 0}
+            by_producto[key] = b
+        b["pvp"] += s_pvp
+        b["cantidad"] += s_can
+        b["lineas"] += int(n_lin)
+        b["producto_id"] = prod_id or b["producto_id"]
+        b["cod_bar"] = (cod_bar or b["cod_bar"]).strip()
+
+    # ----- cross-tabs -----
+    by_fam_pto: dict[tuple, float] = defaultdict(float)
+    by_fam_bod: dict[tuple, float] = defaultdict(float)
+    by_day_pto: dict[tuple, float] = defaultdict(float)
+    fact_por_pto: dict[str, set] = defaultdict(set)
+    for fam_id, ep, s_pvp in con.execute(
+        "SELECT fam_id, EST_PTO, COALESCE(SUM(pvp),0) FROM m GROUP BY 1,2"
+    ).fetchall():
+        fam_id = int(fam_id)
+        name = (familia_parent.get(fam_id, f"FAM_{fam_id}") if fam_id
+                else "(sin familia)")
+        by_fam_pto[(name, ep)] += s_pvp
+    for fam_id, bod_id, s_pvp in con.execute(
+        "SELECT fam_id, bod_id, COALESCE(SUM(pvp),0) FROM m GROUP BY 1,2"
+    ).fetchall():
+        fam_id = int(fam_id); bod_id = int(bod_id)
+        fname = (familia_parent.get(fam_id, f"FAM_{fam_id}") if fam_id
+                 else "(sin familia)")
+        bname = (bodega_names.get(bod_id, f"BOD_{bod_id}") if bod_id
+                 else "(sin bodega)")
+        by_fam_bod[(fname, bname)] += s_pvp
+    for day, ep, s_pvp in con.execute(
+        "SELECT day_key, EST_PTO, COALESCE(SUM(pvp),0) FROM m GROUP BY 1,2"
+    ).fetchall():
+        by_day_pto[(day, ep)] += s_pvp
+    for ep, ids in con.execute("""
+        SELECT EST_PTO, list(DISTINCT CASE WHEN inv_id<>0 THEN inv_id END)
+        FROM m GROUP BY 1""").fetchall():
+        fact_por_pto[ep] = {int(x) for x in (ids or []) if x}
+
+    con.close()
+    return {
+        "total_pvp": total_pvp, "total_neto": total_neto,
+        "n_lineas": n_lineas, "total_count": n_lineas,
+        "n_facturas": n_facturas,
+        "pvp_contado": pvp_contado, "pvp_credito": pvp_credito,
+        "facturas_all": facturas_all,
+        "by_day": dict(by_day), "by_hour": dict(by_hour),
+        "by_familia": dict(by_familia), "by_bodega": dict(by_bodega),
+        "by_pto_emi": dict(by_pto_emi), "by_cliente": dict(by_cliente),
+        "by_forma_pago": dict(by_forma_pago), "by_producto": dict(by_producto),
+        "by_fam_pto": dict(by_fam_pto), "by_fam_bod": dict(by_fam_bod),
+        "by_day_pto": dict(by_day_pto), "fact_por_pto": dict(fact_por_pto),
+    }
+
+
 def covered_days(tenant_id: str, sucursal: str,
                  date_from: str, date_to: str) -> set[str]:
     """Días (ISO) del rango que YA están en Parquet, listos para servir.

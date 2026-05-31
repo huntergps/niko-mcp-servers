@@ -2071,42 +2071,74 @@ async def summarize_sales(
     # ~1.5s/día parseando jsonl. Los días NO cubiertos (hoy, o sin backfill)
     # caen al camino jsonl/ERV de siempre (_get_day_lines). El bucle de
     # acumulación es idéntico para ambas fuentes → mismos números.
-    pq_rows_by_day: dict[str, list[dict[str, Any]]] = {}
-    if _os.environ.get("MOV_PARQUET_DISABLE", "").lower() not in ("1", "true", "yes"):
+    # Camino rápido: si TODO el rango ya está en Parquet, agregamos con GROUP BY
+    # en DuckDB (sub-segundo aun sobre años) en vez del bucle Python. Solo se
+    # mapean los pocos grupos (familia/bodega) en Python — ahí está el speedup.
+    # Si falta algún día (hoy, sin backfill), cae al bucle jsonl/ERP de siempre.
+    used_sql = False
+    pq_disabled = _os.environ.get("MOV_PARQUET_DISABLE", "").lower() in (
+        "1", "true", "yes")
+    if not pq_disabled and days:
         try:
-            # Import diferido: parquet_store importa de este módulo (_KEEP_KEYS),
-            # así que a nivel de módulo sería circular. Aquí ya está cargado.
             from mcp_theos import parquet_store
-            pq_rows_by_day = parquet_store.read_range_rows_by_day(
+            covered = parquet_store.covered_days(
                 client.cfg.tenant_id, suc, date_from, date_to)
-        except Exception as exc:  # noqa: BLE001 — Parquet es optimización, no crítico
-            logger.warning("parquet read_range failed, fallback jsonl: %s", exc)
-            pq_rows_by_day = {}
+            if all(d in covered for d in days):
+                today_iso_local = _today_ecu_iso()
+                current_hour_local = (datetime.utcnow()
+                                      + timedelta(hours=offset_int)).hour
+                agg = parquet_store.aggregate_accumulators(
+                    client.cfg.tenant_id, suc, date_from, date_to,
+                    credit_flags=credit_flags,
+                    familia_parent=familia_parent,
+                    bodega_names=bodega_names,
+                    cutoff_hour=cutoff_hour,
+                    today_iso=today_iso_local,
+                    current_hour=current_hour_local,
+                )
+                total_pvp = agg["total_pvp"]
+                total_neto = agg["total_neto"]
+                n_lineas = agg["n_lineas"]
+                total_count = agg["total_count"]
+                pvp_contado = agg["pvp_contado"]
+                pvp_credito = agg["pvp_credito"]
+                facturas_all = agg["facturas_all"]
+                by_day = agg["by_day"]
+                by_hour = agg["by_hour"]
+                by_familia = agg["by_familia"]
+                by_bodega = agg["by_bodega"]
+                by_pto_emi = agg["by_pto_emi"]
+                by_cliente = agg["by_cliente"]
+                by_forma_pago = agg["by_forma_pago"]
+                by_producto = agg["by_producto"]
+                by_fam_pto = agg["by_fam_pto"]
+                by_fam_bod = agg["by_fam_bod"]
+                by_day_pto = agg["by_day_pto"]
+                fact_por_pto = agg["fact_por_pto"]
+                days_from_parquet = len(days)
+                used_sql = True
+        except Exception as exc:  # noqa: BLE001 — Parquet es optimización
+            logger.warning("parquet SQL aggregate failed, fallback jsonl: %s", exc)
+            used_sql = False
 
-    for day in days:
+    for day in ([] if used_sql else days):
         if n_lineas >= max_rows:
             break
-        pq_day_rows = pq_rows_by_day.get(day)
-        if pq_day_rows is not None:
-            day_rows = pq_day_rows
-            days_from_parquet += 1
-            total_count += len(day_rows)
+        day_result = await _get_day_lines(client, day=day, sucursal=suc)
+        if not day_result.get("success"):
+            return {
+                "success": False,
+                "error_code": day_result.get("error_code", "transport"),
+                "error": day_result.get("error", "fetch day failed"),
+                "day_at_failure": day,
+                "rows_collected": n_lineas,
+            }
+        if day_result.get("from_cache"):
+            days_from_cache += 1
         else:
-            day_result = await _get_day_lines(client, day=day, sucursal=suc)
-            if not day_result.get("success"):
-                return {
-                    "success": False,
-                    "error_code": day_result.get("error_code", "transport"),
-                    "error": day_result.get("error", "fetch day failed"),
-                    "day_at_failure": day,
-                    "rows_collected": n_lineas,
-                }
-            if day_result.get("from_cache"):
-                days_from_cache += 1
-            else:
-                days_live += 1
-            day_rows = day_result.get("rows") or []
-            total_count += int(day_result.get("total_count") or len(day_rows))
+            days_live += 1
+        day_rows = day_result.get("rows") or []
+        total_count += int(day_result.get("total_count") or len(day_rows))
 
         for uk in day_rows:
             if n_lineas >= max_rows:
