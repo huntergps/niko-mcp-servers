@@ -1,0 +1,24 @@
+# Entornos virtuales locales (se reconstruyen dentro de la imagen via pyproject).
+# Copiarlos al build context agota inodes del host (.venv ~25k archivos) y dispara
+# 'no space left on device' en el COPY pese a tener bytes libres.
+**/.venv/
+**/venv/
+**/.env
+
+# Bytecode / cache de Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# Git y metadatos
+.git/
+**/.DS_Store
+
+# Artefactos de pruebas / salidas
+**/*.log
+**/*.pdf
+**/*.xlsx

@@ -73,15 +73,15 @@ async def _load_tenant_row(tenant_id: str) -> dict[str, Any]:
     return rows[0]
 
 
-async def get_tenant_config(request: Request) -> TenantVelneoConfig:
-    """FastAPI dependency: resolve tenant from ``X-Tenant-Id`` header."""
-    tenant_id = (
-        request.headers.get("x-tenant-id")
-        or request.headers.get("X-Tenant-Id")
-        or ""
-    ).strip()
+async def _resolve_by_id(tenant_id: str) -> TenantVelneoConfig:
+    """Resolve a tenant config from its id alone (no HTTP request).
+
+    Same logic and cache as :func:`get_tenant_config`, but callable from
+    non-request contexts (cron jobs, warm-cache, backfill scripts).
+    """
+    tenant_id = (tenant_id or "").strip()
     if not tenant_id:
-        raise HTTPException(status_code=400, detail="missing X-Tenant-Id header")
+        raise ValueError("empty tenant_id")
 
     cached = _cache.get(tenant_id)
     if cached is not None:
@@ -143,6 +143,18 @@ async def get_tenant_config(request: Request) -> TenantVelneoConfig:
         )
         _cache[tenant_id] = cfg
         return cfg
+
+
+async def get_tenant_config(request: Request) -> TenantVelneoConfig:
+    """FastAPI dependency: resolve tenant from ``X-Tenant-Id`` header."""
+    tenant_id = (
+        request.headers.get("x-tenant-id")
+        or request.headers.get("X-Tenant-Id")
+        or ""
+    ).strip()
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="missing X-Tenant-Id header")
+    return await _resolve_by_id(tenant_id)
 
 
 def clear_cache() -> None:
