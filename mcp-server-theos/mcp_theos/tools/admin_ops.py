@@ -950,6 +950,7 @@ async def sales_quick_summary(
         top_n_clientes=top_n_clientes,
         cutoff_hour=cutoff_hour,
         match_current_hour=match_current_hour,
+        include_cross_tabs=include_cross_tabs,
     )
     if not sales.get("success"):
         return sales
@@ -1513,6 +1514,7 @@ async def generate_executive_report(
         client, date_from=date_from, date_to=date_to,
         month=month, year=year, sucursal=sucursal,
         include_credit_notes=True, top_n_clientes=top_n_clientes,
+        include_cross_tabs=True,
     )
     if summary.get("success") is False:
         return summary

@@ -2221,6 +2221,15 @@ async def summarize_sales(
             if inv_id:
                 bfp["facturas"].add(inv_id)
 
+            # Cross-tabs: fam_name / bod_name / est_pto / day_key ya
+            # estan en scope para esta linea. Solo acumular si se piden.
+            if include_cross_tabs:
+                by_fam_pto[(fam_name, est_pto)] += pvp
+                by_fam_bod[(fam_name, bod_name)] += pvp
+                by_day_pto[(day_key, est_pto)] += pvp
+                if inv_id:
+                    fact_por_pto[est_pto].add(inv_id)
+
     truncated = total_count > n_lineas
     n_facturas = len(facturas_all)
     ticket = round(total_pvp / n_facturas, 2) if n_facturas else 0.0
@@ -2331,6 +2340,53 @@ async def summarize_sales(
                                 key=lambda x: -x[1]["cantidad"])[:top_n_productos]
         ],
     }
+
+    if include_cross_tabs:
+        # Listas planas de cruces (para heatmaps en el PDF).
+        response["cross_familia_pto"] = [
+            {"familia": k[0], "pto": k[1], "pvp": round(v, 2)}
+            for k, v in sorted(by_fam_pto.items(), key=lambda x: -x[1])
+        ]
+        response["cross_familia_bodega"] = [
+            {"familia": k[0], "bodega": k[1], "pvp": round(v, 2)}
+            for k, v in sorted(by_fam_bod.items(), key=lambda x: -x[1])
+        ]
+        response["cross_dia_pto"] = [
+            {"day": k[0], "pto": k[1], "pvp": round(v, 2)}
+            for k, v in sorted(by_day_pto.items())
+        ]
+
+        # Rollup por sucursal (punto de emision) con indicadores.
+        fam_top_by_pto: dict[str, tuple[str, float]] = {}
+        for (fam, pto), v in by_fam_pto.items():
+            cur = fam_top_by_pto.get(pto)
+            if cur is None or v > cur[1]:
+                fam_top_by_pto[pto] = (fam, v)
+        dia_top_by_pto: dict[str, tuple[str, float]] = {}
+        for (day, pto), v in by_day_pto.items():
+            cur = dia_top_by_pto.get(pto)
+            if cur is None or v > cur[1]:
+                dia_top_by_pto[pto] = (day, v)
+
+        por_sucursal = []
+        for pto, d in sorted(by_pto_emi.items(), key=lambda x: -x[1]["pvp"]):
+            pvp_pto = round(d["pvp"], 2)
+            n_fac_pto = len(fact_por_pto.get(pto) or d.get("facturas") or [])
+            ftop = fam_top_by_pto.get(pto, ("(s/d)", 0.0))
+            dtop = dia_top_by_pto.get(pto, ("(s/d)", 0.0))
+            por_sucursal.append({
+                "pto": pto,
+                "pvp": pvp_pto,
+                "pct": round(100 * d["pvp"] / total_pvp, 1) if total_pvp else 0.0,
+                "n_facturas": n_fac_pto,
+                "ticket_promedio": round(pvp_pto / n_fac_pto, 2) if n_fac_pto else 0.0,
+                "familia_top": ftop[0],
+                "familia_top_pvp": round(ftop[1], 2),
+                "dia_top": dtop[0],
+                "dia_top_pvp": round(dtop[1], 2),
+            })
+        response["por_sucursal"] = por_sucursal
+
     response["deltas"] = deltas
     response["flags"] = _detect_flags(response)
     return response

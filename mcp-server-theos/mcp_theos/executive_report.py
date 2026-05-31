@@ -365,6 +365,87 @@ def _chart_tendencia(por_dia: list):
     return _chart(fig), proj_txt
 
 
+def _build_matrix(cross: list, row_key: str, col_key: str,
+                  top_rows: int = 6, top_cols: int = 8):
+    """De una lista plana de cruces -> (rows, cols, matrix[r][c]) con las
+    filas/columnas top por total. ``cross`` = [{row_key, col_key, 'pvp'}]."""
+    row_tot: dict[str, float] = {}
+    col_tot: dict[str, float] = {}
+    cell: dict[tuple, float] = {}
+    for d in cross:
+        r = str(_g(d, row_key, default="?"))
+        c = str(_g(d, col_key, default="?"))
+        v = _fnum(_g(d, "pvp"))
+        row_tot[r] = row_tot.get(r, 0) + v
+        col_tot[c] = col_tot.get(c, 0) + v
+        cell[(r, c)] = cell.get((r, c), 0) + v
+    rows = [r for r, _ in sorted(row_tot.items(), key=lambda x: -x[1])[:top_rows]]
+    cols = [c for c, _ in sorted(col_tot.items(), key=lambda x: -x[1])[:top_cols]]
+    matrix = [[cell.get((r, c), 0.0) for c in cols] for r in rows]
+    return rows, cols, matrix
+
+
+def _chart_heatmap(rows, cols, matrix, titulo, row_label="", col_label=""):
+    """Heatmap con valores anotados ($k). Filas=familias, cols=ubicaciones."""
+    import numpy as np
+    from matplotlib.colors import LinearSegmentedColormap
+    nr, nc = len(rows), len(cols)
+    fig, ax = plt.subplots(figsize=(9.4, max(2.2, 0.55 * nr + 1.3)))
+    if nr == 0 or nc == 0:
+        ax.text(0.5, 0.5, "sin datos", ha="center", va="center",
+                transform=ax.transAxes, color=SUBTLE); ax.axis("off")
+        return _chart(fig)
+    M = np.array(matrix, dtype=float)
+    cmap = LinearSegmentedColormap.from_list("mep", ["#FFFFFF", SECONDARY, PRIMARY])
+    ax.imshow(M, aspect="auto", cmap=cmap, vmin=0, vmax=(M.max() or 1))
+    ax.set_xticks(range(nc)); ax.set_xticklabels(cols, fontsize=8, rotation=30, ha="right")
+    ax.set_yticks(range(nr)); ax.set_yticklabels([r[:22] for r in rows], fontsize=8)
+    thr = (M.max() or 1) * 0.55
+    for i in range(nr):
+        for j in range(nc):
+            v = M[i, j]
+            if v <= 0:
+                continue
+            ax.text(j, i, _k(v), ha="center", va="center", fontsize=7,
+                    color=("white" if v >= thr else "#1A1A1A"))
+    for s in ("top", "right", "left", "bottom"):
+        ax.spines[s].set_visible(False)
+    ax.tick_params(length=0)
+    ax.set_title(titulo, fontsize=11, fontweight="bold", color=PRIMARY, loc="left")
+    fig.tight_layout()
+    return _chart(fig)
+
+
+def _chart_dia_sucursal(cross_dia_pto, top_ptos, topn_dias=31):
+    """Línea por sucursal a lo largo de los días (qué días rinden por caja)."""
+    fig, ax = plt.subplots(figsize=(9.4, 3.4))
+    # set de dias ordenados
+    dias = sorted({str(_g(d, "day")) for d in cross_dia_pto})
+    if not dias or not top_ptos:
+        ax.text(0.5, 0.5, "sin datos", ha="center", va="center",
+                transform=ax.transAxes, color=SUBTLE); ax.axis("off")
+        return _chart(fig)
+    val = {(str(_g(d, "day")), str(_g(d, "pto"))): _fnum(_g(d, "pvp")) for d in cross_dia_pto}
+    palette = [PRIMARY, GREEN, ORANGE, PURPLE, CYAN, RED, SECONDARY, "#404040"]
+    xlab = []
+    for dd in dias:
+        try:
+            o = _dt.date.fromisoformat(dd[:10]); xlab.append(f"{o.day:02d}/{o.month:02d}")
+        except ValueError:
+            xlab.append(dd[-5:])
+    x = list(range(len(dias)))
+    for idx, pto in enumerate(top_ptos):
+        y = [val.get((dd, pto), 0.0) for dd in dias]
+        ax.plot(x, y, marker="o", markersize=3, linewidth=1.8,
+                color=palette[idx % len(palette)], label=str(pto)[:18])
+    ax.set_xticks(x); ax.set_xticklabels(xlab, fontsize=6.5, rotation=45)
+    ax.yaxis.set_major_formatter(mtick.FuncFormatter(_k)); ax.tick_params(axis="y", labelsize=8)
+    ax.grid(axis="y", color=ZEBRA, linewidth=1); _style(ax)
+    ax.legend(fontsize=7.5, frameon=False, ncol=3, loc="upper center")
+    ax.set_title("Ventas diarias por sucursal", fontsize=11, fontweight="bold", color=PRIMARY, loc="left")
+    return _chart(fig)
+
+
 # ---------------------------------------------------------------------------
 # API pública
 # ---------------------------------------------------------------------------
@@ -389,6 +470,11 @@ def build_executive_report_pdf(summary: dict[str, Any]) -> tuple[bytes, str]:
     por_dia = _list(summary, "por_dia_combinado", "por_dia")
     top_cli = _list(summary, "top_clientes")
     cnotes = summary.get("credit_notes") or {}
+    # Cruces (presentes solo si el tool pidio include_cross_tabs).
+    cross_fam_pto = _list(summary, "cross_familia_pto")
+    cross_fam_bod = _list(summary, "cross_familia_bodega")
+    cross_dia_pto = _list(summary, "cross_dia_pto")
+    por_sucursal = _list(summary, "por_sucursal")
 
     pvp = _fnum(_g(totals, "pvp"))
     nfac = int(_fnum(_g(totals, "n_facturas")))
@@ -425,7 +511,7 @@ def build_executive_report_pdf(summary: dict[str, Any]) -> tuple[bytes, str]:
 
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
-    TP = 4
+    TP = 6 if cross_fam_pto else 4
 
     # ---- Página 1 ----
     _banner(c, "Informe ejecutivo de ventas", "Resumen del periodo", rango)
@@ -484,7 +570,55 @@ def build_executive_report_pdf(summary: dict[str, Any]) -> tuple[bytes, str]:
     _footer(c, 3, TP)
     c.showPage()
 
-    # ---- Página 4 ----
+    pg = 4  # numero de pagina dinamico para lo que sigue
+
+    # ---- Páginas de cruces (solo si hay cross-tabs) ----
+    if cross_fam_pto:
+        # Página: Familia x ubicacion (dos heatmaps)
+        _banner(c, "Familia por ubicacion", "Que familia se vende mas en cada sitio", rango)
+        y = PAGE_H - 118
+        y = _section(c, y, "Familia x sucursal (punto de emision)")
+        r1, c1, m1 = _build_matrix(cross_fam_pto, "familia", "pto", top_rows=6, top_cols=8)
+        c.drawImage(_chart_heatmap(r1, c1, m1, "Ventas por familia y punto de emision ($)"),
+                    LM, y - 250, width=PAGE_W - LM - RM, height=250, preserveAspectRatio=True, mask="auto")
+        y -= 268
+        y = _section(c, y, "Familia x bodega")
+        r2, c2, m2 = _build_matrix(cross_fam_bod, "familia", "bodega", top_rows=6, top_cols=5)
+        c.drawImage(_chart_heatmap(r2, c2, m2, "Ventas por familia y bodega ($)"),
+                    LM, y - 230, width=PAGE_W - LM - RM, height=230, preserveAspectRatio=True, mask="auto")
+        _footer(c, pg, TP); c.showPage(); pg += 1
+
+        # Página: Comparativo entre sucursales
+        _banner(c, "Comparativo de sucursales", "Ranking e indicadores por punto de emision", rango)
+        y = PAGE_H - 118
+        y = _section(c, y, "Ventas diarias por sucursal")
+        top_ptos = [str(_g(s, "pto")) for s in por_sucursal[:6]]
+        c.drawImage(_chart_dia_sucursal(cross_dia_pto, top_ptos),
+                    LM, y - 200, width=PAGE_W - LM - RM, height=200, preserveAspectRatio=True, mask="auto")
+        y -= 216
+        y = _section(c, y, "Indicadores por sucursal")
+        rows = []
+        for s in por_sucursal[:10]:
+            try:
+                dt_lbl = _dt.date.fromisoformat(str(_g(s, "dia_top"))[:10]).strftime("%d/%m")
+            except ValueError:
+                dt_lbl = str(_g(s, "dia_top"))[-5:]
+            rows.append([
+                str(_g(s, "pto"))[:14],
+                _money(_g(s, "pvp")),
+                f"{_fnum(_g(s, 'pct')):.0f}%",
+                f"{int(_fnum(_g(s, 'n_facturas')))}",
+                _money(_g(s, "ticket_promedio")),
+                str(_g(s, "familia_top", default="-"))[:16],
+                dt_lbl,
+            ])
+        _table(c, y,
+               ["Sucursal", "Ventas", "%", "Fact.", "Ticket", "Familia top", "Mejor dia"],
+               rows, [70, 86, 34, 42, 70, 110, 50],
+               align=["l", "r", "r", "r", "r", "l", "r"])
+        _footer(c, pg, TP); c.showPage(); pg += 1
+
+    # ---- Página: Tendencia (ultima) ----
     _banner(c, "Tendencia y proyeccion", "Lectura del periodo", rango)
     y = PAGE_H - 118
     y = _section(c, y, "Tendencia diaria y proyeccion")
@@ -512,7 +646,7 @@ def build_executive_report_pdf(summary: dict[str, Any]) -> tuple[bytes, str]:
         f"2. <b>Reforzar caja/personal</b> en la franja pico ({pico_txt}).",
         f"3. <b>Gestionar devoluciones</b> ({_money(nc_tot)} en NC): revisar causas para reducir el impacto en el neto.",
     ])
-    _footer(c, 4, TP)
+    _footer(c, pg, TP)
     c.showPage()
     c.save()
 
