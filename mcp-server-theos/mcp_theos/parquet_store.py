@@ -373,10 +373,18 @@ def aggregate_accumulators(
     """)
 
     # credit_flags como tabla para el JOIN de forma de pago.
+    # OJO: executemany() inserta fila-por-fila (cada una su transacción) =>
+    # ~11s para 12k facturas (medido con cProfile). En su lugar registramos
+    # un Arrow Table y hacemos UN solo INSERT vectorizado.
     con.execute("CREATE TABLE cf (inv BIGINT, is_credit BOOLEAN)")
     if credit_flags:
-        con.executemany("INSERT INTO cf VALUES (?, ?)",
-                        [(int(k), bool(v)) for k, v in credit_flags.items()])
+        import pyarrow as _pa
+        invs = [int(k) for k in credit_flags]
+        creds = [bool(v) for v in credit_flags.values()]
+        cf_tbl = _pa.table({"inv": invs, "is_credit": creds})
+        con.register("cf_src", cf_tbl)
+        con.execute("INSERT INTO cf SELECT * FROM cf_src")
+        con.unregister("cf_src")
 
     def _facset(rel_sql: str) -> dict[Any, set]:
         """Ejecuta una query (clave, lista_de_inv_ids) y vuelve {clave: set(ids)}."""
