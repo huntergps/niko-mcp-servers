@@ -2299,7 +2299,10 @@ async def summarize_sales(
             bp_["cantidad"] += cantidad
             bp_["lineas"] += 1
             bp_["producto_id"] = prod_id or bp_["producto_id"]
-            bp_["cod_bar"] = (uk.get("COD_BAR") or bp_["cod_bar"]).strip()
+            # cod_bar: un mismo producto puede tener varios codigos de barras
+            # (presentaciones). Elegimos el MAX para que sea determinista e
+            # identico al camino SQL (que usa MAX(COD_BAR)). Es solo etiqueta.
+            bp_["cod_bar"] = max(bp_["cod_bar"], (uk.get("COD_BAR") or "").strip())
 
             if inv_id and inv_id in credit_flags:
                 if credit_flags[inv_id]:
