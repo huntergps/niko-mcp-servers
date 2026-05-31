@@ -425,7 +425,7 @@ def build_executive_report_pdf(summary: dict[str, Any]) -> tuple[bytes, str]:
 
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
-    TP = 3
+    TP = 4
 
     # ---- Página 1 ----
     _banner(c, "Informe ejecutivo de ventas", "Resumen del periodo", rango)
