@@ -33,6 +33,22 @@ logger = logging.getLogger(__name__)
 # Helpers — fetch paginated lists from Velneo
 # ---------------------------------------------------------------------------
 
+def _num(*candidates: Any) -> float:
+    """Primer candidato parseable a float distinto de 0; si todos son 0/None,
+    devuelve 0.0. Usado para preferir el campo plano resuelto por JS sobre el
+    crudo (que viene 0 cuando el puntero virtual no serializa por REST)."""
+    for v in candidates:
+        if v in (None, ""):
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if f != 0.0:
+            return f
+    return 0.0
+
+
 async def _fetch_all(
     client: VelneoClient,
     table: str,
@@ -169,6 +185,27 @@ async def generate_negative_stock_report(
                   or f"BOD {bid}")
         bodega_name_by_id[bid] = nombre.upper()
 
+    # 2b) Tabla de impuestos (IMP_FIS_IMPUESTOS) — solo ~5 filas, se cachea en
+    # memoria id->nombre. El producto trae IMP_FIS_IMPUESTOS_COMPRA/_VTA como ID
+    # (no como %), igual que la rejilla nativa de Velneo navega el maestro para
+    # mostrar el NOMBRE. No filtrar por filter[ID] (devuelve 0) — traer todas.
+    impuesto_name_by_id: dict[int, str] = {}
+    try:
+        impuestos = await _fetch_all(client, "IMP_FIS_IMPUESTOS", page_size=50)
+    except Exception as exc:  # noqa: BLE001
+        impuestos = []
+        logger.warning("IMP_FIS_IMPUESTOS fetch failed: %s — IVA as ID", exc)
+    for imp in impuestos:
+        if not isinstance(imp, dict):
+            continue
+        try:
+            iid = int(imp.get("id") or 0)
+        except (TypeError, ValueError):
+            iid = 0
+        if not iid:
+            continue
+        impuesto_name_by_id[iid] = (imp.get("name") or "").strip()
+
     # 3) Precompute per-bodega breakdown by calling
     # BUSCAR_EXISTENCIAS_NEGATIVAS. The process loads PRODUCTOS where
     # #EXS<0, walks the EXISTENCIAS_INV_PRODUCTOS plural, and returns
@@ -282,11 +319,22 @@ async def generate_negative_stock_report(
             "nombre": (p.get("name") or "").strip(),
             "costo_promedio": float(p.get("costo_promedio") or 0),
             "costo_compra": float(p.get("costo_compra") or 0),
-            "pvp_sin_iva": float(p.get("pvp_minimo") or 0),
-            "porc_utilidad": float(p.get("tasautilidadreco") or 0),
-            "unidad_minima": (p.get("emp_minimo") or "").strip(),
-            "iva_compras": int(p.get("imp_fis_impuestos_compra") or 0),
-            "iva_ventas": int(p.get("imp_fis_impuestos_vta") or 0),
+            # PVP/utilidad/unidad: si el proceso los devuelve ya resueltos por JS
+            # (campos planos navegando los punteros virtuales PVP_MINIMO/EMP_MINIMO),
+            # los usamos; si no, fallback al valor crudo (que viene 0/ID porque el
+            # puntero virtual no serializa por REST). Ver
+            # mepriga/reporte-existencias-negativas-solucion-js.md
+            "pvp_sin_iva": _num(p.get("pvp_sin_iva"), p.get("pvp_minimo")),
+            "pvp_con_iva": _num(p.get("pvp_con_iva"), None),
+            "porc_utilidad": _num(p.get("pct_utilidad"), p.get("tasautilidadreco")),
+            "unidad_minima": (str(p.get("unidad_minima")
+                                  or p.get("emp_minimo") or "").strip()),
+            # IVA: el producto trae el ID del impuesto → mapear al NOMBRE vía
+            # la tabla IMP_FIS_IMPUESTOS cacheada arriba.
+            "iva_compras": (impuesto_name_by_id.get(
+                int(p.get("imp_fis_impuestos_compra") or 0), "") or ""),
+            "iva_ventas": (impuesto_name_by_id.get(
+                int(p.get("imp_fis_impuestos_vta") or 0), "") or ""),
             "existencia": total,
             "por_bodega": by_bod,
             "product_bodega_ids": product_bodega_ids,
