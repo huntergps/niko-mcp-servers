@@ -2063,24 +2063,50 @@ async def summarize_sales(
     days = await _iter_days(date_from, date_to)
     days_from_cache = 0
     days_live = 0
+    days_from_parquet = 0
+
+    # Capa columnar: una sola query DuckDB trae TODOS los días del rango que
+    # ya están en Parquet (días pasados, inmutables). Esto es lo que hace
+    # viable agregar meses/años — leer 150 días de Parquet es sub-segundo vs
+    # ~1.5s/día parseando jsonl. Los días NO cubiertos (hoy, o sin backfill)
+    # caen al camino jsonl/ERV de siempre (_get_day_lines). El bucle de
+    # acumulación es idéntico para ambas fuentes → mismos números.
+    pq_rows_by_day: dict[str, list[dict[str, Any]]] = {}
+    if _os.environ.get("MOV_PARQUET_DISABLE", "").lower() not in ("1", "true", "yes"):
+        try:
+            # Import diferido: parquet_store importa de este módulo (_KEEP_KEYS),
+            # así que a nivel de módulo sería circular. Aquí ya está cargado.
+            from mcp_theos import parquet_store
+            pq_rows_by_day = parquet_store.read_range_rows_by_day(
+                client.cfg.tenant_id, suc, date_from, date_to)
+        except Exception as exc:  # noqa: BLE001 — Parquet es optimización, no crítico
+            logger.warning("parquet read_range failed, fallback jsonl: %s", exc)
+            pq_rows_by_day = {}
+
     for day in days:
         if n_lineas >= max_rows:
             break
-        day_result = await _get_day_lines(client, day=day, sucursal=suc)
-        if not day_result.get("success"):
-            return {
-                "success": False,
-                "error_code": day_result.get("error_code", "transport"),
-                "error": day_result.get("error", "fetch day failed"),
-                "day_at_failure": day,
-                "rows_collected": n_lineas,
-            }
-        if day_result.get("from_cache"):
-            days_from_cache += 1
+        pq_day_rows = pq_rows_by_day.get(day)
+        if pq_day_rows is not None:
+            day_rows = pq_day_rows
+            days_from_parquet += 1
+            total_count += len(day_rows)
         else:
-            days_live += 1
-        day_rows = day_result.get("rows") or []
-        total_count += int(day_result.get("total_count") or len(day_rows))
+            day_result = await _get_day_lines(client, day=day, sucursal=suc)
+            if not day_result.get("success"):
+                return {
+                    "success": False,
+                    "error_code": day_result.get("error_code", "transport"),
+                    "error": day_result.get("error", "fetch day failed"),
+                    "day_at_failure": day,
+                    "rows_collected": n_lineas,
+                }
+            if day_result.get("from_cache"):
+                days_from_cache += 1
+            else:
+                days_live += 1
+            day_rows = day_result.get("rows") or []
+            total_count += int(day_result.get("total_count") or len(day_rows))
 
         for uk in day_rows:
             if n_lineas >= max_rows:
@@ -2274,6 +2300,7 @@ async def summarize_sales(
         "cache_stats": {
             "days_from_cache": days_from_cache,
             "days_live": days_live,
+            "days_from_parquet": days_from_parquet,
         },
         "totals": {
             "pvp": round(total_pvp, 2),

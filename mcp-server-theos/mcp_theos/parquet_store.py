@@ -257,6 +257,63 @@ def connect_range(tenant_id: str, sucursal: str,
                  f"DAY >= '{d_from}' AND DAY <= '{d_to}'")
 
 
+def covered_days(tenant_id: str, sucursal: str,
+                 date_from: str, date_to: str) -> set[str]:
+    """Días (ISO) del rango que YA están en Parquet, listos para servir.
+
+    Devuelve un set vacío si no hay Parquet. Se usa para decidir, día por día,
+    si la fila se lee de Parquet (rápido) o se cae al jsonl/ERP.
+    """
+    base = parquet_root() / _safe(tenant_id) / _safe(sucursal)
+    if not base.exists() or not list(base.glob(f"*.{_PARQUET_VERSION}.parquet")):
+        return set()
+    try:
+        d_from = _iso_or_raise(date_from)
+        d_to = _iso_or_raise(date_to)
+    except ValueError:
+        return set()
+    con = connect_range(tenant_id, sucursal, d_from, d_to)
+    rows = con.execute("SELECT DISTINCT DAY FROM movs").fetchall()
+    con.close()
+    return {r[0] for r in rows}
+
+
+def read_range_rows_by_day(tenant_id: str, sucursal: str,
+                           date_from: str, date_to: str) -> dict[str, list[dict[str, Any]]]:
+    """Lee del Parquet las filas del rango, agrupadas por día ISO.
+
+    Cada fila vuelve como dict con las MISMAS claves ``_KEEP_KEYS`` (uppercase)
+    que produce el caché jsonl, para que el consumidor (el bucle de
+    ``summarize_sales``) no note la diferencia. Los tipos numéricos vuelven
+    como float/int; el resto como str — el bucle ya hace su propia coerción.
+
+    Esto es lo que hace viable agregar años: DuckDB lee el Parquet columnar en
+    sub-segundo en vez de parsear cientos de miles de líneas jsonl en Python.
+    """
+    base = parquet_root() / _safe(tenant_id) / _safe(sucursal)
+    if not base.exists() or not list(base.glob(f"*.{_PARQUET_VERSION}.parquet")):
+        return {}
+    try:
+        d_from = _iso_or_raise(date_from)
+        d_to = _iso_or_raise(date_to)
+    except ValueError:
+        return {}
+
+    con = connect_range(tenant_id, sucursal, d_from, d_to)
+    # Proyectamos exactamente las columnas crudas (sin DAY, que es de partición)
+    # en el orden estable de _COLS para reconstruir los dicts.
+    raw_cols = [c for c in _COLS if c != "DAY"]
+    col_list = ", ".join(f'"{c}"' for c in raw_cols)
+    cur = con.execute(f"SELECT DAY, {col_list} FROM movs")
+    out: dict[str, list[dict[str, Any]]] = {}
+    for row in cur.fetchall():
+        day = row[0]
+        rec = {raw_cols[i]: row[i + 1] for i in range(len(raw_cols))}
+        out.setdefault(day, []).append(rec)
+    con.close()
+    return out
+
+
 def coverage(tenant_id: str, sucursal: str) -> dict[str, Any]:
     """Diagnóstico: qué rango de días cubren los Parquet existentes."""
     import duckdb
