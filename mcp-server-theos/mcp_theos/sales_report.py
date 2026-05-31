@@ -2080,16 +2080,18 @@ async def summarize_sales(
         except (TypeError, ValueError):
             cutoff_hour = None
 
-    # Lookups (cached).
-    bodega_names = await _resolve_lookup(client, "INV_BODEGA")
-    familia_parent, _ = await _resolve_family_hierarchy(client)
-
-    # Pre-fetch the venta_credito flag for every invoice in the range,
-    # in parallel — needed because the line-level proceso doesn't carry
-    # it. Cost: ~3 paginated GETs per day, all parallel.
-    credit_flags = await _fetch_invoice_credit_flags(
-        client, date_from=date_from, date_to=date_to,
+    # Lookups + credit_flags son independientes entre sí → en paralelo.
+    # Antes eran 3 awaits secuenciales (~1s + 2.7s); concurrentes el costo es
+    # el del más lento. Cada uno cachea por su cuenta (lookups en memoria,
+    # credit_flags en disco por día).
+    import asyncio as _asyncio
+    bodega_names, fam_pair, credit_flags = await _asyncio.gather(
+        _resolve_lookup(client, "INV_BODEGA"),
+        _resolve_family_hierarchy(client),
+        _fetch_invoice_credit_flags(
+            client, date_from=date_from, date_to=date_to),
     )
+    familia_parent, _ = fam_pair
 
     # Iterate the range day-by-day so each day can be served from the
     # on-disk cache (past days are immutable). The first time we see a
