@@ -71,11 +71,13 @@ def build_single_day_hourly_png(
     reference_pvp: float | None = None,
     reference_label: str | None = None,
 ) -> bytes:
-    """Single-day evolution: bars per hour, peak highlighted.
+    """Single-day evolution: barras por hora (volumen) + línea de tendencia
+    superpuesta con marcadores, pico resaltado.
 
-    If ``reference_pvp`` is provided, a dashed horizontal line is drawn
-    at that value (e.g. avg-per-hour over the last 7 days) so the user
-    sees the bar-vs-benchmark relationship visually.
+    Estilo combinado barras+línea: la barra muestra el volumen de cada hora y
+    la línea encima marca la curva del día (la "evolución" que el gerente
+    espera ver). If ``reference_pvp`` is provided, a dashed horizontal line is
+    drawn at that value (e.g. avg-per-hour over the last 7 days).
     """
     fig, ax = plt.subplots(figsize=(12, 6.5), dpi=110)
     fig.patch.set_facecolor("white")
@@ -92,22 +94,36 @@ def build_single_day_hourly_png(
     else:
         hrs = [d["hora"] for d in hourly]
         vals = [float(d["pvp"]) for d in hourly]
-        bars = ax.bar(hrs, vals, color=COLOR_SECONDARY, edgecolor="none",
-                      width=0.7)
+        xs = list(range(len(hrs)))
+        # Barras = volumen por hora (suaves, para que la línea destaque).
+        bars = ax.bar(xs, vals, color=COLOR_SECONDARY, edgecolor="none",
+                      width=0.62, alpha=0.55, zorder=2)
+        # Línea de tendencia encima con marcadores = la "curva" del día.
+        ax.plot(xs, vals, color=COLOR_PRIMARY, linewidth=2.4,
+                marker="o", markersize=6, markerfacecolor="white",
+                markeredgecolor=COLOR_PRIMARY, markeredgewidth=1.8,
+                zorder=4)
+        ax.set_xticks(xs)
+        ax.set_xticklabels(hrs)
         if vals:
             peak_i = max(range(len(vals)), key=lambda i: vals[i])
             bars[peak_i].set_color(COLOR_PRIMARY)
-            # Annotate peak value above the bar
-            ax.text(peak_i, vals[peak_i],
-                    f"  ${vals[peak_i]:,.0f}",
-                    ha="center", va="bottom", fontsize=10,
-                    fontweight="bold", color=COLOR_PRIMARY)
+            bars[peak_i].set_alpha(0.85)
+            # Anotar el pico sobre el marcador de la línea.
+            ax.annotate(f"pico {hrs[peak_i]}  ${vals[peak_i]:,.0f}",
+                        xy=(peak_i, vals[peak_i]),
+                        xytext=(0, 14), textcoords="offset points",
+                        ha="center", va="bottom", fontsize=10,
+                        fontweight="bold", color=COLOR_PRIMARY, zorder=6)
         if reference_pvp is not None and reference_pvp > 0:
             label = reference_label or f"Promedio ${reference_pvp:,.0f}"
             ax.axhline(reference_pvp, color=COLOR_ORANGE,
                        linestyle="--", linewidth=1.6, alpha=0.85,
                        label=label, zorder=5)
             ax.legend(loc="upper right", fontsize=9, frameon=False)
+        # Holgura arriba para que la anotación del pico no se corte.
+        if vals and max(vals) > 0:
+            ax.set_ylim(0, max(vals) * 1.18)
         ax.yaxis.set_major_formatter(mtick.FuncFormatter(_fmt_dollar))
         ax.tick_params(axis="x", labelsize=10, rotation=45)
         ax.tick_params(axis="y", labelsize=10)
@@ -206,7 +222,8 @@ def build_daily_trend_png(
     benchmark_pvp: float | None = None,
     benchmark_label: str | None = None,
 ) -> bytes:
-    """Daily trend: bars per day + secondary line for n_facturas."""
+    """Daily trend: LÍNEA por día con relleno de área (la curva de evolución
+    temporal que el gerente espera), promedio y benchmark de referencia."""
     fig, ax = plt.subplots(figsize=(13, 7), dpi=110)
     fig.patch.set_facecolor("white")
     fig.suptitle(f"Tendencia diaria — {period_label}", fontsize=17,
@@ -229,18 +246,29 @@ def build_daily_trend_png(
             except (ValueError, KeyError):
                 labels.append(d.get("day", "?"))
         vals = [float(d["pvp"]) for d in daily]
-        bars = ax.bar(labels, vals, color=COLOR_SECONDARY,
-                      edgecolor="none", width=0.65)
+        xs = list(range(len(labels)))
+        # Línea de evolución + relleno de área debajo.
+        ax.fill_between(xs, vals, color=COLOR_SECONDARY, alpha=0.18, zorder=1)
+        ax.plot(xs, vals, color=COLOR_PRIMARY, linewidth=2.6,
+                marker="o", markersize=6, markerfacecolor="white",
+                markeredgecolor=COLOR_PRIMARY, markeredgewidth=1.8, zorder=3)
+        ax.set_xticks(xs)
+        ax.set_xticklabels(labels)
         avg = sum(vals) / len(vals) if vals else 0
         ax.axhline(avg, color=COLOR_ORANGE, linewidth=1.5, linestyle="--",
-                   label=f"Prom. rango ${avg:,.0f}", alpha=0.85)
+                   label=f"Prom. rango ${avg:,.0f}", alpha=0.85, zorder=2)
         if benchmark_pvp is not None and benchmark_pvp > 0:
             bench_lbl = benchmark_label or f"Prom. anterior ${benchmark_pvp:,.0f}"
-            ax.axhline(benchmark_pvp, color=COLOR_PRIMARY, linewidth=1.5,
-                       linestyle=":", label=bench_lbl, alpha=0.85)
+            ax.axhline(benchmark_pvp, color=COLOR_GREEN, linewidth=1.5,
+                       linestyle=":", label=bench_lbl, alpha=0.85, zorder=2)
         if vals:
             peak_i = max(range(len(vals)), key=lambda i: vals[i])
-            bars[peak_i].set_color(COLOR_PRIMARY)
+            ax.annotate(f"máx ${vals[peak_i]:,.0f}",
+                        xy=(peak_i, vals[peak_i]),
+                        xytext=(0, 12), textcoords="offset points",
+                        ha="center", fontsize=10, fontweight="bold",
+                        color=COLOR_PRIMARY, zorder=5)
+            ax.set_ylim(0, max(vals) * 1.18)
         ax.yaxis.set_major_formatter(mtick.FuncFormatter(_fmt_dollar))
         ax.tick_params(axis="x", labelsize=10, rotation=45)
         ax.tick_params(axis="y", labelsize=10)
