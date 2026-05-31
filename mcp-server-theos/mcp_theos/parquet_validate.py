@@ -1,8 +1,9 @@
-"""Valida que summarize_sales dé IDÉNTICO con Parquet vs sin Parquet (jsonl).
+"""Valida que summarize_sales dé IDÉNTICO con Parquet/SQL vs sin Parquet (jsonl).
 
 Corre dentro del contenedor. Llama summarize_sales dos veces sobre el mismo
 rango: una con la capa Parquet activa y otra forzando el fallback jsonl
-(MOV_PARQUET_DISABLE), y compara los dicts de respuesta campo por campo.
+(MOV_PARQUET_DISABLE), y compara los dicts de respuesta campo por campo con
+tolerancia de 1 centavo (artefacto de no-asociatividad de punto flotante).
 
 Uso:
   python -m mcp_theos.parquet_validate <tenant_id> <date_from> <date_to>
@@ -18,9 +19,11 @@ from mcp_theos.velneo_http import VelneoClient
 from mcp_theos.tools.admin_ops import _tenant_sucursal
 
 
-# Campos volátiles que pueden diferir legítimamente entre corridas (stats de
-# origen de datos, no datos de negocio). Se excluyen de la comparación.
+# Campos volátiles que difieren legítimamente entre corridas (stats de origen
+# de datos, no datos de negocio). Se excluyen de la comparación.
 _VOLATILE = {"cache_stats"}
+
+_MONEY_TOL = 0.01  # tolerancia: artefacto de no-asociatividad de punto flotante
 
 
 def _strip(d):
@@ -31,13 +34,9 @@ def _strip(d):
     return d
 
 
-_MONEY_TOL = 0.01  # tolerancia: artefacto de no-asociatividad de punto flotante
-
-
 def _deep_equal(a, b, path="", diffs=None):
-    """Compara tolerando <=1 centavo en floats (float non-associativity).
-    Acumula en ``diffs`` los caminos con diferencia REAL (>1 centavo o
-    estructural). Devuelve (igual_bool, max_money_delta)."""
+    """Compara tolerando <=1 centavo en floats. Acumula en ``diffs`` los caminos
+    con diferencia REAL (>1 centavo o estructural). Devuelve (igual, max_delta)."""
     if diffs is None:
         diffs = []
     maxd = 0.0
@@ -76,8 +75,11 @@ async def _run(client, df, dt, disable_pq):
         os.environ.pop("MOV_PARQUET_DISABLE", None)
     from mcp_theos.sales_report import summarize_sales
     t0 = time.time()
+    # max_rows alto en AMBOS caminos: el bucle jsonl trunca en 200k por defecto,
+    # lo que daría un falso DIFIEREN en rangos grandes (jsonl truncado vs parquet
+    # completo). Subimos el tope para una comparación justa.
     r = await summarize_sales(client, date_from=df, date_to=dt,
-                              include_cross_tabs=True,
+                              include_cross_tabs=True, max_rows=50_000_000,
                               top_n_clientes=20, top_n_productos=50)
     return r, time.time() - t0
 
