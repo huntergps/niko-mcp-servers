@@ -311,7 +311,7 @@ def connect_range(tenant_id: str, sucursal: str,
 
 
 def aggregate_accumulators(
-    tenant_id: str, sucursal: str, date_from: str, date_to: str,
+    tenant_id: str, sucursal: str, days: list[str],
     *,
     credit_flags: dict[int, bool],
     familia_parent: dict[int, str],
@@ -320,9 +320,10 @@ def aggregate_accumulators(
     today_iso: str | None = None,
     current_hour: int | None = None,
 ) -> dict[str, Any]:
-    """Agrega el rango con GROUP BY en DuckDB y devuelve los MISMOS acumuladores
-    que produce el bucle Python de summarize_sales, para que el armado de la
-    respuesta quede idéntico.
+    """Agrega los días dados (``days`` = días de CAPTURA) con GROUP BY en DuckDB
+    y devuelve los MISMOS acumuladores que produce el bucle Python de
+    summarize_sales, para que el armado de la respuesta quede idéntico y los
+    días históricos (Parquet) se puedan combinar con los días en vivo (ERP).
 
     El mapeo familia_id→nombre y bodega_id→nombre se aplica en Python sobre los
     POCOS grupos (≈85 familias, ≈10 bodegas), no sobre las 476k filas — ahí está
@@ -335,7 +336,14 @@ def aggregate_accumulators(
     """
     from collections import defaultdict
 
-    con = connect_range(tenant_id, sucursal, date_from, date_to)
+    # Filtramos por DAY (día de CAPTURA, = el archivo .jsonl del día), no por
+    # rango, para que el split histórico(Parquet)/live(ERP) en summarize_sales
+    # no solape ni doble-cuente días.
+    day_set = sorted({_iso_or_raise(d) for d in days})
+    if not day_set:
+        raise ValueError("aggregate_accumulators: days vacío")
+    day_lits = ",".join(f"'{d}'" for d in day_set)
+    con = query(tenant_id, sucursal, f"DAY IN ({day_lits})")
 
     # Filtros que replican el cutoff y la defensa del día en curso del bucle.
     filters = []

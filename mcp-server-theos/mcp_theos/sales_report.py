@@ -2065,30 +2065,37 @@ async def summarize_sales(
     days_live = 0
     days_from_parquet = 0
 
-    # Capa columnar: una sola query DuckDB trae TODOS los días del rango que
-    # ya están en Parquet (días pasados, inmutables). Esto es lo que hace
-    # viable agregar meses/años — leer 150 días de Parquet es sub-segundo vs
-    # ~1.5s/día parseando jsonl. Los días NO cubiertos (hoy, o sin backfill)
-    # caen al camino jsonl/ERV de siempre (_get_day_lines). El bucle de
-    # acumulación es idéntico para ambas fuentes → mismos números.
-    # Camino rápido: si TODO el rango ya está en Parquet, agregamos con GROUP BY
-    # en DuckDB (sub-segundo aun sobre años) en vez del bucle Python. Solo se
-    # mapean los pocos grupos (familia/bodega) en Python — ahí está el speedup.
-    # Si falta algún día (hoy, sin backfill), cae al bucle jsonl/ERP de siempre.
-    used_sql = False
+    # Arquitectura HÍBRIDA por día (histórico rápido + hoy en vivo):
+    #   * Días pasados YA en Parquet  -> agregados con GROUP BY en DuckDB
+    #     (sub-segundo, escala a años). Solo se mapean los pocos grupos
+    #     (familia/bodega) en Python — ahí está el speedup.
+    #   * Días NO cubiertos (HOY siempre — es mutable —, o pasados sin backfill)
+    #     -> se traen EN VIVO del ERP con el bucle de siempre y se SUMAN encima
+    #     de los mismos acumuladores. Así el día de hoy NUNCA tiene desfase
+    #     (igual que el camino jsonl puro) y el histórico vuela.
+    # Los acumuladores se pre-pueblan con el resultado SQL por ASIGNACIÓN de
+    # clave (preservando el factory del defaultdict); el bucle live suma con +=
+    # / unión de sets encima -> mismos números, combinados.
     pq_disabled = _os.environ.get("MOV_PARQUET_DISABLE", "").lower() in (
         "1", "true", "yes")
+    live_days = days
+    agg = None  # resultado SQL del histórico (None si no se usa / falla)
     if not pq_disabled and days:
         try:
             from mcp_theos import parquet_store
             covered = parquet_store.covered_days(
                 client.cfg.tenant_id, suc, date_from, date_to)
-            if all(d in covered for d in days):
+            pq_days = [d for d in days if d in covered]
+            if pq_days:
                 today_iso_local = _today_ecu_iso()
                 current_hour_local = (datetime.utcnow()
                                       + timedelta(hours=offset_int)).hour
+                # Cómputo SQL atómico: o devuelve agg completo o lanza ANTES de
+                # tocar los acumuladores. El pre-poblado va FUERA del try, así
+                # un fallo nunca deja acumuladores contaminados (no hay doble
+                # conteo en el fallback).
                 agg = parquet_store.aggregate_accumulators(
-                    client.cfg.tenant_id, suc, date_from, date_to,
+                    client.cfg.tenant_id, suc, pq_days,
                     credit_flags=credit_flags,
                     familia_parent=familia_parent,
                     bodega_names=bodega_names,
@@ -2096,32 +2103,49 @@ async def summarize_sales(
                     today_iso=today_iso_local,
                     current_hour=current_hour_local,
                 )
-                total_pvp = agg["total_pvp"]
-                total_neto = agg["total_neto"]
-                n_lineas = agg["n_lineas"]
-                total_count = agg["total_count"]
-                pvp_contado = agg["pvp_contado"]
-                pvp_credito = agg["pvp_credito"]
-                facturas_all = agg["facturas_all"]
-                by_day = agg["by_day"]
-                by_hour = agg["by_hour"]
-                by_familia = agg["by_familia"]
-                by_bodega = agg["by_bodega"]
-                by_pto_emi = agg["by_pto_emi"]
-                by_cliente = agg["by_cliente"]
-                by_forma_pago = agg["by_forma_pago"]
-                by_producto = agg["by_producto"]
-                by_fam_pto = agg["by_fam_pto"]
-                by_fam_bod = agg["by_fam_bod"]
-                by_day_pto = agg["by_day_pto"]
-                fact_por_pto = agg["fact_por_pto"]
-                days_from_parquet = len(days)
-                used_sql = True
+                live_days = [d for d in days if d not in covered]
         except Exception as exc:  # noqa: BLE001 — Parquet es optimización
             logger.warning("parquet SQL aggregate failed, fallback jsonl: %s", exc)
-            used_sql = False
+            agg = None
+            live_days = days
 
-    for day in ([] if used_sql else days):
+    if agg is not None:
+        # Pre-poblar por asignación de clave preserva el factory del defaultdict,
+        # así el bucle live suma encima con += / unión de sets.
+        total_pvp = agg["total_pvp"]
+        total_neto = agg["total_neto"]
+        n_lineas = agg["n_lineas"]
+        total_count = agg["total_count"]
+        pvp_contado = agg["pvp_contado"]
+        pvp_credito = agg["pvp_credito"]
+        facturas_all |= agg["facturas_all"]
+        for k, v in agg["by_day"].items():
+            by_day[k] = v
+        for k, v in agg["by_hour"].items():
+            by_hour[k] = v
+        for k, v in agg["by_familia"].items():
+            by_familia[k] = v
+        for k, v in agg["by_bodega"].items():
+            by_bodega[k] = v
+        for k, v in agg["by_pto_emi"].items():
+            by_pto_emi[k] = v
+        for k, v in agg["by_cliente"].items():
+            by_cliente[k] = v
+        for k, v in agg["by_forma_pago"].items():
+            by_forma_pago[k] = v
+        for k, v in agg["by_producto"].items():
+            by_producto[k] = v
+        for k, v in agg["by_fam_pto"].items():
+            by_fam_pto[k] = v
+        for k, v in agg["by_fam_bod"].items():
+            by_fam_bod[k] = v
+        for k, v in agg["by_day_pto"].items():
+            by_day_pto[k] = v
+        for k, v in agg["fact_por_pto"].items():
+            fact_por_pto[k] = v
+        days_from_parquet = len(days) - len(live_days)
+
+    for day in live_days:
         if n_lineas >= max_rows:
             break
         day_result = await _get_day_lines(client, day=day, sucursal=suc)
