@@ -1964,6 +1964,7 @@ async def summarize_sales(
     top_n_productos: int = 10,
     cutoff_hour: int | None = None,
     match_current_hour: bool = False,
+    include_cross_tabs: bool = False,
 ) -> dict[str, Any]:
     """Aggregate sales lines for a date range, no XLSX, JSON only.
 
