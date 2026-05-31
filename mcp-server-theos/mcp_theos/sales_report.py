@@ -2327,30 +2327,30 @@ async def summarize_sales(
             {"familia": f, "pvp": round(d["pvp"], 2),
              "pct": round(100 * d["pvp"] / total_pvp, 1) if total_pvp else 0.0,
              "n_lineas": d["lineas"]}
-            for f, d in sorted(by_familia.items(), key=lambda x: -x[1]["pvp"])
+            for f, d in sorted(by_familia.items(), key=lambda x: (-x[1]["pvp"], x[0]))
         ],
         "por_bodega": [
             {"bodega": b, "pvp": round(d["pvp"], 2),
              "pct": round(100 * d["pvp"] / total_pvp, 1) if total_pvp else 0.0,
              "n_facturas": len(d["facturas"]), "n_lineas": d["lineas"]}
-            for b, d in sorted(by_bodega.items(), key=lambda x: -x[1]["pvp"])
+            for b, d in sorted(by_bodega.items(), key=lambda x: (-x[1]["pvp"], x[0]))
         ],
         "por_pto_emision": [
             {"establecimiento_pto": ep, "pvp": round(d["pvp"], 2),
              "n_facturas": len(d["facturas"]), "n_lineas": d["lineas"]}
-            for ep, d in sorted(by_pto_emi.items(), key=lambda x: -x[1]["pvp"])
+            for ep, d in sorted(by_pto_emi.items(), key=lambda x: (-x[1]["pvp"], x[0]))
         ],
         "top_clientes": [
             {"nombre": c, "cif": d["cif"], "pvp": round(d["pvp"], 2),
              "n_facturas": len(d["facturas"]), "n_lineas": d["lineas"]}
             for c, d in sorted(by_cliente.items(),
-                                key=lambda x: -x[1]["pvp"])[:top_n_clientes]
+                                key=lambda x: (-x[1]["pvp"], x[0]))[:top_n_clientes]
         ],
         "por_forma_pago": [
             {"forma": f, "pvp": round(d["pvp"], 2),
              "pct": round(100 * d["pvp"] / total_pvp, 1) if total_pvp else 0.0,
              "n_facturas": len(d["facturas"]), "n_lineas": d["lineas"]}
-            for f, d in sorted(by_forma_pago.items(), key=lambda x: -x[1]["pvp"])
+            for f, d in sorted(by_forma_pago.items(), key=lambda x: (-x[1]["pvp"], x[0]))
         ],
         "top_productos": [
             {"nombre": p, "cod_bar": d["cod_bar"], "producto_id": d["producto_id"],
@@ -2358,7 +2358,7 @@ async def summarize_sales(
              "pct": round(100 * d["pvp"] / total_pvp, 1) if total_pvp else 0.0,
              "cantidad": round(d["cantidad"], 2), "n_lineas": d["lineas"]}
             for p, d in sorted(by_producto.items(),
-                                key=lambda x: -x[1]["pvp"])[:top_n_productos]
+                                key=lambda x: (-x[1]["pvp"], x[0]))[:top_n_productos]
         ],
         "top_productos_por_cantidad": [
             {"nombre": p, "cod_bar": d["cod_bar"], "producto_id": d["producto_id"],
@@ -2370,7 +2370,7 @@ async def summarize_sales(
              ),
              "n_lineas": d["lineas"]}
             for p, d in sorted(by_producto.items(),
-                                key=lambda x: -x[1]["cantidad"])[:top_n_productos]
+                                key=lambda x: (-x[1]["cantidad"], x[0]))[:top_n_productos]
         ],
     }
 
@@ -2378,11 +2378,11 @@ async def summarize_sales(
         # Listas planas de cruces (para heatmaps en el PDF).
         response["cross_familia_pto"] = [
             {"familia": k[0], "pto": k[1], "pvp": round(v, 2)}
-            for k, v in sorted(by_fam_pto.items(), key=lambda x: -x[1])
+            for k, v in sorted(by_fam_pto.items(), key=lambda x: (-x[1], x[0]))
         ]
         response["cross_familia_bodega"] = [
             {"familia": k[0], "bodega": k[1], "pvp": round(v, 2)}
-            for k, v in sorted(by_fam_bod.items(), key=lambda x: -x[1])
+            for k, v in sorted(by_fam_bod.items(), key=lambda x: (-x[1], x[0]))
         ]
         response["cross_dia_pto"] = [
             {"day": k[0], "pto": k[1], "pvp": round(v, 2)}
@@ -2402,7 +2402,7 @@ async def summarize_sales(
                 dia_top_by_pto[pto] = (day, v)
 
         por_sucursal = []
-        for pto, d in sorted(by_pto_emi.items(), key=lambda x: -x[1]["pvp"]):
+        for pto, d in sorted(by_pto_emi.items(), key=lambda x: (-x[1]["pvp"], x[0])):
             pvp_pto = round(d["pvp"], 2)
             n_fac_pto = len(fact_por_pto.get(pto) or d.get("facturas") or [])
             ftop = fam_top_by_pto.get(pto, ("(s/d)", 0.0))
