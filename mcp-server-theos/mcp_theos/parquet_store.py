@@ -359,9 +359,9 @@ def aggregate_accumulators(
     con.execute(f"""
         CREATE VIEW m AS
         SELECT
-            CAST(PVP_LINEA AS DECIMAL(18,4))          AS pvp,
-            CAST(PRECIO_NETO_LINEA AS DECIMAL(18,4))  AS neto,
-            CAST(CAN AS DECIMAL(18,4))                AS can,
+            CAST(PVP_LINEA AS DECIMAL(24,8))          AS pvp,
+            CAST(PRECIO_NETO_LINEA AS DECIMAL(24,8))  AS neto,
+            CAST(CAN AS DECIMAL(24,8))                AS can,
             CAST(VENT_FACT_VENT AS BIGINT)     AS inv_id,
             CAST(INV_FAMI AS BIGINT)           AS fam_id,
             CAST(INV_BODEGA AS BIGINT)         AS bod_id,
