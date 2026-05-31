@@ -1196,6 +1196,42 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "generate_executive_report",
+        "description": (
+            "Genera el INFORME EJECUTIVO de ventas en PDF (3 paginas: KPIs "
+            "con iconos incl. devoluciones NC + dona de familias + infografia "
+            "contado/credito; barras de horas pico + barras por punto de "
+            "emision + tabla top clientes; tendencia diaria con proyeccion 3 "
+            "dias + lectura + recomendaciones) y lo ENTREGA al chat via "
+            "sendDocument. USAR cuando el usuario pida 'informe ejecutivo', "
+            "'reporte gerencial', 'PDF de ventas', 'informe para gerencia', "
+            "'algo presentable'. DISTINTO de generate_sales_report (XLSX/"
+            "planilla) y de sales_dashboard_chart (1 PNG). Requiere "
+            "``deliver_to_chat``. Devuelve ``{success, delivered, "
+            "delivered_to_chat, pdf_filename, resumen, totals}``."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "month": {"type": "string", "description": "YYYY-MM (mes completo)"},
+                "year": {"type": "string", "description": "YYYY (año completo)"},
+                "date_from": {"type": "string", "description": "ISO YYYY-MM-DD"},
+                "date_to": {"type": "string", "description": "ISO YYYY-MM-DD"},
+                "sucursal": {"type": "string"},
+                "top_n_clientes": {"type": "integer", "default": 10},
+                "deliver_to_chat": {
+                    "type": "string",
+                    "description": (
+                        "REQUERIDO. Telegram chat_id destino (ej "
+                        "'-5248384291' para grupo Soporte Mepriga). El PDF se "
+                        "sube a ese chat como documento."
+                    ),
+                },
+            },
+            "required": ["deliver_to_chat"],
+        },
+    },
+    {
         "name": "generate_sales_report",
         "description": (
             "Genera el INFORME DE VENTAS DIARIAS (XLSX) que el operador "
@@ -1529,6 +1565,7 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "sales_dashboard_chart": ("admin_ops.sales_dashboard_chart", admin_ops.sales_dashboard_chart),
     "sales_evolution_chart": ("admin_ops.sales_evolution_chart", admin_ops.sales_evolution_chart),
     "generate_sales_report": ("admin_ops.generate_sales_report", admin_ops.generate_sales_report),
+    "generate_executive_report": ("admin_ops.generate_executive_report", admin_ops.generate_executive_report),
     "signature_queue_status": ("signature_queue.signature_queue_status", signature_queue.signature_queue_status),
     "list_signature_queue_errors": ("signature_queue.list_signature_queue_errors", signature_queue.list_signature_queue_errors),
     "reset_signature_queue_record": ("signature_queue.reset_signature_queue_record", signature_queue.reset_signature_queue_record),

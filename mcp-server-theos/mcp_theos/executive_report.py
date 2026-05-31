@@ -296,11 +296,11 @@ def _chart_hora(por_hora: list) -> ImageReader:
     fig, ax = plt.subplots(figsize=(9.2, 3.0))
     hrs = []
     for d in por_hora:
-        h = _g(d, "hora", "hour")
+        h = str(_g(d, "hora", "hour", default="")).replace("h00", "").strip()
         try:
             hrs.append(f"{int(h):02d}")
         except (TypeError, ValueError):
-            hrs.append(str(h))
+            hrs.append(str(_g(d, "hora", "hour")))
     vals = [_fnum(_g(d, "pvp")) for d in por_hora]
     bars = ax.bar(hrs, vals, color=SECONDARY, width=0.72)
     if vals:
@@ -376,9 +376,10 @@ def build_executive_report_pdf(summary: dict[str, Any]) -> tuple[bytes, str]:
     """
     import numpy as np
 
-    period = summary.get("period") or {}
-    rango = str(_g(period, "label", default="")) or \
-        f"{_g(period, 'from', default='')} -> {_g(period, 'to', default='')}".strip(" ->")
+    # Período: summarize_sales expone date_from/date_to top-level (no "period").
+    d_from = str(_g(summary, "date_from", default=""))
+    d_to = str(_g(summary, "date_to", default=""))
+    rango = f"{d_from} -> {d_to}".strip(" ->") if (d_from or d_to) else ""
 
     totals = summary.get("totals") or {}
     por_familia = _list(summary, "por_familia")
@@ -393,8 +394,15 @@ def build_executive_report_pdf(summary: dict[str, Any]) -> tuple[bytes, str]:
     nc_tot = _fnum(_g(totals, "nc_total"))
     neto = _fnum(_g(totals, "saldo_neto", "neto", default=pvp - nc_tot))
     n_ncs = int(_fnum(_g(cnotes, "n_ncs")))
-    ticket = _fnum(_g(totals, "ticket_promedio", default=(pvp / nfac if nfac else 0)))
-    contado, credito = _forma_pago_split(_g(totals, "por_forma_pago", default=[]))
+    # ticket: summarize_sales usa "ticket_promedio_pvp".
+    ticket = _fnum(_g(totals, "ticket_promedio_pvp", "ticket_promedio",
+                      default=(pvp / nfac if nfac else 0)))
+    # Contado/credito: summarize_sales los da directos en totals
+    # (pvp_contado / pvp_credito). Fallback: split de por_forma_pago.
+    contado = _fnum(_g(totals, "pvp_contado"))
+    credito = _fnum(_g(totals, "pvp_credito"))
+    if contado == 0 and credito == 0:
+        contado, credito = _forma_pago_split(_list(summary, "por_forma_pago"))
     pct_contado = contado / (contado + credito) * 100 if (contado + credito) else 0
 
     fam_lider = str(_g(por_familia[0], "familia", "nombre", default="s/d")) if por_familia else "s/d"
@@ -402,13 +410,15 @@ def build_executive_report_pdf(summary: dict[str, Any]) -> tuple[bytes, str]:
     if not fam_pct and por_familia and pvp:
         fam_pct = _fnum(_g(por_familia[0], "pvp")) / pvp * 100
 
+    # Hora pico: "hora" puede venir como "08h00" (string) o como int.
     pico = max(por_hora, key=lambda d: _fnum(_g(d, "pvp")), default=None)
     if pico is not None:
-        ph = _g(pico, "hora")
+        ph = str(_g(pico, "hora", default="")).replace("h00", "").strip()
         try:
-            pico_txt = f"{int(ph):02d}h ({_money(_g(pico, 'pvp'))})"
+            pico_lbl = f"{int(ph):02d}h"
         except (TypeError, ValueError):
-            pico_txt = f"{ph}h ({_money(_g(pico, 'pvp'))})"
+            pico_lbl = f"{_g(pico, 'hora')}"
+        pico_txt = f"{pico_lbl} ({_money(_g(pico, 'pvp'))})"
     else:
         pico_txt = "s/d"
 

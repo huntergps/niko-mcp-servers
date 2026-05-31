@@ -1489,6 +1489,71 @@ async def sales_dashboard_chart(
     }
 
 
+async def generate_executive_report(
+    client: VelneoClient,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    month: str | None = None,
+    year: str | None = None,
+    deliver_to_chat: str | None = None,
+    sucursal: str | None = None,
+    top_n_clientes: int = 10,
+) -> dict[str, Any]:
+    """Informe ejecutivo de ventas en PDF (3 páginas) y entrega a Telegram.
+
+    Mismo summarizer que ``sales_dashboard_chart`` / ``sales_quick_summary``
+    (datos idénticos, cache compartida). Arma un PDF con KPIs, dona de
+    familias, contado/crédito, horas pico, sucursales, top clientes y
+    tendencia con proyección, y lo entrega con ``send_document`` cuando se
+    pasa ``deliver_to_chat``. Sin ``deliver_to_chat`` devuelve ``pdf_base64``.
+    """
+    summary = await sales_quick_summary(
+        client, date_from=date_from, date_to=date_to,
+        month=month, year=year, sucursal=sucursal,
+        include_credit_notes=True, top_n_clientes=top_n_clientes,
+    )
+    if summary.get("success") is False:
+        return summary
+
+    from mcp_theos.executive_report import build_executive_report_pdf
+    try:
+        pdf_bytes, resumen = build_executive_report_pdf(summary)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"pdf_render_failed: {type(exc).__name__}: {exc}"}
+
+    label = month or year or summary.get("date_from") or "periodo"
+    fname = f"informe-ejecutivo-mepriga-{label}.pdf"
+
+    if deliver_to_chat:
+        from mcp_theos.telegram_delivery import send_document, BotTokenMissing
+        try:
+            await send_document(
+                chat_id=str(deliver_to_chat), filename=fname,
+                data=pdf_bytes, caption=resumen, parse_mode=None,
+            )
+        except BotTokenMissing as e:
+            return {"success": False, "error": "telegram_bot_token_missing", "message": str(e)}
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "error": "telegram_upload_failed", "message": str(e)}
+        return {
+            "success": True,
+            "delivered": True,
+            "delivered_to_chat": str(deliver_to_chat),
+            "pdf_filename": fname,
+            "resumen": resumen,
+            "totals": summary.get("totals"),
+        }
+
+    return {
+        "success": True,
+        "pdf_base64": base64.b64encode(pdf_bytes).decode(),
+        "pdf_filename": fname,
+        "resumen": resumen,
+        "totals": summary.get("totals"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # generate_sales_report — XLSX deliverable for the daily ops report
 # ---------------------------------------------------------------------------
