@@ -1508,6 +1508,7 @@ async def generate_executive_report(
     tendencia con proyección, y lo entrega con ``send_document`` cuando se
     pasa ``deliver_to_chat``. Sin ``deliver_to_chat`` devuelve ``pdf_base64``.
     """
+    import base64
     summary = await sales_quick_summary(
         client, date_from=date_from, date_to=date_to,
         month=month, year=year, sucursal=sucursal,
