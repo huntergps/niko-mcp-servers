@@ -2145,8 +2145,15 @@ async def summarize_sales(
             fact_por_pto[k] = v
         days_from_parquet = len(days) - len(live_days)
 
+    # ``max_rows`` es un tope de MEMORIA del bucle Python (cuántas filas
+    # materializa). El histórico via SQL NO materializa filas en Python, así que
+    # NO cuenta para este tope — si contara, un histórico >200k saltaría el día
+    # de hoy. ``live_lineas`` cuenta solo lo que carga el bucle en vivo
+    # (hoy + días sin backfill, siempre pocos); ``n_lineas`` sigue siendo el
+    # total real (SQL + vivo) que va a la respuesta.
+    live_lineas = 0
     for day in live_days:
-        if n_lineas >= max_rows:
+        if live_lineas >= max_rows:
             break
         day_result = await _get_day_lines(client, day=day, sucursal=suc)
         if not day_result.get("success"):
