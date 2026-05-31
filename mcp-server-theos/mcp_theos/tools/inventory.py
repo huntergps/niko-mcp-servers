@@ -158,6 +158,39 @@ async def generate_negative_stock_report(
                 "delivered": False,
                 "note": "No hay productos con saldo negativo."}
 
+    # 1b) Enriquecer cada producto con los campos NAVEGADOS por puntero que el
+    # proceso no resuelve (PVP, % utilidad, unidad, nombre de impuesto). El API
+    # REST de Velneo SÍ navega punteros con notación de punto
+    # (fields=PVP_MINIMO.PRECIO2) — confirmado: devuelve el valor real, no el ID.
+    # 1 GET por producto (~20 productos negativos, barato). Si falla, el bucle de
+    # abajo cae al valor crudo (0) sin romper.
+    _NAV_FIELDS = [
+        "ID",
+        "PVP_MINIMO.PRECIO2",                 # PVP sin IVA
+        "PVP_MINIMO.PVP2",                    # PVP con IVA
+        "PVP_MINIMO.PORCENTAJE_UTILIDAD2",    # % utilidad final
+        "EMP_MINIMO.NAME",                    # unidad mínima (dinámica)
+        "IMP_FIS_IMPUESTOS_VTA.NAME",         # nombre del impuesto ventas
+        "IMP_FIS_IMPUESTOS_COMPRA.NAME",      # nombre del impuesto compras
+    ]
+    nav_by_id: dict[int, dict[str, Any]] = {}
+    for p in products:
+        if not isinstance(p, dict):
+            continue
+        try:
+            pid_nav = int(p.get("id") or 0)
+        except (TypeError, ValueError):
+            pid_nav = 0
+        if not pid_nav:
+            continue
+        try:
+            rn = await client.get("PRODUCTOS", record_id=pid_nav,
+                                  fields=_NAV_FIELDS)
+            if rn.rows:
+                nav_by_id[pid_nav] = rn.rows[0]
+        except Exception as exc:  # noqa: BLE001 — navegación es mejora, no crítica
+            logger.warning("nav fields prod %s failed: %s", pid_nav, exc)
+
     # 2) Bodega names — fetch from INV_BODEGA WITHOUT fields filter
     # (verified working: returns 20 bodegas with full data including
     # nombre_corto which makes nicer column headers than the long NAME).
@@ -312,6 +345,17 @@ async def generate_negative_stock_report(
         if not keep:
             continue
 
+        # Campos navegados por puntero (PVP, % utilidad, unidad, nombre impuesto)
+        # obtenidos en el paso 1b vía fields=PVP_MINIMO.PRECIO2 etc. Las claves
+        # vienen UPPER con el path completo. Fallback al crudo/cache si faltan.
+        nav = nav_by_id.get(pid, {})
+        iva_vta = (nav.get("IMP_FIS_IMPUESTOS_VTA.NAME")
+                   or impuesto_name_by_id.get(
+                       int(p.get("imp_fis_impuestos_vta") or 0), "") or "")
+        iva_comp = (nav.get("IMP_FIS_IMPUESTOS_COMPRA.NAME")
+                    or impuesto_name_by_id.get(
+                        int(p.get("imp_fis_impuestos_compra") or 0), "") or "")
+
         rows.append({
             "id": pid,
             "familia": (p.get("inv_fami") or "").strip(),
@@ -319,22 +363,16 @@ async def generate_negative_stock_report(
             "nombre": (p.get("name") or "").strip(),
             "costo_promedio": float(p.get("costo_promedio") or 0),
             "costo_compra": float(p.get("costo_compra") or 0),
-            # PVP/utilidad/unidad: si el proceso los devuelve ya resueltos por JS
-            # (campos planos navegando los punteros virtuales PVP_MINIMO/EMP_MINIMO),
-            # los usamos; si no, fallback al valor crudo (que viene 0/ID porque el
-            # puntero virtual no serializa por REST). Ver
-            # mepriga/reporte-existencias-negativas-solucion-js.md
-            "pvp_sin_iva": _num(p.get("pvp_sin_iva"), p.get("pvp_minimo")),
-            "pvp_con_iva": _num(p.get("pvp_con_iva"), None),
-            "porc_utilidad": _num(p.get("pct_utilidad"), p.get("tasautilidadreco")),
-            "unidad_minima": (str(p.get("unidad_minima")
+            # PVP/utilidad/unidad: navegando el puntero virtual PVP_MINIMO /
+            # EMP_MINIMO (el API REST resuelve el puntero); fallback al crudo (0).
+            "pvp_sin_iva": _num(nav.get("PVP_MINIMO.PRECIO2"), p.get("pvp_minimo")),
+            "pvp_con_iva": _num(nav.get("PVP_MINIMO.PVP2"), None),
+            "porc_utilidad": _num(nav.get("PVP_MINIMO.PORCENTAJE_UTILIDAD2"),
+                                  p.get("tasautilidadreco")),
+            "unidad_minima": (str(nav.get("EMP_MINIMO.NAME")
                                   or p.get("emp_minimo") or "").strip()),
-            # IVA: el producto trae el ID del impuesto → mapear al NOMBRE vía
-            # la tabla IMP_FIS_IMPUESTOS cacheada arriba.
-            "iva_compras": (impuesto_name_by_id.get(
-                int(p.get("imp_fis_impuestos_compra") or 0), "") or ""),
-            "iva_ventas": (impuesto_name_by_id.get(
-                int(p.get("imp_fis_impuestos_vta") or 0), "") or ""),
+            "iva_compras": iva_comp,
+            "iva_ventas": iva_vta,
             "existencia": total,
             "por_bodega": by_bod,
             "product_bodega_ids": product_bodega_ids,
