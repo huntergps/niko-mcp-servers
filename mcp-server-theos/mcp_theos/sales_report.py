@@ -2690,32 +2690,51 @@ async def generate(
     # page[size] on _process/<name> just like on table list endpoints
     # (verified empirically 2026-05-28).
     suc = sucursal or _tenant_sucursal(client)
-    # Iterate day-by-day so each past day is served from the on-disk
-    # cache. Today's data is always pulled live (lines come in over the
-    # course of the day so any cache would go stale).
     days = await _iter_days(date_from, date_to)
     rows: list[dict[str, Any]] = []
     total_count = 0
     days_from_cache = 0
     days_live = 0
+    days_from_parquet = 0
+
+    # Capa columnar: los días YA en Parquet (pasados, inmutables) se leen de
+    # golpe vía DuckDB en vez de parsear jsonl día por día. HOY y días sin
+    # backfill se traen en vivo del ERP. Las filas vuelven en formato
+    # _KEEP_KEYS, idénticas a las del jsonl → el XLSX se arma igual.
+    pq_rows_by_day: dict[str, list[dict[str, Any]]] = {}
+    if _os.environ.get("MOV_PARQUET_DISABLE", "").lower() not in ("1", "true", "yes"):
+        try:
+            from mcp_theos import parquet_store
+            pq_rows_by_day = parquet_store.read_range_rows_by_day(
+                client.cfg.tenant_id, suc, date_from, date_to)
+        except Exception as exc:  # noqa: BLE001 — Parquet es optimización
+            logger.warning("parquet read_range (xlsx) failed, fallback jsonl: %s", exc)
+            pq_rows_by_day = {}
+
     for day in days:
         if len(rows) >= max_rows:
             break
-        day_result = await _get_day_lines(client, day=day, sucursal=suc)
-        if not day_result.get("success"):
-            return {
-                "success": False,
-                "error_code": day_result.get("error_code", "transport"),
-                "error": day_result.get("error", "fetch day failed"),
-                "day_at_failure": day,
-                "rows_collected": len(rows),
-            }
-        if day_result.get("from_cache"):
-            days_from_cache += 1
+        pq_day_rows = pq_rows_by_day.get(day)
+        if pq_day_rows is not None:
+            day_rows = pq_day_rows
+            days_from_parquet += 1
+            total_count += len(day_rows)
         else:
-            days_live += 1
-        day_rows = day_result.get("rows") or []
-        total_count += int(day_result.get("total_count") or len(day_rows))
+            day_result = await _get_day_lines(client, day=day, sucursal=suc)
+            if not day_result.get("success"):
+                return {
+                    "success": False,
+                    "error_code": day_result.get("error_code", "transport"),
+                    "error": day_result.get("error", "fetch day failed"),
+                    "day_at_failure": day,
+                    "rows_collected": len(rows),
+                }
+            if day_result.get("from_cache"):
+                days_from_cache += 1
+            else:
+                days_live += 1
+            day_rows = day_result.get("rows") or []
+            total_count += int(day_result.get("total_count") or len(day_rows))
         for r in day_rows:
             rows.append(r)
             if len(rows) >= max_rows:
