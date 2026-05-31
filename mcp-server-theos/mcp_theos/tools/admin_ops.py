@@ -1558,6 +1558,90 @@ async def generate_executive_report(
     }
 
 
+async def generate_forecast_report(
+    client: VelneoClient,
+    *,
+    target_month: str | None = None,
+    history_months: int = 2,
+    deliver_to_chat: str | None = None,
+    sucursal: str | None = None,
+) -> dict[str, Any]:
+    """Pronóstico de ventas del próximo mes en PDF, basado en N meses de historial.
+
+    Sin ``target_month`` proyecta el mes siguiente al actual (Ecuador). Lee
+    el historial dia por dia reutilizando el cache en disco (dias pasados
+    inmutables), evitando el timeout de traer 2 meses de golpe.
+    """
+    import base64
+    import calendar
+    from datetime import date as _date, datetime as _datetime, timezone, timedelta
+
+    ec_now = _datetime.now(timezone.utc) - timedelta(hours=5)
+    if target_month:
+        try:
+            ty, tm = (int(p) for p in str(target_month).strip().split("-"))
+            if not (1 <= tm <= 12 and 2000 <= ty <= 2100):
+                raise ValueError
+        except (TypeError, ValueError):
+            return {"success": False, "error": "target_month debe ser YYYY-MM"}
+    else:
+        ty, tm = (ec_now.year + 1, 1) if ec_now.month == 12 else (ec_now.year, ec_now.month + 1)
+
+    hm = max(1, min(int(history_months or 2), 6))
+    end_y, end_m = (ty - 1, 12) if tm == 1 else (ty, tm - 1)
+    hist_end = _date(end_y, end_m, calendar.monthrange(end_y, end_m)[1])
+    sy, sm = end_y, end_m
+    for _ in range(hm - 1):
+        sy, sm = (sy - 1, 12) if sm == 1 else (sy, sm - 1)
+    hist_start = _date(sy, sm, 1)
+    if hist_start > ec_now.date():
+        return {"success": False, "error": "rango historico en el futuro; revisa target_month"}
+    if hist_end > ec_now.date():
+        hist_end = ec_now.date()
+
+    from mcp_theos.sales_report import summarize_sales as _sum_sales
+    hist = await _sum_sales(
+        client, date_from=hist_start.isoformat(), date_to=hist_end.isoformat(),
+        sucursal=sucursal,
+    )
+    if hist.get("success") is False:
+        return hist
+
+    hist_label = (f"{hist_start.day:02d}/{hist_start.month:02d}/{hist_start.year} - "
+                  f"{hist_end.day:02d}/{hist_end.month:02d}/{hist_end.year}")
+
+    from mcp_theos.forecast import build_forecast_report_pdf
+    try:
+        pdf_bytes, resumen = build_forecast_report_pdf(hist, ty, tm, hist_label=hist_label)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"pdf_render_failed: {type(exc).__name__}: {exc}"}
+
+    fname = f"pronostico-ventas-mepriga-{ty:04d}-{tm:02d}.pdf"
+
+    if deliver_to_chat:
+        from mcp_theos.telegram_delivery import send_document, BotTokenMissing
+        try:
+            await send_document(chat_id=str(deliver_to_chat), filename=fname,
+                                data=pdf_bytes, caption=resumen, parse_mode=None)
+        except BotTokenMissing as e:
+            return {"success": False, "error": "telegram_bot_token_missing", "message": str(e)}
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "error": "telegram_upload_failed", "message": str(e)}
+        return {
+            "success": True, "delivered": True,
+            "delivered_to_chat": str(deliver_to_chat),
+            "pdf_filename": fname, "resumen": resumen,
+            "target_month": f"{ty:04d}-{tm:02d}", "history": hist_label,
+        }
+
+    return {
+        "success": True,
+        "pdf_base64": base64.b64encode(pdf_bytes).decode(),
+        "pdf_filename": fname, "resumen": resumen,
+        "target_month": f"{ty:04d}-{tm:02d}", "history": hist_label,
+    }
+
+
 # ---------------------------------------------------------------------------
 # generate_sales_report — XLSX deliverable for the daily ops report
 # ---------------------------------------------------------------------------
