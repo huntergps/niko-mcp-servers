@@ -1232,6 +1232,35 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "generate_purchase_report",
+        "description": (
+            "Genera un PDF de RECOMENDACION DE COMPRA: cruza los productos "
+            "mas vendidos (demanda historica) con las existencias actuales y "
+            "recomienda cuanto comprar para el proximo mes, con tres criterios "
+            "(reposicion simple, +20% seguridad, cobertura de N meses). USAR "
+            "cuando el usuario pida 'cuanto comprar', 'recomendacion/sugerencia "
+            "de compra', 'que reponer', 'pedido de compra', 'productos a "
+            "comprar', o 'productos mas vendidos vs existencias'. Requiere "
+            "``deliver_to_chat``. ``history_months`` (default 2) define la "
+            "ventana de demanda; ``top_n`` (default 30) cuantos productos; "
+            "``coverage_months`` (default 1.5) el 3er criterio. Devuelve "
+            "``{success, delivered, pdf_filename, resumen, n_productos}``. "
+            "Lee el historial dia por dia desde el cache; la 1a vez sobre meses "
+            "frios puede tardar."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "history_months": {"type": "integer", "default": 2, "description": "meses de demanda base (1-6)"},
+                "top_n": {"type": "integer", "default": 30, "description": "cuantos productos analizar (5-100)"},
+                "coverage_months": {"type": "number", "default": 1.5, "description": "meses de cobertura para el 3er criterio"},
+                "deliver_to_chat": {"type": "string", "description": "telegram chat_id destino (REQUERIDO para entregar)"},
+                "sucursal": {"type": "string"},
+            },
+            "required": ["deliver_to_chat"],
+        },
+    },
+    {
         "name": "generate_sales_report",
         "description": (
             "Genera el INFORME DE VENTAS DIARIAS (XLSX) que el operador "

@@ -1642,6 +1642,130 @@ async def generate_forecast_report(
     }
 
 
+async def generate_purchase_report(
+    client: VelneoClient,
+    *,
+    history_months: int = 2,
+    top_n: int = 30,
+    coverage_months: float = 1.5,
+    deliver_to_chat: str | None = None,
+    sucursal: str | None = None,
+) -> dict[str, Any]:
+    """Recomendación de compra: cruza productos más vendidos vs existencias y
+    sugiere cuánto comprar para el próximo mes (PDF).
+
+    Lee la demanda de los últimos ``history_months`` meses (día por día,
+    reutilizando el caché en disco — no recarga el ERP en corridas repetidas)
+    y las existencias actuales (EXS) de PRODUCTOS en una sola pasada paginada.
+    Tres criterios por producto: reposición simple, +20% seguridad y cobertura
+    de ``coverage_months`` meses. Entrega via send_document o devuelve base64.
+    """
+    import base64
+    import calendar
+    from datetime import date as _date, datetime as _datetime, timezone, timedelta
+
+    hm = max(1, min(int(history_months or 2), 6))
+    topn = max(5, min(int(top_n or 30), 100))
+    cov = float(coverage_months or 1.5)
+
+    ec_now = _datetime.now(timezone.utc) - timedelta(hours=5)
+    # Ventana histórica: hm meses completos previos al mes actual + lo que va
+    # del mes actual, para una tasa de venta reciente.
+    end = ec_now.date()
+    sy, sm = end.year, end.month
+    for _ in range(hm):
+        sy, sm = (sy - 1, 12) if sm == 1 else (sy, sm - 1)
+    hist_start = _date(sy, sm, 1)
+    n_days_hist = (end - hist_start).days + 1
+
+    # Mes objetivo (siguiente al actual) para el rótulo.
+    ty, tm = (ec_now.year + 1, 1) if ec_now.month == 12 else (ec_now.year, ec_now.month + 1)
+    meses = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+             "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    target_label = f"{meses[tm]} {ty}"
+    periodo_label = (f"{hist_start.day:02d}/{hist_start.month:02d}/{hist_start.year} - "
+                     f"{end.day:02d}/{end.month:02d}/{end.year} ({n_days_hist} dias)")
+
+    # 1) Demanda: productos más vendidos por cantidad en la ventana.
+    # summarize_sales directo (sales_quick_summary no forwarda top_n_productos).
+    from mcp_theos.sales_report import summarize_sales as _sum_sales
+    sales = await _sum_sales(
+        client, date_from=hist_start.isoformat(), date_to=end.isoformat(),
+        sucursal=sucursal, top_n_clientes=1, top_n_productos=topn,
+    )
+    if sales.get("success") is False:
+        return sales
+    top = sales.get("top_productos_por_cantidad") or sales.get("top_productos") or []
+    if not top:
+        return {"success": False, "error": "no_sales_data",
+                "message": "No se encontraron productos vendidos en el periodo."}
+    top = top[:topn]
+
+    # 2) Existencias: traer PRODUCTOS con EXS en una pasada paginada.
+    stock_by_id: dict[int, dict[str, Any]] = {}
+    fields = ["ID", "NAME", "CODIGO", "INV_FAMI", "EXS", "COSTO_COMPRA", "COSTO_PROMEDIO"]
+    page = 1
+    while page <= 200:
+        try:
+            resp = await client.get("PRODUCTOS",
+                                    params={"pagesize": 500, "page": page, "sort": "ID"},
+                                    fields=fields)
+        except VelneoError:
+            break
+        batch = resp.rows
+        if not batch:
+            break
+        for r in batch:
+            try:
+                pid = int(r.get("id") or r.get("ID") or 0)
+            except (TypeError, ValueError):
+                pid = 0
+            if not pid:
+                continue
+            stock_by_id[pid] = {
+                "existencia": float(r.get("exs") or 0),
+                "costo": float(r.get("costo_compra") or r.get("costo_promedio") or 0),
+                "familia": (r.get("inv_fami") or "").strip(),
+                "nombre": (r.get("name") or "").strip(),
+            }
+        if len(batch) < 500:
+            break
+        page += 1
+
+    # 3) Calcular y armar el PDF.
+    from mcp_theos.purchase import compute_purchase, build_purchase_report_pdf
+    pur = compute_purchase(top, stock_by_id, n_days_hist, coverage_months=cov)
+    try:
+        pdf_bytes, resumen = build_purchase_report_pdf(pur, periodo_label, target_label)
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "error": f"pdf_render_failed: {type(exc).__name__}: {exc}"}
+
+    fname = f"recomendacion-compra-mepriga-{ty:04d}-{tm:02d}.pdf"
+
+    if deliver_to_chat:
+        from mcp_theos.telegram_delivery import send_document, BotTokenMissing
+        try:
+            await send_document(chat_id=str(deliver_to_chat), filename=fname,
+                                data=pdf_bytes, caption=resumen, parse_mode=None)
+        except BotTokenMissing as e:
+            return {"success": False, "error": "telegram_bot_token_missing", "message": str(e)}
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "error": "telegram_upload_failed", "message": str(e)}
+        return {
+            "success": True, "delivered": True,
+            "delivered_to_chat": str(deliver_to_chat),
+            "pdf_filename": fname, "resumen": resumen,
+            "n_productos": pur["n_productos"], "target_month": f"{ty:04d}-{tm:02d}",
+        }
+
+    return {
+        "success": True,
+        "pdf_base64": base64.b64encode(pdf_bytes).decode(),
+        "pdf_filename": fname, "resumen": resumen,
+        "n_productos": pur["n_productos"], "target_month": f"{ty:04d}-{tm:02d}",
+    }
+
+
 # ---------------------------------------------------------------------------
 # generate_sales_report — XLSX deliverable for the daily ops report
 # ---------------------------------------------------------------------------
