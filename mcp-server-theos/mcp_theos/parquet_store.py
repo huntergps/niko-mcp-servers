@@ -226,7 +226,7 @@ def build_month(tenant_id: str, sucursal: str, month: str,
     for c in _COLS:
         if c in _NUM_COLS:
             fields.append(pa.field(c, pa.float64()))
-        elif c in _INT_COLS:
+        elif c in _INT_COLS or c == "HOUR_ECU":
             fields.append(pa.field(c, pa.int64()))
         else:
             fields.append(pa.field(c, pa.string()))
