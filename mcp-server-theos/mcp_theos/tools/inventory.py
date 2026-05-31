@@ -712,33 +712,70 @@ def _build_negative_stock_xlsx(
 # inventory_movements_window — wraps INV_DOC_MOV_BUSQ_JS
 # ---------------------------------------------------------------------------
 
+def _today_ecu_iso_inv() -> str:
+    """Fecha de "hoy" en hora oficial Ecuador (UTC-5), igual que el resto del
+    MCP. Mepriga factura en hora Quito (SRI), aunque el local esté en Galápagos.
+    """
+    from datetime import datetime, timezone, timedelta
+    return (datetime.now(timezone.utc) - timedelta(hours=5)).date().isoformat()
+
+
 async def inventory_movements_window(
     client: VelneoClient,
     *,
-    date_from: str,
-    date_to: str,
+    date_from: str | None = None,
+    date_to: str | None = None,
     tipo_doc: str = "",
     sucursal: str | None = None,
     producto: int = 0,
     bodega: int = 0,
+    cliente: int = 0,
+    proveedor: int = 0,
+    empresa: str = "",
     off: int = 0,
     limit: int = 1000,
 ) -> dict[str, Any]:
-    """Call the INV_DOC_MOV_BUSQ_JS process (multi-tipo doc movements).
+    """Kárdex de movimientos de inventario vía el proceso INV_DOC_MOV_BUSQ_JS.
 
-    ``tipo_doc``: "V"|"W"|"C"|"D" or "" for all 4 types.
-    Returns the list of INV_MOVIMIENTOS rows aggregated.
+    ``tipo_doc``:
+      - ""  → TODOS los movimientos del rango (ventas, NCs, compras, ajustes,
+        transferencias, prefacturas, guías...) vía la búsqueda directa
+        INV_MOVIMIENTOS_BUSQ_LILA. Soporta los filtros producto/bodega/empresa/
+        cliente/proveedor.
+      - "V"/"W"/"C"/"D" → un tipo concreto vía su búsqueda padre + loadPlurals.
+
+    Fechas: si no se pasan, usa "hoy" en hora oficial Ecuador (UTC-5), coherente
+    con el resto del MCP. ``date_from``/``date_to`` son ISO YYYY-MM-DD.
+
+    Filtros (0/"" = no filtrar): ``producto``, ``bodega``, ``cliente``,
+    ``proveedor`` (ids numéricos), ``empresa`` (alfa). Solo aplican en el modo
+    "todos" (tipo_doc="").
+
+    OJO desfase de fecha: la rama "todos" filtra por FECHA_CONTA (timestamp UTC);
+    la rama por-tipo filtra por la fecha de documento del padre. Para conteos
+    consistentes con el día comercial, comparar siempre el mismo modo.
     """
+    df = date_from or _today_ecu_iso_inv()
+    dt = date_to or df
+
     params: dict[str, Any] = {
-        "FCH_DES": date_from,
-        "FCH_HST": date_to,
+        "FCH_DES": df,
+        "FCH_HST": dt,
         "TIPO_DOC": tipo_doc or "",
         "OFF": off,
         "PRODUCTO": producto,
         "BODEGA": bodega,
+        "CLIENTE": cliente,
+        "PROVEEDOR": proveedor,
     }
     if sucursal:
         params["SUCURSAL"] = sucursal
+    else:
+        # SUCURSAL es requerida por la búsqueda; usar la del tenant por defecto.
+        from mcp_theos.tools.admin_ops import _tenant_sucursal
+        params["SUCURSAL"] = _tenant_sucursal(client)
+    if empresa:
+        params["EMPRESA"] = empresa
 
     try:
         resp = await client.process("INV_DOC_MOV_BUSQ_JS", params)
@@ -746,6 +783,8 @@ async def inventory_movements_window(
         return {"success": False,
                 "error": f"INV_DOC_MOV_BUSQ_JS failed: {exc}"}
 
+    # OJO: salida de un PROCESO viene con keys lowercase (ver memoria
+    # velneo-lowercase-fields). El envelope también: "inv_movimientos".
     rows = resp.get("inv_movimientos") or resp.get("INV_MOVIMIENTOS") or []
     if not isinstance(rows, list):
         rows = [rows] if rows else []
@@ -757,8 +796,12 @@ async def inventory_movements_window(
     return {
         "success": True,
         "tipo_doc": tipo_doc or "(todos)",
-        "date_from": date_from,
-        "date_to": date_to,
+        "date_from": df,
+        "date_to": dt,
+        "filtros": {k: v for k, v in {
+            "producto": producto, "bodega": bodega, "cliente": cliente,
+            "proveedor": proveedor, "empresa": empresa,
+        }.items() if v},
         "n_movimientos": len(rows),
         "truncated": truncated,
         "returned": len(head),

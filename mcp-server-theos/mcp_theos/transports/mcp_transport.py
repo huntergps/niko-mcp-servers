@@ -1527,30 +1527,37 @@ MCP_TOOLS: list[dict[str, Any]] = [
     {
         "name": "inventory_movements_window",
         "description": (
-            "Devuelve movimientos de inventario (INV_MOVIMIENTOS) por "
-            "rango de fechas + tipo de documento. Wrapper del proceso "
-            "Velneo INV_DOC_MOV_BUSQ_JS. tipo_doc: 'V'=ventas, 'W'=NCs "
-            "ventas, 'C'=compras, 'D'=NCs compras, ''=todos. Filtros "
-            "opcionales: producto, bodega, sucursal."
+            "Kárdex de movimientos de inventario (INV_MOVIMIENTOS). Wrapper del "
+            "proceso Velneo INV_DOC_MOV_BUSQ_JS. tipo_doc='' = TODOS los "
+            "movimientos (ventas, NCs, compras, ajustes, transferencias, "
+            "prefacturas, guías...); 'V'=ventas, 'W'=NCs vtas, 'C'=compras, "
+            "'D'=NCs compras. Filtros opcionales para el modo todos: producto, "
+            "bodega, cliente, proveedor, empresa, sucursal. Si no pasás fechas "
+            "usa HOY (hora Ecuador UTC-5). Usalo para: 'movimientos del producto "
+            "X', 'kárdex de la bodega Y', 'qué le compramos al proveedor Z', "
+            "'movimientos del cliente W'. NO pases fechas para 'hoy'."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "date_from": {"type": "string", "description": "ISO YYYY-MM-DD"},
-                "date_to": {"type": "string", "description": "ISO YYYY-MM-DD"},
+                "date_from": {"type": "string", "description": "ISO YYYY-MM-DD. Omitir para hoy (UTC-5)."},
+                "date_to": {"type": "string", "description": "ISO YYYY-MM-DD. Omitir para hoy (UTC-5)."},
                 "tipo_doc": {
                     "type": "string",
                     "enum": ["", "V", "W", "C", "D"],
                     "default": "",
-                    "description": "V=ventas, W=NCs vtas, C=compras, D=NCs compras, ''=todos",
+                    "description": "''=TODOS, V=ventas, W=NCs vtas, C=compras, D=NCs compras",
                 },
-                "sucursal": {"type": "string"},
-                "producto": {"type": "integer", "default": 0, "description": "0=no filtrar"},
-                "bodega": {"type": "integer", "default": 0, "description": "0=no filtrar"},
+                "sucursal": {"type": "string", "description": "Omitir = sucursal del tenant"},
+                "producto": {"type": "integer", "default": 0, "description": "id producto, 0=no filtrar"},
+                "bodega": {"type": "integer", "default": 0, "description": "id bodega, 0=no filtrar"},
+                "cliente": {"type": "integer", "default": 0, "description": "id cliente (CLT_ENT), 0=no filtrar"},
+                "proveedor": {"type": "integer", "default": 0, "description": "id proveedor (PRV_ENT), 0=no filtrar"},
+                "empresa": {"type": "string", "default": "", "description": "código empresa, ''=no filtrar"},
                 "off": {"type": "integer", "default": 0, "description": "1=incluir desactivados"},
                 "limit": {"type": "integer", "default": 1000, "minimum": 1, "maximum": 5000},
             },
-            "required": ["date_from", "date_to"],
+            "required": [],
         },
     },
     {
