@@ -607,6 +607,22 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "sri_status_report",
+        "description": (
+            "Informe de ESTADO de documentos electronicos SRI (clasificado). "
+            "USAR SIEMPRE para: 'estado de (los) documentos electronicos', "
+            "'informe SRI', 'cola SRI', 'como va el SRI', 'documentos pendientes "
+            "de autorizar / no enviados / devueltos', 'saneamiento de documentos'. "
+            "Devuelve dos secciones listas para mostrar TAL CUAL al usuario: "
+            "PENDIENTES de enviar al SRI (ventas accionables, compras SOLO con "
+            "liquidacion 03 o retencion real, guias por fechaemision; NC compra "
+            "en silencio) + INFORMATIVO (borradores/cancelados para contabilidad). "
+            "NO improvisar con odoo_search/aggregate_records/search_count — ESTE "
+            "tool ya clasifica bien y evita los falsos positivos. Ventana 7 dias."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
         "name": "search_partner",
         "description": (
             "Buscar un cliente, proveedor o contacto por nombre, empresa, ciudad o cualquier dato. "
@@ -2880,6 +2896,12 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         from mcp_odoo.tools.inventory import odoo_check_stock
         result = odoo_check_stock(*creds, args["product_ids"])
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "sri_status_report":
+        from mcp_odoo.tools.sri_report import sri_status_report
+        # Devuelve texto monospace listo para Telegram (NO json) — Lila lo
+        # muestra tal cual; ya viene clasificado (pendientes + informativo).
+        return sri_status_report(*creds)
 
     if tool_name == "search_partner":
         return await _rag_search_partners(args["query"], args.get("top_k", 5), tc["tenant_id"])
