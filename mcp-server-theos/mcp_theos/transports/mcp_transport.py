@@ -1561,6 +1561,49 @@ MCP_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "generate_immobilized_stock_report",
+        "description": (
+            "Stock INMOVILIZADO: productos con existencias que NO tuvieron "
+            "NINGÚN movimiento de inventario en el periodo (stock muerto que "
+            "no rota = capital parado). Wrapper del proceso Velneo "
+            "PRODUCTOS_SIN_VENTAS_PERIODO_JS, que cruza catálogo vs "
+            "movimientos DEL LADO DEL SERVIDOR (no descarga las cientos de "
+            "miles de líneas de venta). Calcula valor_inmovilizado = "
+            "existencia × costo_promedio, ordena descendente y devuelve el "
+            "TOP-N. Si pasás deliver_to_chat, además sube un XLSX con TODOS "
+            "los inmovilizados ordenados por valor. Fechas opcionales: por "
+            "defecto del 1-ene del año en curso a hoy (UTC-5); el periodo es "
+            "libre (3 meses, 1 año, 2 años atrás). "
+            "USAR cuando el usuario pide: 'productos sin ventas en [periodo]', "
+            "'productos que no rotan', 'stock inmovilizado', 'stock muerto', "
+            "'top N de stock parado', 'productos sin movimiento'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "ISO YYYY-MM-DD. Omitir = 1-ene del año en curso (UTC-5)."},
+                "date_to": {"type": "string", "description": "ISO YYYY-MM-DD. Omitir = hoy (UTC-5)."},
+                "sucursal": {"type": "string", "description": "Omitir = sucursal del tenant"},
+                "solo_con_stock": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "True (default) = solo EXS>0 = stock inmovilizado "
+                        "real (capital parado). False = todo producto sin "
+                        "movimiento, con o sin stock."
+                    ),
+                },
+                "top_n": {"type": "integer", "default": 10, "minimum": 1, "maximum": 100,
+                          "description": "Cuántos devolver al chat, ordenados por valor inmovilizado desc."},
+                "deliver_to_chat": {
+                    "type": "string",
+                    "description": "Telegram chat_id para subir el XLSX completo. Para Mepriga: '-5248384291'. Omitir = solo top-N en el chat, sin XLSX.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "reset_signature_queue_record",
         "description": (
             "Cambia ESTADO_FEAP='1' en UNA fila de COLA_DOCS_FIRMAR "
@@ -1656,6 +1699,7 @@ _DISPATCH: dict[str, tuple[str, ToolFn]] = {
     "reset_signature_queue_record": ("signature_queue.reset_signature_queue_record", signature_queue.reset_signature_queue_record),
     "generate_negative_stock_report": ("inventory.generate_negative_stock_report", inventory.generate_negative_stock_report),
     "inventory_movements_window": ("inventory.inventory_movements_window", inventory.inventory_movements_window),
+    "generate_immobilized_stock_report": ("inventory.generate_immobilized_stock_report", inventory.generate_immobilized_stock_report),
 }
 
 

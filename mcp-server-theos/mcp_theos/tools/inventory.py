@@ -827,3 +827,354 @@ async def inventory_movements_window(
         "returned": len(head),
         "rows": head,
     }
+
+
+# ---------------------------------------------------------------------------
+# generate_immobilized_stock_report — wraps PRODUCTOS_SIN_VENTAS_PERIODO_JS
+# ---------------------------------------------------------------------------
+
+def _year_start_ecu_iso() -> str:
+    """1 de enero del año en curso, hora oficial Ecuador (UTC-5)."""
+    from datetime import datetime, timezone, timedelta
+    return (datetime.now(timezone.utc) - timedelta(hours=5)).date().replace(
+        month=1, day=1).isoformat()
+
+
+async def generate_immobilized_stock_report(
+    client: VelneoClient,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    sucursal: str | None = None,
+    solo_con_stock: bool = True,
+    top_n: int = 10,
+    deliver_to_chat: str | None = None,
+) -> dict[str, Any]:
+    """Productos INMOVILIZADOS: con stock que NO tuvieron NINGÚN movimiento de
+    inventario en el periodo (stock muerto que no rota). Wrapper del proceso
+    Velneo ``PRODUCTOS_SIN_VENTAS_PERIODO_JS``, que cruza catálogo vs movimientos
+    DEL LADO DEL SERVIDOR (operaciones nativas de lista) — NO descarga las
+    cientos de miles de líneas de venta al MCP.
+
+    El proceso devuelve la lista de PRODUCTOS inmovilizados. Acá paginamos esa
+    lista pidiendo SOLO campos livianos (id, codigo, nombre, familia, exs,
+    costo_promedio) para no arrastrar filas gordas, calculamos
+    ``valor_inmovilizado = exs × costo_promedio`` por producto, ordenamos
+    descendente y:
+      * devolvemos el TOP-N al chat (tabla),
+      * si ``deliver_to_chat`` se da, además armamos un XLSX con TODOS los
+        inmovilizados ordenados por valor y lo subimos a Telegram.
+
+    Fechas (ISO YYYY-MM-DD): si no se pasan, ``date_from`` = 1-ene del año en
+    curso y ``date_to`` = hoy, ambas en hora oficial Ecuador (UTC-5). El periodo
+    es libre: 3 meses, 1 año, 2 años atrás...
+
+    ``solo_con_stock``: True (default) = solo EXS>0 = stock inmovilizado real
+    (capital parado). False = todo producto sin movimiento, con o sin stock.
+    """
+    df = date_from or _year_start_ecu_iso()
+    dt = date_to or _today_ecu_iso_inv()
+
+    if sucursal is None:
+        from mcp_theos.tools.admin_ops import _tenant_sucursal
+        sucursal = _tenant_sucursal(client)
+
+    params: dict[str, Any] = {
+        "FCH_DES": df,
+        "FCH_HST": dt,
+        "SUCURSAL": sucursal,
+        "SOLO_CON_STOCK": 1 if solo_con_stock else 0,
+        # Solo campos livianos: el proceso devuelve PRODUCTOS, que tiene decenas
+        # de columnas; pedir todas con 26k+ filas tumba la conexión. Con estos 6
+        # campos cada fila pesa poco y la paginación aguanta. (Si el API no
+        # aplicara fields a la salida del proceso, el cálculo sigue siendo
+        # correcto — solo pesaría más; se valida en pruebas.)
+        "fields": "ID,CODIGO,NAME,INV_FAMI,EXS,COSTO_PROMEDIO",
+    }
+
+    _API_PAGE = 1000
+    max_pages = 200  # 200k productos cap duro — más que el catálogo entero
+    all_rows: list[dict[str, Any]] = []
+    page = 1
+    while page <= max_pages:
+        page_params = dict(params)
+        page_params["page[number]"] = page
+        page_params["page[size]"] = _API_PAGE
+        try:
+            resp = await client.process(
+                "PRODUCTOS_SIN_VENTAS_PERIODO_JS", page_params)
+        except Exception as exc:  # noqa: BLE001
+            # No perder lo ya recolectado: devolver parcial con aviso explícito.
+            if all_rows:
+                logger.warning(
+                    "PRODUCTOS_SIN_VENTAS_PERIODO_JS corte en page %d: %s "
+                    "(%d filas ya recolectadas)", page, exc, len(all_rows))
+                break
+            return {"success": False,
+                    "error": f"PRODUCTOS_SIN_VENTAS_PERIODO_JS failed "
+                             f"(page {page}): {exc}"}
+        # Salida de PROCESO = keys lowercase; envelope "productos".
+        chunk = resp.get("productos") or resp.get("PRODUCTOS") or []
+        if not isinstance(chunk, list):
+            chunk = [chunk] if chunk else []
+        all_rows.extend(chunk)
+        if len(chunk) < _API_PAGE:
+            break
+        page += 1
+    pages_hit_cap = page > max_pages
+
+    # Construir filas con valor inmovilizado = exs × costo_promedio.
+    items: list[dict[str, Any]] = []
+    for p in all_rows:
+        if not isinstance(p, dict):
+            continue
+        try:
+            pid = int(p.get("id") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if not pid:
+            continue
+        exs = _num(p.get("exs"))
+        costo = _num(p.get("costo_promedio"))
+        valor = exs * costo
+        items.append({
+            "id": pid,
+            "codigo": (p.get("codigo") or "").strip(),
+            "nombre": (p.get("name") or "").strip(),
+            "familia": (p.get("inv_fami") or "").strip(),
+            "existencia": exs,
+            "costo_promedio": costo,
+            "valor_inmovilizado": valor,
+        })
+
+    # Ordenar por valor inmovilizado descendente (lo que más capital tiene parado).
+    items.sort(key=lambda x: x["valor_inmovilizado"], reverse=True)
+
+    n_total = len(items)
+    valor_total = sum(x["valor_inmovilizado"] for x in items)
+    top = items[: max(1, top_n)]
+
+    result: dict[str, Any] = {
+        "success": True,
+        "date_from": df,
+        "date_to": dt,
+        "sucursal": sucursal,
+        "solo_con_stock": solo_con_stock,
+        "n_productos_inmovilizados": n_total,
+        "valor_total_inmovilizado": round(valor_total, 2),
+        "pages_fetched": page if not pages_hit_cap else max_pages,
+        "pages_hit_cap": pages_hit_cap,
+        "top_n": len(top),
+        "top": [
+            {**t,
+             "existencia": round(t["existencia"], 2),
+             "costo_promedio": round(t["costo_promedio"], 4),
+             "valor_inmovilizado": round(t["valor_inmovilizado"], 2)}
+            for t in top
+        ],
+    }
+
+    # XLSX completo (opcional) → Telegram.
+    if deliver_to_chat:
+        xlsx_bytes = _build_immobilized_xlsx(items, df, dt, valor_total)
+        from mcp_theos.telegram_delivery import (
+            send_document as _send_doc, BotTokenMissing,
+        )
+        ec_now = datetime.now(timezone.utc) - timedelta(hours=5)
+        filename = (f"stock_inmovilizado_"
+                    f"{ec_now.strftime('%Y-%m-%d_%H%M')}.xlsx")
+        caption = (
+            f"<b>Stock inmovilizado</b> · {n_total:,} productos · "
+            f"${valor_total:,.2f} en capital parado\n"
+            f"Periodo {df} a {dt}"
+        )
+        try:
+            await _send_doc(
+                chat_id=str(deliver_to_chat),
+                data=xlsx_bytes,
+                filename=filename,
+                caption=caption,
+                parse_mode="HTML",
+            )
+            result["delivered"] = True
+            result["delivered_to_chat"] = str(deliver_to_chat)
+            result["filename"] = filename
+            result["xlsx_size_kb"] = round(len(xlsx_bytes) / 1024, 1)
+        except BotTokenMissing as e:
+            result["delivered"] = False
+            result["deliver_error"] = f"telegram_bot_token_missing: {e}"
+        except Exception as e:  # noqa: BLE001
+            result["delivered"] = False
+            result["deliver_error"] = f"telegram_upload_failed: {e}"
+
+    return result
+
+
+def _build_immobilized_xlsx(
+    items: list[dict[str, Any]],
+    date_from: str,
+    date_to: str,
+    valor_total: float,
+) -> bytes:
+    """XLSX de stock inmovilizado: banner corporativo + KPIs + tabla ordenada
+    por valor inmovilizado descendente, con AutoFilter y zebra striping.
+    Mismo lenguaje visual que el reporte de saldos negativos.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.cell import WriteOnlyCell as _C
+    from openpyxl.utils import get_column_letter
+
+    P_PRIMARY = "1F4E78"
+    P_SECONDARY = "2E75B6"
+    P_GREEN = "70AD47"
+    P_TABLE_HEADER = "305496"
+    P_ZEBRA = "F8F9FB"
+    P_SUBTLE = "595959"
+    P_WHITE = "FFFFFF"
+
+    title_font = Font(bold=True, color=P_WHITE, size=22, name="Calibri")
+    subtitle_font = Font(bold=True, color=P_WHITE, size=12, name="Calibri")
+    caption_font = Font(italic=True, color=P_SUBTLE, size=11, name="Calibri")
+    kpi_header_font = Font(bold=True, color=P_WHITE, size=11, name="Calibri")
+    kpi_value_font = Font(bold=True, color=P_PRIMARY, size=18, name="Calibri")
+    section_font = Font(bold=True, color=P_PRIMARY, size=13, name="Calibri")
+    table_header_font = Font(bold=True, color=P_WHITE, size=10, name="Calibri")
+    body_font = Font(size=10, name="Calibri")
+
+    primary_fill = PatternFill("solid", fgColor=P_PRIMARY)
+    secondary_fill = PatternFill("solid", fgColor=P_SECONDARY)
+    green_fill = PatternFill("solid", fgColor=P_GREEN)
+    table_header_fill = PatternFill("solid", fgColor=P_TABLE_HEADER)
+    zebra_fill = PatternFill("solid", fgColor=P_ZEBRA)
+
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left = Alignment(horizontal="left", vertical="center", indent=1)
+    right = Alignment(horizontal="right", vertical="center")
+
+    thin = Side(border_style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    headers = ["#", "ID", "Código", "Nombre", "Familia",
+               "Existencia", "Costo\nPromedio", "Valor\nInmovilizado"]
+    total_cols = len(headers)
+
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet(title="Stock Inmovilizado")
+    ws.sheet_view.showGridLines = False
+
+    widths = {1: 6, 2: 9, 3: 14, 4: 50, 5: 14,
+              6: 12, 7: 13, 8: 16}
+    for c, w in widths.items():
+        ws.column_dimensions[get_column_letter(c)].width = w
+
+    def _empty_row() -> list:
+        return [None] * total_cols
+
+    def _cell(value, font=None, fill=None, alignment=None, border_=None,
+              number_format=None):
+        c = _C(ws, value=value)
+        if font: c.font = font
+        if fill: c.fill = fill
+        if alignment: c.alignment = alignment
+        if border_: c.border = border_
+        if number_format: c.number_format = number_format
+        return c
+
+    def _merge(sr, sc, er, ec):
+        ws.merged_cells.ranges.add(
+            f"{get_column_letter(sc)}{sr}:{get_column_letter(ec)}{er}")
+
+    # Row 1 margin
+    ws.append(_empty_row())
+    # Row 2 banner
+    ws.row_dimensions[2].height = 38
+    _merge(2, 1, 2, total_cols)
+    row = _empty_row()
+    row[0] = _cell("MEPRIGA — Mega Primavera Galápagos",
+                   font=title_font, fill=primary_fill,
+                   alignment=Alignment(horizontal="center", vertical="center"))
+    ws.append(row)
+    # Row 3 subtitle
+    ws.row_dimensions[3].height = 24
+    _merge(3, 1, 3, total_cols)
+    row = _empty_row()
+    row[0] = _cell("Stock Inmovilizado (sin movimiento en el periodo)",
+                   font=subtitle_font, fill=secondary_fill,
+                   alignment=Alignment(horizontal="center", vertical="center"))
+    ws.append(row)
+    # Row 4 caption
+    ws.row_dimensions[4].height = 20
+    _merge(4, 1, 4, total_cols)
+    row = _empty_row()
+    row[0] = _cell(f"Periodo {date_from} a {date_to}",
+                   font=caption_font,
+                   alignment=Alignment(horizontal="center", vertical="center"))
+    ws.append(row)
+    # Row 5 gutter
+    ws.append(_empty_row())
+    # Rows 6-7 KPIs
+    kpis = [
+        ("PRODUCTOS INMOVILIZADOS", f"{len(items):,}", P_SECONDARY),
+        ("VALOR TOTAL PARADO", f"${valor_total:,.2f}", P_GREEN),
+    ]
+    span = max(2, total_cols // 2)
+    starts = [1, 1 + span]
+    ends = [span, total_cols]
+    ws.row_dimensions[6].height = 24
+    row = _empty_row()
+    for (label, _v, color), s, e in zip(kpis, starts, ends):
+        row[s - 1] = _cell(label, font=kpi_header_font,
+                           fill=PatternFill("solid", fgColor=color),
+                           alignment=center, border_=border)
+        _merge(6, s, 6, e)
+    ws.append(row)
+    ws.row_dimensions[7].height = 38
+    row = _empty_row()
+    for (_l, val, _c), s, e in zip(kpis, starts, ends):
+        row[s - 1] = _cell(val, font=kpi_value_font,
+                           alignment=center, border_=border)
+        _merge(7, s, 7, e)
+    ws.append(row)
+    # Row 8 gutter
+    ws.append(_empty_row())
+    # Row 9 section
+    ws.row_dimensions[9].height = 22
+    row = _empty_row()
+    row[0] = _cell("Detalle ordenado por valor inmovilizado",
+                   font=section_font,
+                   alignment=Alignment(horizontal="left", vertical="center"))
+    ws.append(row)
+    # Row 10 headers
+    ws.row_dimensions[10].height = 40
+    ws.append([_cell(h, font=table_header_font, fill=table_header_fill,
+                     alignment=center, border_=border) for h in headers])
+    # Rows 11+ data
+    for idx, r in enumerate(items):
+        zebra = zebra_fill if idx % 2 == 0 else None
+        vals = [
+            idx + 1,
+            r["id"],
+            r["codigo"],
+            r["nombre"],
+            r["familia"],
+            round(r["existencia"], 2),
+            round(r["costo_promedio"], 4),
+            round(r["valor_inmovilizado"], 2),
+        ]
+        cells = []
+        for i, v in enumerate(vals):
+            align = left if i in (2, 3, 4) else right
+            nf = '#,##0.00' if i == 7 else None
+            cells.append(_cell(v, font=body_font, fill=zebra,
+                               alignment=align, border_=border,
+                               number_format=nf))
+        ws.append(cells)
+
+    ws.freeze_panes = "A11"
+    last_row = 10 + len(items)
+    ws.auto_filter.ref = f"A10:{get_column_letter(total_cols)}{last_row}"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
