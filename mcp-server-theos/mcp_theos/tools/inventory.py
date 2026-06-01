@@ -849,6 +849,7 @@ async def generate_immobilized_stock_report(
     solo_con_stock: bool = True,
     top_n: int = 10,
     deliver_to_chat: str | None = None,
+    xlsx_top_n: int = 0,
 ) -> dict[str, Any]:
     """Productos INMOVILIZADOS: con stock que NO tuvieron NINGÚN movimiento de
     inventario en el periodo (stock muerto que no rota). Wrapper del proceso
@@ -856,14 +857,20 @@ async def generate_immobilized_stock_report(
     DEL LADO DEL SERVIDOR (operaciones nativas de lista) — NO descarga las
     cientos de miles de líneas de venta al MCP.
 
-    El proceso devuelve la lista de PRODUCTOS inmovilizados. Acá paginamos esa
-    lista pidiendo SOLO campos livianos (id, codigo, nombre, familia, exs,
-    costo_promedio) para no arrastrar filas gordas, calculamos
-    ``valor_inmovilizado = exs × costo_promedio`` por producto, ordenamos
-    descendente y:
-      * devolvemos el TOP-N al chat (tabla),
-      * si ``deliver_to_chat`` se da, además armamos un XLSX con TODOS los
-        inmovilizados ordenados por valor y lo subimos a Telegram.
+    OPTIMIZACIÓN: el proceso JS calcula ``valor = EXS × COSTO_PROMEDIO``, ordena
+    descendente y RECORTA al top-N DENTRO del servidor (variable ``TOP_N``). Así
+    el "top 10 al chat" devuelve 10 filas en 1 sola ejecución, en vez de
+    arrastrar 26k+ productos al MCP. Solo el XLSX completo (``xlsx_top_n=0``)
+    pide todos los inmovilizados y pagina.
+
+    Cuántas filas le pedimos al proceso (``TOP_N``):
+      * sin ``deliver_to_chat`` → ``top_n`` (lo que se muestra en el chat).
+      * con ``deliver_to_chat`` y ``xlsx_top_n>0`` → ``max(top_n, xlsx_top_n)``.
+      * con ``deliver_to_chat`` y ``xlsx_top_n=0`` → 0 = TODOS (XLSX completo).
+
+    El MCP recalcula el valor de las filas recibidas y re-ordena (el ``load`` del
+    JS puede devolver por ID), toma ``top_n`` para el chat y arma el XLSX con
+    todo lo recibido.
 
     Fechas (ISO YYYY-MM-DD): si no se pasan, ``date_from`` = 1-ene del año en
     curso y ``date_to`` = hoy, ambas en hora oficial Ecuador (UTC-5). El periodo
@@ -871,6 +878,10 @@ async def generate_immobilized_stock_report(
 
     ``solo_con_stock``: True (default) = solo EXS>0 = stock inmovilizado real
     (capital parado). False = todo producto sin movimiento, con o sin stock.
+
+    OJO: ``n_productos_inmovilizados`` cuenta solo lo DEVUELTO. Para el conteo
+    total absoluto, llamá con ``solo_con_stock`` deseado y ``xlsx_top_n=0`` (o
+    sin recorte) — el proceso loguea el total en el server.
     """
     df = date_from or _year_start_ecu_iso()
     dt = date_to or _today_ecu_iso_inv()
@@ -879,11 +890,20 @@ async def generate_immobilized_stock_report(
         from mcp_theos.tools.admin_ops import _tenant_sucursal
         sucursal = _tenant_sucursal(client)
 
+    # Cuántas filas pedirle al proceso (recorte server-side).
+    if deliver_to_chat:
+        effective_top_n = 0 if xlsx_top_n <= 0 else max(top_n, xlsx_top_n)
+    else:
+        effective_top_n = max(1, top_n)
+
     params: dict[str, Any] = {
         "FCH_DES": df,
         "FCH_HST": dt,
         "SUCURSAL": sucursal,
         "SOLO_CON_STOCK": 1 if solo_con_stock else 0,
+        # TOP_N>0 = el proceso ordena por valor y devuelve solo los N de mayor
+        # valor (óptimo). 0 = todos (para XLSX completo).
+        "TOP_N": effective_top_n,
         # Solo campos livianos: el proceso devuelve PRODUCTOS, que tiene decenas
         # de columnas; pedir todas con 26k+ filas tumba la conexión. Con estos 6
         # campos cada fila pesa poco y la paginación aguanta. (Si el API no
@@ -950,9 +970,11 @@ async def generate_immobilized_stock_report(
     # Ordenar por valor inmovilizado descendente (lo que más capital tiene parado).
     items.sort(key=lambda x: x["valor_inmovilizado"], reverse=True)
 
-    n_total = len(items)
-    valor_total = sum(x["valor_inmovilizado"] for x in items)
+    n_devueltos = len(items)
+    valor_devuelto = sum(x["valor_inmovilizado"] for x in items)
     top = items[: max(1, top_n)]
+    # ¿El proceso recortó al top? (effective_top_n>0 y vino justo esa cantidad).
+    recortado = effective_top_n > 0
 
     result: dict[str, Any] = {
         "success": True,
@@ -960,8 +982,14 @@ async def generate_immobilized_stock_report(
         "date_to": dt,
         "sucursal": sucursal,
         "solo_con_stock": solo_con_stock,
-        "n_productos_inmovilizados": n_total,
-        "valor_total_inmovilizado": round(valor_total, 2),
+        # Con recorte server-side estos cuentan lo DEVUELTO (el top), no el
+        # universo completo. Sin recorte (xlsx_top_n=0) sí son los totales.
+        "recorte_server_side": recortado,
+        "n_devueltos": n_devueltos,
+        "valor_devuelto": round(valor_devuelto, 2),
+        "valor_total_inmovilizado": (
+            None if recortado else round(valor_devuelto, 2)
+        ),
         "pages_fetched": page if not pages_hit_cap else max_pages,
         "pages_hit_cap": pages_hit_cap,
         "top_n": len(top),
@@ -974,18 +1002,20 @@ async def generate_immobilized_stock_report(
         ],
     }
 
-    # XLSX completo (opcional) → Telegram.
+    # XLSX (opcional) → Telegram. Incluye TODO lo recibido (todos si
+    # xlsx_top_n=0, o el top pedido), ya ordenado por valor.
     if deliver_to_chat:
-        xlsx_bytes = _build_immobilized_xlsx(items, df, dt, valor_total)
+        xlsx_bytes = _build_immobilized_xlsx(items, df, dt, valor_devuelto)
         from mcp_theos.telegram_delivery import (
             send_document as _send_doc, BotTokenMissing,
         )
         ec_now = datetime.now(timezone.utc) - timedelta(hours=5)
         filename = (f"stock_inmovilizado_"
                     f"{ec_now.strftime('%Y-%m-%d_%H%M')}.xlsx")
+        alcance = "todos" if effective_top_n == 0 else f"top {n_devueltos}"
         caption = (
-            f"<b>Stock inmovilizado</b> · {n_total:,} productos · "
-            f"${valor_total:,.2f} en capital parado\n"
+            f"<b>Stock inmovilizado</b> · {n_devueltos:,} productos "
+            f"({alcance}) · ${valor_devuelto:,.2f} en capital parado\n"
             f"Periodo {df} a {dt}"
         )
         try:

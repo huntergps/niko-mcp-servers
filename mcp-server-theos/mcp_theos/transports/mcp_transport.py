@@ -1594,10 +1594,16 @@ MCP_TOOLS: list[dict[str, Any]] = [
                     ),
                 },
                 "top_n": {"type": "integer", "default": 10, "minimum": 1, "maximum": 100,
-                          "description": "Cuántos devolver al chat, ordenados por valor inmovilizado desc."},
+                          "description": "Cuántos mostrar en el CHAT, ordenados por valor inmovilizado desc. El proceso recorta al top DEL LADO DEL SERVIDOR (rápido)."},
                 "deliver_to_chat": {
                     "type": "string",
-                    "description": "Telegram chat_id para subir el XLSX completo. Para Mepriga: '-5248384291'. Omitir = solo top-N en el chat, sin XLSX.",
+                    "description": "Telegram chat_id para subir el XLSX. Para Mepriga: '-5248384291'. Omitir = solo top-N en el chat, sin XLSX.",
+                },
+                "xlsx_top_n": {
+                    "type": "integer",
+                    "default": 0,
+                    "minimum": 0,
+                    "description": "Solo aplica con deliver_to_chat. 0 (default) = XLSX con TODOS los inmovilizados (pagina, más lento). >0 = XLSX con los N de mayor valor (1 sola pasada, óptimo; ej. 500).",
                 },
             },
             "required": [],
