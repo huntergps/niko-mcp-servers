@@ -921,8 +921,12 @@ async def generate_immobilized_stock_report(
         page_params["page[number]"] = page
         page_params["page[size]"] = _API_PAGE
         try:
+            # Timeout largo: el proceso recorre todas las facturas/compras del
+            # periodo del lado del servidor (un año ≈ 100k facturas) → puede
+            # tardar bastante más que el timeout HTTP global (20s).
             resp = await client.process(
-                "PRODUCTOS_SIN_VENTAS_PERIODO_JS", page_params)
+                "PRODUCTOS_SIN_VENTAS_PERIODO_JS", page_params,
+                timeout=240.0)
         except Exception as exc:  # noqa: BLE001
             # No perder lo ya recolectado: devolver parcial con aviso explícito.
             if all_rows:

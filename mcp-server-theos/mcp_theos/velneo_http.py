@@ -286,6 +286,8 @@ class VelneoClient:
         self,
         name: str,
         params: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         """Invoke a Velneo process: ``GET /_process/<name>?param[...]=...``.
 
@@ -295,6 +297,10 @@ class VelneoClient:
         lista de salida del proceso (`listaFiltrarOrdenarPaginar`). Si se
         envolvieran (``param[page[number]]``) el API las ignora y siempre
         devuelve la primera página. (Bug detectado 2026-05-31.)
+
+        ``timeout``: override del timeout HTTP global (20s) para procesos
+        pesados que recorren muchos documentos del lado del servidor (ej.
+        PRODUCTOS_SIN_VENTAS_PERIODO_JS sobre un año = ~100k facturas).
         """
         q: dict[str, Any] = {}
         for k, v in (params or {}).items():
@@ -302,7 +308,10 @@ class VelneoClient:
                 q[k] = v          # reservada del API: sin envolver
             else:
                 q[f"param[{k}]"] = v
-        resp = await self._client.get(f"_process/{quote(name)}", params=q)
+        kwargs: dict[str, Any] = {"params": q}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        resp = await self._client.get(f"_process/{quote(name)}", **kwargs)
         resp.raise_for_status()
         return resp.json()
 
