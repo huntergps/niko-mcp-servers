@@ -1605,6 +1605,11 @@ MCP_TOOLS: list[dict[str, Any]] = [
                     "minimum": 0,
                     "description": "Solo aplica con deliver_to_chat. 0 (default) = XLSX con TODOS los inmovilizados (pagina, más lento). >0 = XLSX con los N de mayor valor (1 sola pasada, óptimo; ej. 500).",
                 },
+                "background": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "RECOMENDADO para periodos largos (un año tarda ~3 min). Si True NO bloquea: dispara el análisis y responde al toque; el top + el archivo llegan SOLOS al chat cuando termina. Requiere deliver_to_chat. Cuando lo uses, dile al usuario que el reporte ya está en camino.",
+                },
             },
             "required": [],
         },

@@ -840,6 +840,64 @@ def _year_start_ecu_iso() -> str:
         month=1, day=1).isoformat()
 
 
+def _format_top_msg(res: dict[str, Any]) -> str:
+    """Formatea el top de inmovilizados como mensaje HTML para Telegram (lo usa
+    la tarea en background, que entrega directo al chat sin pasar por el agente)."""
+    df = res.get("date_from")
+    dt = res.get("date_to")
+    top = res.get("top") or []
+    lines = [f"<b>Stock inmovilizado</b> — periodo {df} a {dt}"]
+    if not res.get("recorte_server_side"):
+        n = res.get("n_devueltos")
+        vt = res.get("valor_total_inmovilizado")
+        cab = f"{n:,} productos sin movimiento en bodega"
+        if vt:
+            cab += f" · ${vt:,.2f} en capital parado"
+        lines.append(cab)
+    lines.append(f"Top {len(top)} por valor inmovilizado:")
+    for i, p in enumerate(top, 1):
+        lines.append(
+            f"{i}. {(p.get('nombre') or '')[:40]} — "
+            f"{p.get('existencia', 0):,.0f} u × ${p.get('costo_promedio', 0):,.2f} "
+            f"= <b>${p.get('valor_inmovilizado', 0):,.2f}</b>"
+        )
+    return "\n".join(lines)
+
+
+async def _immobilized_bg(cfg: Any, params: dict[str, Any]) -> None:
+    """Corre el reporte de inmovilizados en segundo plano con su PROPIO
+    VelneoClient (el del request original ya se cerró) y entrega el resultado al
+    chat: el XLSX lo sube la llamada interna (deliver_to_chat) y acá mandamos el
+    top como mensaje de texto. Pensada para asyncio.create_task: NO propaga
+    excepciones — cualquier fallo se avisa al chat.
+    """
+    from mcp_theos.velneo_http import VelneoClient
+    from mcp_theos.telegram_delivery import send_message
+    chat = str(params.get("deliver_to_chat") or "")
+    try:
+        async with VelneoClient(cfg) as c:
+            res = await generate_immobilized_stock_report(c, **params)
+        if not res.get("success"):
+            await send_message(
+                chat_id=chat,
+                text=("No pude generar el reporte de stock inmovilizado: "
+                      + str(res.get("error") or "error desconocido")),
+                parse_mode=None)
+            return
+        await send_message(chat_id=chat, text=_format_top_msg(res),
+                           parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        logger.exception("immobilized background task failed")
+        try:
+            await send_message(
+                chat_id=chat,
+                text=("Hubo un problema generando el reporte de stock "
+                      "inmovilizado; lo estamos revisando."),
+                parse_mode=None)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def generate_immobilized_stock_report(
     client: VelneoClient,
     *,
@@ -850,12 +908,19 @@ async def generate_immobilized_stock_report(
     top_n: int = 10,
     deliver_to_chat: str | None = None,
     xlsx_top_n: int = 0,
+    background: bool = False,
 ) -> dict[str, Any]:
     """Productos INMOVILIZADOS: con stock que NO tuvieron NINGÚN movimiento de
     inventario en el periodo (stock muerto que no rota). Wrapper del proceso
     Velneo ``PRODUCTOS_SIN_VENTAS_PERIODO_JS``, que cruza catálogo vs movimientos
     DEL LADO DEL SERVIDOR (operaciones nativas de lista) — NO descarga las
     cientos de miles de líneas de venta al MCP.
+
+    ``background``: si True, NO bloquea — dispara el análisis en una tarea aparte
+    y devuelve al toque (``status='scheduled'``). El resultado (top como mensaje
+    + XLSX si se pidió) llega SOLO al chat ``deliver_to_chat`` cuando termina.
+    Úsalo para periodos largos (un año ≈ 3 min): así Lila responde "ya te lo
+    preparo" sin colgar la conexión. Requiere ``deliver_to_chat``.
 
     OPTIMIZACIÓN: el proceso JS calcula ``valor = EXS × COSTO_PROMEDIO``, ordena
     descendente y RECORTA al top-N DENTRO del servidor (variable ``TOP_N``). Así
@@ -883,6 +948,31 @@ async def generate_immobilized_stock_report(
     total absoluto, llamá con ``solo_con_stock`` deseado y ``xlsx_top_n=0`` (o
     sin recorte) — el proceso loguea el total en el server.
     """
+    # ----- Despacho a BACKGROUND (no bloquea) -----
+    # Para periodos largos el proceso tarda minutos; en vez de colgar la
+    # llamada, disparamos una tarea con su PROPIO VelneoClient (el del request
+    # se cierra al responder) y devolvemos al toque. El resultado llega al chat.
+    if background:
+        if not deliver_to_chat:
+            return {"success": False,
+                    "error": "background=True requiere deliver_to_chat "
+                             "(es a donde llega el resultado)"}
+        import asyncio
+        params = {
+            "date_from": date_from, "date_to": date_to, "sucursal": sucursal,
+            "solo_con_stock": solo_con_stock, "top_n": top_n,
+            "deliver_to_chat": deliver_to_chat, "xlsx_top_n": xlsx_top_n,
+        }
+        asyncio.create_task(_immobilized_bg(client.cfg, params))
+        return {
+            "success": True,
+            "status": "scheduled",
+            "deliver_to_chat": str(deliver_to_chat),
+            "message": ("El análisis de stock inmovilizado está corriendo en "
+                        "segundo plano; el top y el archivo llegarán al chat en "
+                        "un par de minutos. No hace falta esperar."),
+        }
+
     df = date_from or _year_start_ecu_iso()
     dt = date_to or _today_ecu_iso_inv()
 
