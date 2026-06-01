@@ -1,17 +1,20 @@
 """Informe ejecutivo de ventas en PDF (Mepriga).
 
-Construye un PDF de 3 páginas a partir del dict que devuelve
-``sales_quick_summary`` (mismo summarizer que alimenta el dashboard PNG).
-No hace I/O ni llamadas al ERP: recibe el ``summary`` ya resuelto y
-devuelve los bytes del PDF. La entrega (Telegram) la hace el caller con
+Construye un PDF a partir del dict que devuelve ``sales_quick_summary``
+(mismo summarizer que alimenta el dashboard PNG). No hace I/O ni llamadas
+al ERP: recibe el ``summary`` ya resuelto y devuelve
+``(bytes, resumen, n_paginas)``. La entrega (Telegram) la hace el caller con
 ``telegram_delivery.send_document``.
 
-Diseño aprobado por el cliente (3 páginas):
+El PDF es DINÁMICO: 3 páginas fijas + páginas condicionales según los datos
+(no hardcodear el total — usar ``n_paginas`` que devuelve esta función):
   P1 — banner + 5 KPI cards con íconos (PVP, neto, ticket, facturas,
        devoluciones NC) + dona de familias + infografía contado/crédito.
   P2 — barras de ventas por hora (pico resaltado) + barras por punto de
        emisión + tabla top clientes.
   P3 — tendencia diaria con proyección a 3 días + lectura + recomendaciones.
+  P4+ (condicionales) — heatmaps familia×ubicación, comparativo entre
+       sucursales, etc. (solo si hay datos suficientes).
 
 Shape REAL consumido (verificado en sales_report.summarize_sales +
 admin_ops.sales_quick_summary, 2026-05-30):
@@ -648,8 +651,13 @@ def build_executive_report_pdf(summary: dict[str, Any]) -> tuple[bytes, str]:
     ])
     _footer(c, pg, TP)
     c.showPage()
+    # getPageNumber() apunta a la página SIGUIENTE (en blanco) tras el último
+    # showPage(); las páginas reales son una menos. El PDF es DINÁMICO: 3 fijas
+    # + páginas condicionales (heatmaps familia×ubicación, comparativo sucursales)
+    # según los datos, así que NO hardcodear el total.
+    n_paginas = c.getPageNumber() - 1
     c.save()
 
     resumen = (f"Informe ejecutivo {rango}: {_money(pvp)} PVP ({_money(neto)} neto), "
                f"tendencia {tend}. Familia lider: {fam_lider}.")
-    return buf.getvalue(), resumen
+    return buf.getvalue(), resumen, n_paginas

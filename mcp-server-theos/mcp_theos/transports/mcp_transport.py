@@ -1198,11 +1198,14 @@ MCP_TOOLS: list[dict[str, Any]] = [
     {
         "name": "generate_executive_report",
         "description": (
-            "Genera el INFORME EJECUTIVO de ventas en PDF (3 paginas: KPIs "
+            "Genera el INFORME EJECUTIVO de ventas en PDF (varias paginas: KPIs "
             "con iconos incl. devoluciones NC + dona de familias + infografia "
             "contado/credito; barras de horas pico + barras por punto de "
             "emision + tabla top clientes; tendencia diaria con proyeccion 3 "
-            "dias + lectura + recomendaciones) y lo ENTREGA al chat via "
+            "dias + lectura + recomendaciones; + paginas condicionales de "
+            "heatmaps y comparativo de sucursales segun datos). El resultado "
+            "devuelve 'n_paginas' con el total REAL — NO afirmar un numero fijo "
+            "de paginas, usar ese valor. Lo ENTREGA al chat via "
             "sendDocument. USAR cuando el usuario pida 'informe ejecutivo', "
             "'reporte gerencial', 'PDF de ventas', 'informe para gerencia', "
             "'algo presentable'. DISTINTO de generate_sales_report (XLSX/"

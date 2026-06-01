@@ -1522,7 +1522,7 @@ async def generate_executive_report(
 
     from mcp_theos.executive_report import build_executive_report_pdf
     try:
-        pdf_bytes, resumen = build_executive_report_pdf(summary)
+        pdf_bytes, resumen, n_paginas = build_executive_report_pdf(summary)
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "error": f"pdf_render_failed: {type(exc).__name__}: {exc}"}
 
@@ -1546,6 +1546,7 @@ async def generate_executive_report(
             "delivered_to_chat": str(deliver_to_chat),
             "pdf_filename": fname,
             "resumen": resumen,
+            "n_paginas": n_paginas,
             "totals": summary.get("totals"),
         }
 
@@ -1554,6 +1555,7 @@ async def generate_executive_report(
         "pdf_base64": base64.b64encode(pdf_bytes).decode(),
         "pdf_filename": fname,
         "resumen": resumen,
+        "n_paginas": n_paginas,
         "totals": summary.get("totals"),
     }
 
