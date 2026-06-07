@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import date, datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import jwt
 import pytest
@@ -24,6 +24,86 @@ from fastapi.testclient import TestClient
 
 
 JWT_SECRET = "test-jwt-secret-for-testing-only-32bytes!"
+
+
+# ---------------------------------------------------------------------------
+# Version-aware field resolution (resolve_field / valid_model_fields)
+# ---------------------------------------------------------------------------
+# The invoice tools resolve a few account.move / account.payment columns at
+# call time because their names changed between Odoo 13 and Odoo 16+/19:
+#   account.move.type            (O13) → move_type         (O16+)
+#   account.move.invoice_payment_state (O13) → payment_state (O16+)
+#   account.payment.payment_date (O13) → date              (O16+)
+# Resolution goes through fields_get (cached per db/model). The helper tests
+# below mock fields_get so they pin a deterministic Odoo version instead of
+# hitting a live instance (which fails open to the modern names).
+
+# Field name sets for fields_get mocking (only keys matter).
+_O13_MOVE_FIELDS = {
+    f: {} for f in [
+        "id", "name", "type", "state", "partner_id", "invoice_date",
+        "invoice_date_due", "amount_total", "amount_residual",
+        "amount_untaxed", "amount_tax", "invoice_payment_state", "ref",
+        "access_token", "access_url", "currency_id", "invoice_line_ids",
+    ]
+}
+_O19_MOVE_FIELDS = {
+    f: {} for f in [
+        "id", "name", "move_type", "state", "partner_id", "invoice_date",
+        "invoice_date_due", "amount_total", "amount_residual",
+        "amount_untaxed", "amount_tax", "payment_state", "ref",
+        "access_token", "access_url", "currency_id", "invoice_line_ids",
+    ]
+}
+_O13_PAYMENT_FIELDS = {
+    f: {} for f in [
+        "id", "name", "payment_date", "amount", "journal_id", "partner_id",
+        "payment_type", "state", "communication", "reconciled_invoice_ids",
+        "ref",
+    ]
+}
+_O19_PAYMENT_FIELDS = {
+    f: {} for f in [
+        "id", "name", "date", "amount", "journal_id", "partner_id",
+        "payment_type", "state", "reconciled_invoice_ids", "memo",
+    ]
+}
+
+
+def _fields_get_mock(move_fields: dict, payment_fields: dict) -> MagicMock:
+    """odoo_pool.execute mock that answers fields_get per model."""
+    def _exec(tenant_id, url, db, user, password, model, method,
+              args=None, kwargs=None):
+        if method == "fields_get":
+            if model == "account.move":
+                return move_fields
+            if model == "account.payment":
+                return payment_fields
+            return {}
+        raise AssertionError(f"unexpected method {method!r}")
+    return MagicMock(side_effect=_exec)
+
+
+@pytest.fixture
+def odoo13_schema():
+    """Patch fields_get to an Odoo 13 schema (legacy field names)."""
+    from mcp_odoo.tools import generic
+    generic._FIELDS_CACHE.clear()
+    fake = _fields_get_mock(_O13_MOVE_FIELDS, _O13_PAYMENT_FIELDS)
+    with patch.object(generic.odoo_pool, "execute", fake):
+        yield
+    generic._FIELDS_CACHE.clear()
+
+
+@pytest.fixture
+def odoo19_schema():
+    """Patch fields_get to an Odoo 19 schema (modern field names)."""
+    from mcp_odoo.tools import generic
+    generic._FIELDS_CACHE.clear()
+    fake = _fields_get_mock(_O19_MOVE_FIELDS, _O19_PAYMENT_FIELDS)
+    with patch.object(generic.odoo_pool, "execute", fake):
+        yield
+    generic._FIELDS_CACHE.clear()
 
 MOCK_TENANT_CONFIG = {
     "tenant_id": "tenant-zeta-test",
@@ -174,7 +254,7 @@ def _fake_read_sync(*args, **kwargs):
 # ---------------------------------------------------------------------------
 
 class TestGetCustomerInvoicesHelper:
-    def test_basic_call(self):
+    def test_basic_call(self, odoo13_schema):
         from mcp_odoo.tools import invoices as inv
 
         def _fake_search(*a, **k):
@@ -213,7 +293,7 @@ class TestGetCustomerInvoicesHelper:
         assert "access_token=tok_abc123" in r["invoices"][0]["portal_url"]
         assert r["invoices"][0]["ref"] == "VENTA109335"
 
-    def test_overdue_filter_builds_domain(self):
+    def test_overdue_filter_builds_domain(self, odoo13_schema):
         from mcp_odoo.tools import invoices as inv
         captured = {}
 
@@ -226,6 +306,7 @@ class TestGetCustomerInvoicesHelper:
                 "t", "url", "db", "u", "p", partner_id=62, state="overdue",
             )
         domain = captured["domain"]
+        # Odoo 13 schema → legacy field names in the domain.
         assert ["invoice_date_due", "<", date.today().isoformat()] in domain
         assert ["invoice_payment_state", "in", ["not_paid", "partial"]] in domain
 
@@ -256,7 +337,7 @@ class TestGetCustomerInvoicesHelper:
             )
         assert captured["limit"] == 50
 
-    def test_days_overdue_positive_when_due_passed(self):
+    def test_days_overdue_positive_when_due_passed(self, odoo13_schema):
         from mcp_odoo.tools import invoices as inv
         past = (date.today() - timedelta(days=10)).isoformat()
 
@@ -279,7 +360,7 @@ class TestGetCustomerInvoicesHelper:
 
 
 class TestGetInvoiceDetailHelper:
-    def test_basic_call_with_lines_and_taxes(self):
+    def test_basic_call_with_lines_and_taxes(self, odoo13_schema):
         from mcp_odoo.tools import invoices as inv
 
         def _fake_read(*a, **k):
@@ -345,7 +426,7 @@ class TestGetInvoiceDetailHelper:
 
 
 class TestGetCustomerPaymentsHelper:
-    def test_basic_call(self):
+    def test_basic_call(self, odoo13_schema):
         from mcp_odoo.tools import invoices as inv
 
         def _fake_search(*a, **k):
@@ -382,7 +463,7 @@ class TestGetCustomerPaymentsHelper:
         assert r["payments"][0]["applied_to"][0]["name"] == "FACV/2025/4897"
         assert r["total_amount"] == 500.0
 
-    def test_year_filter(self):
+    def test_year_filter(self, odoo13_schema):
         from mcp_odoo.tools import invoices as inv
         captured = {}
 
@@ -394,31 +475,43 @@ class TestGetCustomerPaymentsHelper:
             inv.odoo_get_customer_payments(
                 "t", "url", "db", "u", "p", partner_id=62, year=2025,
             )
+        # Odoo 13 schema → legacy "payment_date" column in the domain.
         assert ["payment_date", ">=", "2025-01-01"] in captured["domain"]
         assert ["payment_date", "<=", "2025-12-31"] in captured["domain"]
 
 
 class TestGetCustomerStatementHelper:
-    def test_period_aggregates(self):
+    def test_period_aggregates(self, odoo13_schema):
         from mcp_odoo.tools import invoices as inv
 
         today = date.today()
         recent = (today - timedelta(days=10)).isoformat()
         older = (today - timedelta(days=60)).isoformat()
 
+        f1 = {"id": 1, "name": "F1", "invoice_date": recent,
+              "invoice_date_due": recent, "amount_total": 100.0,
+              "amount_residual": 0.0, "invoice_payment_state": "paid",
+              "type": "out_invoice"}
+        f2 = {"id": 2, "name": "F2", "invoice_date": older,
+              "invoice_date_due": older, "amount_total": 200.0,
+              "amount_residual": 200.0, "invoice_payment_state": "not_paid",
+              "type": "out_invoice"}
+
         def _fake_search(*a, **k):
             model = a[5]
+            domain = a[6]
             if model == "account.move":
-                return [
-                    {"id": 1, "name": "F1", "invoice_date": recent,
-                     "invoice_date_due": recent, "amount_total": 100.0,
-                     "amount_residual": 0.0, "invoice_payment_state": "paid",
-                     "type": "out_invoice"},
-                    {"id": 2, "name": "F2", "invoice_date": older,
-                     "invoice_date_due": older, "amount_total": 200.0,
-                     "amount_residual": 200.0, "invoice_payment_state": "not_paid",
-                     "type": "out_invoice"},
-                ]
+                # The open-receivables snapshot query carries an
+                # ``amount_residual > 0`` clause. Real Odoo returns only F2
+                # for it; the period query (no such clause) returns both.
+                # Honour the domain so invoices_overdue reflects reality
+                # (only the unpaid F2 counts, not the fully-paid F1).
+                if any(
+                    c[0] == "amount_residual" for c in domain
+                    if isinstance(c, (list, tuple))
+                ):
+                    return [f2]
+                return [f1, f2]
             if model == "account.payment":
                 return [
                     {"id": 100, "name": "P1", "payment_date": recent,
@@ -454,7 +547,7 @@ class TestGetCustomerStatementHelper:
         assert s["avg_payment_days"] == 0.0
         assert len(r["recent_movements"]) == 3
 
-    def test_days_back_clamped(self):
+    def test_days_back_clamped(self, odoo13_schema):
         from mcp_odoo.tools import invoices as inv
         captured = {}
 
@@ -472,6 +565,170 @@ class TestGetCustomerStatementHelper:
         from_clause = [c for c in d if c[0] == "invoice_date" and c[1] == ">="][0]
         from_date = datetime.strptime(from_clause[2], "%Y-%m-%d").date()
         assert (date.today() - from_date).days == 730
+
+
+# ---------------------------------------------------------------------------
+# Version-aware field resolution (Odoo 19 vs Odoo 13)
+# ---------------------------------------------------------------------------
+
+class TestVersionAwareInvoices:
+    """The Odoo-19 incompatibilities verified live on Afrodita:
+    move.type→move_type, invoice_payment_state→payment_state,
+    payment.payment_date→date. With the O19 schema the tools must build
+    domains/field-lists with the MODERN names and parse the MODERN keys —
+    never asking for a column that would raise "Invalid field".
+    """
+
+    def test_invoices_domain_uses_move_type_on_odoo19(self, odoo19_schema):
+        from mcp_odoo.tools import invoices as inv
+        captured = {}
+
+        def _fake_search(*a, **k):
+            captured["domain"] = a[6]
+            captured["fields"] = k.get("fields")
+            captured["order"] = k.get("order")
+            return []
+        with patch("mcp_odoo.tools.invoices.odoo_search", side_effect=_fake_search):
+            inv.odoo_get_customer_invoices(
+                "t", "url", "db", "u", "p", partner_id=62, state="overdue",
+            )
+        domain = captured["domain"]
+        # Modern names in the domain, NOT the O13 ones.
+        assert ["move_type", "in", ["out_invoice", "out_refund"]] in domain
+        assert ["payment_state", "in", ["not_paid", "partial"]] in domain
+        assert not any(c[0] == "type" for c in domain if isinstance(c, list))
+        assert not any(
+            c[0] == "invoice_payment_state" for c in domain
+            if isinstance(c, list)
+        )
+        # Field list must request modern columns only.
+        assert "move_type" in captured["fields"]
+        assert "payment_state" in captured["fields"]
+        assert "type" not in captured["fields"]
+        assert "invoice_payment_state" not in captured["fields"]
+
+    def test_invoices_parse_modern_keys_on_odoo19(self, odoo19_schema):
+        from mcp_odoo.tools import invoices as inv
+
+        def _fake_search(*a, **k):
+            # Odoo 19 row: move_type / payment_state, NO legacy keys.
+            return [{
+                "id": 1, "name": "INV/2026/001", "state": "posted",
+                "partner_id": [62, "X"], "invoice_date": "2026-01-01",
+                "invoice_date_due": "2026-01-15",
+                "amount_total": 100.0, "amount_residual": 100.0,
+                "amount_untaxed": 89.29, "amount_tax": 10.71,
+                "move_type": "out_invoice", "payment_state": "partial",
+                "ref": "R1", "access_token": "tok", "access_url": "/my/invoices/1",
+                "currency_id": [1, "USD"],
+            }]
+        with patch("mcp_odoo.tools.invoices.odoo_search", side_effect=_fake_search):
+            r = inv.odoo_get_customer_invoices(
+                "t", "url", "db", "u", "p", partner_id=62,
+            )
+        assert r["success"] is True
+        row = r["invoices"][0]
+        assert row["type"] == "out_invoice"
+        assert row["payment_state"] == "partial"
+        assert row["payment_state_label"] == "Pago parcial"
+
+    def test_payments_domain_uses_date_on_odoo19(self, odoo19_schema):
+        from mcp_odoo.tools import invoices as inv
+        captured = {}
+
+        def _fake_search(*a, **k):
+            captured["domain"] = a[6]
+            captured["fields"] = k.get("fields")
+            captured["order"] = k.get("order")
+            return []
+        with patch("mcp_odoo.tools.invoices.odoo_search", side_effect=_fake_search):
+            inv.odoo_get_customer_payments(
+                "t", "url", "db", "u", "p", partner_id=62, year=2026,
+            )
+        assert ["date", ">=", "2026-01-01"] in captured["domain"]
+        assert ["date", "<=", "2026-12-31"] in captured["domain"]
+        assert captured["order"].startswith("date ")
+        # O13-only 'communication' must be dropped from the O19 field list.
+        assert "communication" not in captured["fields"]
+        assert "payment_date" not in captured["fields"]
+        assert "date" in captured["fields"]
+
+    def test_statement_uses_modern_names_on_odoo19(self, odoo19_schema):
+        from mcp_odoo.tools import invoices as inv
+        today = date.today()
+        recent = (today - timedelta(days=5)).isoformat()
+        captured = {"move_domains": [], "pay_domains": []}
+
+        def _fake_search(*a, **k):
+            model = a[5]
+            domain = a[6]
+            if model == "account.move":
+                captured["move_domains"].append(domain)
+                if any(
+                    c[0] == "amount_residual" for c in domain
+                    if isinstance(c, (list, tuple))
+                ):
+                    return [{"id": 2, "name": "F2",
+                             "invoice_date_due": recent, "amount_residual": 50.0}]
+                return [{"id": 1, "name": "F1", "invoice_date": recent,
+                         "invoice_date_due": recent, "amount_total": 50.0,
+                         "amount_residual": 50.0, "payment_state": "not_paid",
+                         "move_type": "out_invoice"}]
+            if model == "account.payment":
+                captured["pay_domains"].append(domain)
+                return [{"id": 9, "name": "P1", "date": recent,
+                         "amount": 25.0, "reconciled_invoice_ids": []}]
+            return []
+        with patch("mcp_odoo.tools.invoices.odoo_search", side_effect=_fake_search), \
+             patch("mcp_odoo.tools.invoices.odoo_read", side_effect=lambda *a, **k: []):
+            r = inv.odoo_get_customer_statement(
+                "t", "url", "db", "u", "p", partner_id=62, days_back=30,
+            )
+        assert r["success"] is True
+        # Invoice period domain uses move_type, not type.
+        period_dom = captured["move_domains"][0]
+        assert any(c[0] == "move_type" for c in period_dom if isinstance(c, list))
+        assert not any(c[0] == "type" for c in period_dom if isinstance(c, list))
+        # Payment domain uses 'date', not payment_date.
+        pay_dom = captured["pay_domains"][0]
+        assert any(c[0] == "date" for c in pay_dom if isinstance(c, list))
+        assert not any(
+            c[0] == "payment_date" for c in pay_dom if isinstance(c, list)
+        )
+        assert r["summary"]["total_billed"] == 50.0
+        assert r["summary"]["total_paid"] == 25.0
+
+    def test_invoice_detail_modern_keys_on_odoo19(self, odoo19_schema):
+        from mcp_odoo.tools import invoices as inv
+
+        def _fake_read(*a, **k):
+            model = a[5]
+            fields = a[7] if len(a) > 7 else k.get("fields")
+            if model == "account.move":
+                # The read field list must NOT contain legacy names.
+                assert "type" not in fields
+                assert "invoice_payment_state" not in fields
+                assert "move_type" in fields
+                assert "payment_state" in fields
+                return [{
+                    "id": 5, "name": "INV/2026/005", "state": "posted",
+                    "partner_id": [62, "X"], "invoice_date": "2026-02-01",
+                    "invoice_date_due": "2026-02-10",
+                    "amount_total": 12.0, "amount_residual": 0.0,
+                    "amount_untaxed": 10.71, "amount_tax": 1.29,
+                    "move_type": "out_invoice", "payment_state": "paid",
+                    "ref": "R5", "access_token": "t", "access_url": "/my/invoices/5",
+                    "currency_id": [1, "USD"], "invoice_line_ids": [],
+                }]
+            return []
+        with patch("mcp_odoo.tools.invoices.odoo_read", side_effect=_fake_read):
+            r = inv.odoo_get_invoice_detail(
+                "t", "url", "db", "u", "p", invoice_id=5,
+                include_lines=False, include_taxes=False,
+            )
+        assert r["success"] is True
+        assert r["invoice"]["type"] == "out_invoice"
+        assert r["invoice"]["payment_state"] == "paid"
 
 
 # ---------------------------------------------------------------------------

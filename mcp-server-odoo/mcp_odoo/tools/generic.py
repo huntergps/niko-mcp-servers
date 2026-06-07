@@ -73,6 +73,45 @@ def valid_partner_fields(
     )
 
 
+def resolve_field(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+    model: str, candidates: list[str],
+) -> str:
+    """Return the FIRST of ``candidates`` that exists on ``model``.
+
+    Sibling of :func:`valid_model_fields` — reuses the same cached
+    ``fields_get`` per (db, model). Used to bridge field renames across
+    Odoo versions where a single canonical column has different names
+    (e.g. ``account.move.type`` in Odoo 13 became ``move_type`` in Odoo
+    16+; ``invoice_payment_state`` became ``payment_state``).
+
+    The caller passes the candidates in PREFERENCE order. ``valid``
+    preserves that order (it filters the candidate list), so the first
+    surviving entry is the one to use.
+
+    Fail-open: if ``fields_get`` cannot be resolved, or none of the
+    candidates exist on the model, the FIRST candidate is returned
+    unchanged. On a healthy Odoo 13 instance the modern names simply
+    won't match and the legacy name (passed as a later candidate) is
+    selected; if the schema lookup itself fails we degrade to the first
+    candidate so behaviour is deterministic and never raises here.
+    """
+    if not candidates:
+        raise ValueError("resolve_field requires a non-empty candidates list")
+
+    valid = valid_model_fields(
+        tenant_id, url, db, user, password, model, list(candidates),
+    )
+    # valid_model_fields preserves the order of the input list. When the
+    # cache/fields_get is healthy it returns only existing fields; when it
+    # fails open it returns the candidates unchanged. Either way the first
+    # element is our best guess.
+    for cand in candidates:
+        if cand in valid:
+            return cand
+    return candidates[0]
+
+
 def odoo_search(
     tenant_id: str, url: str, db: str, user: str, password: str,
     model: str, domain: list, fields: list | None = None,

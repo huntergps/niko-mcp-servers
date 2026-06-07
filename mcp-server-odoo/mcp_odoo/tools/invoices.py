@@ -23,7 +23,12 @@ import time
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from mcp_odoo.tools.generic import odoo_read, odoo_search
+from mcp_odoo.tools.generic import (
+    odoo_read,
+    odoo_search,
+    resolve_field,
+    valid_model_fields,
+)
 from mcp_odoo.tools.sales import _absolutize_share_link, _log_call
 
 logger = logging.getLogger("mcp_odoo.invoices")
@@ -37,8 +42,11 @@ _INVOICE_PAYMENT_STATE_LABEL_ES = {
     "paid": "pagada",
     "in_payment": "en pago",
     "not_paid": "pendiente",
-    "partial": "parcial",
-    "reversed": "anulada",
+    # Odoo 19 distinguishes "partial" from the legacy "parcial"; keep the
+    # owner-facing wording requested for the new states.
+    "partial": "Pago parcial",
+    "reversed": "Revertida",
+    "blocked": "Bloqueada",
     "invoicing_legacy": "previa",
 }
 
@@ -49,16 +57,20 @@ _INVOICE_TYPE_LABEL_ES = {
     "in_refund": "nota credito proveedor",
 }
 
-# Default fields read from ``account.move``. The list is small on purpose:
-# we surface only the columns the chat formatter / LLM actually needs.
+# Version-neutral fields read from ``account.move``. The list is small on
+# purpose: we surface only the columns the chat formatter / LLM actually
+# needs. The three version-dependent columns (move_type/type,
+# payment_state/invoice_payment_state, ref/memo) are appended at call time
+# via ``_resolve_move_fields`` so the field list never asks Odoo for a
+# column that does not exist on that version (Odoo 19 raises "Invalid
+# field" otherwise).
 # Iter 81e: NO incluir 'number' aquí. Bug en módulo l10n_ec_sri
 # (account_invoice.py:186 _compute_number) hace `self.number = self.name`
 # sin iterar el recordset → falla con "Expected singleton" cuando se
 # leen >1 facturas a la vez. El field `name` ya es único y suficiente.
-_INVOICE_HEADER_FIELDS = [
+_INVOICE_HEADER_FIELDS_BASE = [
     "id",
     "name",
-    "type",
     "state",
     "partner_id",
     "invoice_date",
@@ -67,12 +79,25 @@ _INVOICE_HEADER_FIELDS = [
     "amount_residual",
     "amount_untaxed",
     "amount_tax",
-    "invoice_payment_state",
-    "ref",
     "access_token",
     "access_url",
     "currency_id",
 ]
+
+# Field-name candidates per Odoo version. First match wins (preference
+# order: modern Odoo 16+/19 name first, legacy Odoo 13 name last).
+#   account.move.move_type (O16+) / type (O13)
+#   account.move.payment_state (O16+) / invoice_payment_state (O13)
+#   account.move.ref (both) — kept for compatibility; some installs alias
+#       it to memo. We resolve to the first that exists.
+_MOVE_TYPE_CANDIDATES = ["move_type", "type"]
+_MOVE_PAYMENT_STATE_CANDIDATES = ["payment_state", "invoice_payment_state"]
+_MOVE_REF_CANDIDATES = ["ref", "memo", "name"]
+
+# account.payment.date (O16+) / payment_date (O13)
+# account.payment reference: ref (O13) / memo (O16+) / name (fallback)
+_PAYMENT_DATE_CANDIDATES = ["date", "payment_date"]
+_PAYMENT_REF_CANDIDATES = ["ref", "memo", "name"]
 
 # Optional l10n_ec extras — declared separately because they only exist in
 # Tecnosmart-style installs and we must tolerate their absence.
@@ -81,10 +106,11 @@ _INVOICE_L10N_EC_FIELDS = [
     "total_descuento_xml",
 ]
 
-_PAYMENT_FIELDS = [
+# Version-neutral account.payment fields. The date column + the reference
+# column are appended at call time via ``_resolve_payment_fields``.
+_PAYMENT_FIELDS_BASE = [
     "id",
     "name",
-    "payment_date",
     "amount",
     "journal_id",
     "partner_id",
@@ -210,6 +236,50 @@ def _days_overdue(due: date | None, *, today: date | None = None) -> int | None:
     return (ref - due).days
 
 
+def _resolve_move_fields(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+) -> tuple[str, str, str]:
+    """Resolve the version-dependent ``account.move`` column names.
+
+    Returns ``(move_type_field, payment_state_field, ref_field)``:
+      * Odoo 13 → ``("type", "invoice_payment_state", "ref")``
+      * Odoo 19 → ``("move_type", "payment_state", "ref")``
+    """
+    move_type = resolve_field(
+        tenant_id, url, db, user, password, "account.move",
+        _MOVE_TYPE_CANDIDATES,
+    )
+    pay_state = resolve_field(
+        tenant_id, url, db, user, password, "account.move",
+        _MOVE_PAYMENT_STATE_CANDIDATES,
+    )
+    ref_field = resolve_field(
+        tenant_id, url, db, user, password, "account.move",
+        _MOVE_REF_CANDIDATES,
+    )
+    return move_type, pay_state, ref_field
+
+
+def _resolve_payment_fields(
+    tenant_id: str, url: str, db: str, user: str, password: str,
+) -> tuple[str, str]:
+    """Resolve the version-dependent ``account.payment`` column names.
+
+    Returns ``(date_field, ref_field)``:
+      * Odoo 13 → ``("payment_date", "ref")``
+      * Odoo 19 → ``("date", "memo")`` (or whichever ref alias exists)
+    """
+    pay_date = resolve_field(
+        tenant_id, url, db, user, password, "account.payment",
+        _PAYMENT_DATE_CANDIDATES,
+    )
+    pay_ref = resolve_field(
+        tenant_id, url, db, user, password, "account.payment",
+        _PAYMENT_REF_CANDIDATES,
+    )
+    return pay_date, pay_ref
+
+
 # ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
@@ -276,20 +346,25 @@ def odoo_get_customer_invoices(
             ),
         }
 
+    # ----- Resolve version-dependent field names -------------------------
+    move_type_f, pay_state_f, ref_f = _resolve_move_fields(
+        tenant_id, url, db, user, password,
+    )
+
     # ----- Domain ---------------------------------------------------------
     domain: list = [
         ["partner_id", "=", partner_id],
-        ["type", "in", ["out_invoice", "out_refund"]],
+        [move_type_f, "in", ["out_invoice", "out_refund"]],
         ["state", "=", "posted"],
     ]
 
     today_iso = date.today().isoformat()
     if state == "paid":
-        domain.append(["invoice_payment_state", "=", "paid"])
+        domain.append([pay_state_f, "=", "paid"])
     elif state == "not_paid":
-        domain.append(["invoice_payment_state", "in", ["not_paid", "partial"]])
+        domain.append([pay_state_f, "in", ["not_paid", "partial"]])
     elif state == "overdue":
-        domain.append(["invoice_payment_state", "in", ["not_paid", "partial"]])
+        domain.append([pay_state_f, "in", ["not_paid", "partial"]])
         domain.append(["invoice_date_due", "<", today_iso])
 
     if year is not None:
@@ -300,8 +375,13 @@ def odoo_get_customer_invoices(
         except (TypeError, ValueError):
             return {"success": False, "error_code": "invalid_year"}
 
-    # ----- Read fields (with l10n_ec fallback) ---------------------------
-    fields = list(_INVOICE_HEADER_FIELDS)
+    # ----- Read fields (version-aware) -----------------------------------
+    fields = list(_INVOICE_HEADER_FIELDS_BASE)
+    # Append the resolved version-dependent columns, de-duplicating in case
+    # ref_f collapsed onto an already-present base column (e.g. "name").
+    for f in (move_type_f, pay_state_f, ref_f):
+        if f not in fields:
+            fields.append(f)
     try:
         rows = odoo_search(
             tenant_id, url, db, user, password,
@@ -332,8 +412,8 @@ def odoo_get_customer_invoices(
         total_amount += amount_total
         total_residual += amount_residual
 
-        payment_state = r.get("invoice_payment_state") or ""
-        type_v = r.get("type") or ""
+        payment_state = r.get(pay_state_f) or ""
+        type_v = r.get(move_type_f) or ""
         currency = _flatten_m2o(r.get("currency_id"))
 
         invoices.append({
@@ -349,7 +429,7 @@ def odoo_get_customer_invoices(
             "amount_tax": round(float(r.get("amount_tax") or 0), 2),
             "payment_state": payment_state or None,
             "payment_state_label": _state_label(payment_state, r.get("state")),
-            "ref": r.get("ref") or None,
+            "ref": r.get(ref_f) or None,
             "type": type_v,
             "type_label": _INVOICE_TYPE_LABEL_ES.get(type_v, type_v),
             "currency": currency.get("name") if currency else None,
@@ -405,11 +485,19 @@ def odoo_get_invoice_detail(
     if inv_id_int <= 0:
         return {"success": False, "error_code": "invalid_invoice_id"}
 
+    move_type_f, pay_state_f, ref_f = _resolve_move_fields(
+        tenant_id, url, db, user, password,
+    )
+    read_fields = list(_INVOICE_HEADER_FIELDS_BASE)
+    for f in (move_type_f, pay_state_f, ref_f, "invoice_line_ids"):
+        if f not in read_fields:
+            read_fields.append(f)
+
     try:
         rows = odoo_read(
             tenant_id, url, db, user, password,
             "account.move", [inv_id_int],
-            _INVOICE_HEADER_FIELDS + ["invoice_line_ids"],
+            read_fields,
         )
     except Exception as exc:  # noqa: BLE001
         msg = f"Error leyendo factura {inv_id_int}: {exc}"
@@ -434,8 +522,8 @@ def odoo_get_invoice_detail(
     due = _parse_date(r.get("invoice_date_due"))
     amount_total = float(r.get("amount_total") or 0)
     amount_residual = float(r.get("amount_residual") or 0)
-    payment_state = r.get("invoice_payment_state") or ""
-    type_v = r.get("type") or ""
+    payment_state = r.get(pay_state_f) or ""
+    type_v = r.get(move_type_f) or ""
     partner = _flatten_m2o(r.get("partner_id"))
     currency = _flatten_m2o(r.get("currency_id"))
 
@@ -455,7 +543,7 @@ def odoo_get_invoice_detail(
         "amount_tax": round(float(r.get("amount_tax") or 0), 2),
         "payment_state": payment_state or None,
         "payment_state_label": _state_label(payment_state, r.get("state")),
-        "ref": r.get("ref") or None,
+        "ref": r.get(ref_f) or None,
         "partner": partner,
         "currency": currency.get("name") if currency else None,
         "portal_url": _build_portal_url(
@@ -603,6 +691,10 @@ def odoo_get_customer_payments(
     except (TypeError, ValueError):
         limit_int = 10
 
+    pay_date_f, pay_ref_f = _resolve_payment_fields(
+        tenant_id, url, db, user, password,
+    )
+
     domain: list = [
         ["partner_id", "=", partner_id],
         ["payment_type", "=", "inbound"],
@@ -611,17 +703,28 @@ def odoo_get_customer_payments(
     if year is not None:
         try:
             y = int(year)
-            domain.append(["payment_date", ">=", f"{y}-01-01"])
-            domain.append(["payment_date", "<=", f"{y}-12-31"])
+            domain.append([pay_date_f, ">=", f"{y}-01-01"])
+            domain.append([pay_date_f, "<=", f"{y}-12-31"])
         except (TypeError, ValueError):
             return {"success": False, "error_code": "invalid_year"}
+
+    # Build the version-aware field list and filter it through fields_get so
+    # any other O13-only column (e.g. ``communication``, renamed to ``memo``
+    # in Odoo 16+) is silently dropped instead of raising "Invalid field".
+    pay_fields = list(_PAYMENT_FIELDS_BASE)
+    for f in (pay_date_f, pay_ref_f):
+        if f not in pay_fields:
+            pay_fields.append(f)
+    pay_fields = valid_model_fields(
+        tenant_id, url, db, user, password, "account.payment", pay_fields,
+    )
 
     try:
         rows = odoo_search(
             tenant_id, url, db, user, password,
             "account.payment", domain,
-            fields=_PAYMENT_FIELDS, limit=limit_int,
-            order="payment_date desc, id desc",
+            fields=pay_fields, limit=limit_int,
+            order=f"{pay_date_f} desc, id desc",
         )
     except Exception as exc:  # noqa: BLE001
         msg = f"Error listando pagos: {exc}"
@@ -663,13 +766,19 @@ def odoo_get_customer_payments(
             for iid in (r.get("reconciled_invoice_ids") or [])
             if isinstance(iid, int)
         ]
+        # ``communication`` (O13) was renamed/merged; on O19 the closest
+        # human-facing memo lives in the resolved ref field. Prefer the
+        # legacy column when present, else fall back to the resolved ref.
+        comm = r.get("communication")
+        if not comm and pay_ref_f != "name":
+            comm = r.get(pay_ref_f)
         payments.append({
             "payment_id": int(r["id"]),
             "name": r.get("name") or "",
-            "payment_date": str(r.get("payment_date") or "") or None,
+            "payment_date": str(r.get(pay_date_f) or "") or None,
             "amount": round(amount, 2),
             "journal": journal.get("name") if journal else None,
-            "communication": r.get("communication") or None,
+            "communication": comm or None,
             "applied_to": applied,
         })
 
@@ -729,10 +838,18 @@ def odoo_get_customer_statement(
     period_from_iso = period_from.isoformat()
     today_iso = today_d.isoformat()
 
+    # ----- Resolve version-dependent field names ----------------------
+    move_type_f, pay_state_f, _ref_f = _resolve_move_fields(
+        tenant_id, url, db, user, password,
+    )
+    pay_date_f, _pay_ref_f = _resolve_payment_fields(
+        tenant_id, url, db, user, password,
+    )
+
     # ----- Invoices in period -----------------------------------------
     inv_domain = [
         ["partner_id", "=", partner_id],
-        ["type", "in", ["out_invoice", "out_refund"]],
+        [move_type_f, "in", ["out_invoice", "out_refund"]],
         ["state", "=", "posted"],
         ["invoice_date", ">=", period_from_iso],
         ["invoice_date", "<=", today_iso],
@@ -743,8 +860,8 @@ def odoo_get_customer_statement(
             "account.move", inv_domain,
             fields=[
                 "id", "name", "invoice_date", "invoice_date_due",
-                "amount_total", "amount_residual", "invoice_payment_state",
-                "type",
+                "amount_total", "amount_residual", pay_state_f,
+                move_type_f,
             ],
             limit=200, order="invoice_date desc, id desc",
         )
@@ -763,18 +880,18 @@ def odoo_get_customer_statement(
         ["partner_id", "=", partner_id],
         ["payment_type", "=", "inbound"],
         ["state", "=", "posted"],
-        ["payment_date", ">=", period_from_iso],
-        ["payment_date", "<=", today_iso],
+        [pay_date_f, ">=", period_from_iso],
+        [pay_date_f, "<=", today_iso],
     ]
     try:
         payments = odoo_search(
             tenant_id, url, db, user, password,
             "account.payment", pay_domain,
             fields=[
-                "id", "name", "payment_date", "amount",
+                "id", "name", pay_date_f, "amount",
                 "reconciled_invoice_ids",
             ],
-            limit=200, order="payment_date desc, id desc",
+            limit=200, order=f"{pay_date_f} desc, id desc",
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -799,7 +916,7 @@ def odoo_get_customer_statement(
             "account.move",
             [
                 ["partner_id", "=", partner_id],
-                ["type", "in", ["out_invoice", "out_refund"]],
+                [move_type_f, "in", ["out_invoice", "out_refund"]],
                 ["state", "=", "posted"],
                 ["amount_residual", ">", 0],
             ],
@@ -852,12 +969,12 @@ def odoo_get_customer_statement(
     # reconciled payment falls inside our payments[] (we have date there).
     paid_invoices = [
         i for i in invoices
-        if i.get("invoice_payment_state") == "paid" and i.get("invoice_date")
+        if i.get(pay_state_f) == "paid" and i.get("invoice_date")
     ]
     # Build inv_id -> payment_date map from payments.
     inv_to_paydate: dict[int, date] = {}
     for p in payments:
-        pd = _parse_date(p.get("payment_date"))
+        pd = _parse_date(p.get(pay_date_f))
         if not pd:
             continue
         for iid in (p.get("reconciled_invoice_ids") or []):
@@ -893,7 +1010,7 @@ def odoo_get_customer_statement(
                 # We don't have the names cached here; defer resolution.
                 applied_names.append(iid)
         movements.append({
-            "date": str(pay.get("payment_date") or ""),
+            "date": str(pay.get(pay_date_f) or ""),
             "type": "payment",
             "name": pay.get("name") or "",
             "amount": -round(float(pay.get("amount") or 0), 2),

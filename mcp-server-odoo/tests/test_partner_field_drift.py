@@ -18,7 +18,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mcp_odoo.tools import generic
-from mcp_odoo.tools.generic import valid_partner_fields, valid_model_fields
+from mcp_odoo.tools.generic import (
+    resolve_field,
+    valid_partner_fields,
+    valid_model_fields,
+)
 
 
 # res.partner fields_get shapes for each Odoo version (only keys matter).
@@ -137,6 +141,83 @@ def test_valid_model_fields_generic_model():
             *CREDS, "product.product", ["name", "list_price", "barcode"],
         )
     assert result == ["name", "list_price"]
+
+
+# ---------------------------------------------------------------------------
+# resolve_field — bridge field renames across Odoo versions
+# ---------------------------------------------------------------------------
+
+# account.move fields_get shapes for each version (keys only).
+_O13_MOVE = {
+    f: {} for f in [
+        "id", "name", "type", "state", "invoice_payment_state", "ref",
+    ]
+}
+_O19_MOVE = {
+    f: {} for f in [
+        "id", "name", "move_type", "state", "payment_state", "memo",
+    ]
+}
+
+
+def test_resolve_field_move_type_odoo19():
+    """Odoo 19 has move_type (not type) → resolves to move_type."""
+    fake = _fake_execute(_O19_MOVE)
+    with patch.object(generic.odoo_pool, "execute", fake):
+        assert resolve_field(
+            *CREDS, "account.move", ["move_type", "type"],
+        ) == "move_type"
+        assert resolve_field(
+            *CREDS, "account.move", ["payment_state", "invoice_payment_state"],
+        ) == "payment_state"
+
+
+def test_resolve_field_move_type_odoo13():
+    """Odoo 13 has type (not move_type) → resolves to legacy name."""
+    fake = _fake_execute(_O13_MOVE)
+    with patch.object(generic.odoo_pool, "execute", fake):
+        assert resolve_field(
+            *CREDS, "account.move", ["move_type", "type"],
+        ) == "type"
+        assert resolve_field(
+            *CREDS, "account.move", ["payment_state", "invoice_payment_state"],
+        ) == "invoice_payment_state"
+
+
+def test_resolve_field_ref_picks_first_existing():
+    """ref candidates: O13 keeps 'ref'; O19 schema (no ref) falls to 'memo'."""
+    with patch.object(generic.odoo_pool, "execute", _fake_execute(_O13_MOVE)):
+        assert resolve_field(
+            *CREDS, "account.move", ["ref", "memo", "name"],
+        ) == "ref"
+    generic._FIELDS_CACHE.clear()
+    with patch.object(generic.odoo_pool, "execute", _fake_execute(_O19_MOVE)):
+        assert resolve_field(
+            *CREDS, "account.move", ["ref", "memo", "name"],
+        ) == "memo"
+
+
+def test_resolve_field_fail_open_returns_first_candidate():
+    """fields_get failure → first candidate (modern name) per spec."""
+    fake = MagicMock(side_effect=RuntimeError("boom"))
+    with patch.object(generic.odoo_pool, "execute", fake):
+        assert resolve_field(
+            *CREDS, "account.move", ["move_type", "type"],
+        ) == "move_type"
+
+
+def test_resolve_field_none_match_returns_first_candidate():
+    """No candidate exists on the model → first candidate is returned."""
+    fake = _fake_execute({"id": {}, "name": {}})
+    with patch.object(generic.odoo_pool, "execute", fake):
+        assert resolve_field(
+            *CREDS, "account.move", ["move_type", "type"],
+        ) == "move_type"
+
+
+def test_resolve_field_empty_candidates_raises():
+    with pytest.raises(ValueError):
+        resolve_field(*CREDS, "account.move", [])
 
 
 # ---------------------------------------------------------------------------
