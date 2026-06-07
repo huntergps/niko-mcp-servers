@@ -2194,16 +2194,20 @@ MCP_TOOLS = [
     {
         "name": "book_appointment",
         "description": (
-            "Agendar una cita en el calendario del salón para un cliente "
-            "YA identificado. Crea el evento directo en el calendario (sin "
-            "confirmación humana) y le copia los recordatorios "
-            "(email/SMS) configurados para ese servicio. Re-valida que el "
-            "horario siga libre y dentro del horario de atención antes de "
-            "crear; si está ocupado o fuera de horario, devuelve un error "
-            "claro y debes usar get_availability para ofrecer otra hora. "
-            "Úsala cuando el cliente confirme un horario específico (ej.: "
-            "'agéndame el viernes a las 10'). NECESITAS el partner_id del "
-            "cliente identificado y la hora local exacta."
+            "Agendar una cita en el calendario del salón. La cita queda "
+            "POR CONFIRMAR hasta que el staff verifique el anticipo del "
+            "50% (no reembolsable, por transferencia); copia al evento los "
+            "recordatorios (email/SMS) configurados para ese servicio. "
+            "Re-valida que el horario siga libre y dentro del horario de "
+            "atención antes de crear; si está ocupado o fuera de horario, "
+            "devuelve un error claro y debes usar get_availability para "
+            "ofrecer otra hora. Úsala cuando el cliente confirme un horario "
+            "específico (ej.: 'agéndame el viernes a las 10'). NO requiere "
+            "cédula: si el cliente ya está identificado pasa su partner_id; "
+            "si no, pasa customer_name + customer_phone (el celular es "
+            "OBLIGATORIO cuando no hay partner_id) y se crea un contacto "
+            "mínimo. Tras agendar, usa get_payment_info para enviarle los "
+            "datos del anticipo."
         ),
         "inputSchema": {
             "type": "object",
@@ -2211,13 +2215,6 @@ MCP_TOOLS = [
                 "service": {
                     "type": "string",
                     "description": "Nombre del servicio a agendar.",
-                },
-                "partner_id": {
-                    "type": "integer",
-                    "description": (
-                        "ID del cliente en Odoo (res.partner.id). El "
-                        "cliente debe estar identificado primero."
-                    ),
                 },
                 "start_local": {
                     "type": "string",
@@ -2227,8 +2224,31 @@ MCP_TOOLS = [
                         "'2026-06-12 10:00')."
                     ),
                 },
+                "partner_id": {
+                    "type": "integer",
+                    "description": (
+                        "(Opcional) ID del cliente en Odoo (res.partner.id) "
+                        "si ya está identificado. Si no lo pasas, usa "
+                        "customer_name + customer_phone."
+                    ),
+                },
+                "customer_name": {
+                    "type": "string",
+                    "description": (
+                        "Nombre del cliente para crear un contacto mínimo "
+                        "cuando no hay partner_id (sin cédula)."
+                    ),
+                },
+                "customer_phone": {
+                    "type": "string",
+                    "description": (
+                        "Celular del cliente. OBLIGATORIO cuando no hay "
+                        "partner_id: se usa para reconocer a clientas que "
+                        "regresan y, si no existe, crear el contacto."
+                    ),
+                },
             },
-            "required": ["service", "partner_id", "start_local"],
+            "required": ["service", "start_local"],
         },
     },
     {
@@ -2354,6 +2374,39 @@ MCP_TOOLS = [
                 },
             },
             "required": ["partner_id", "lines"],
+        },
+    },
+    {
+        "name": "get_payment_info",
+        "description": (
+            "Devolver los datos bancarios del salón para que el cliente "
+            "haga el anticipo del 50% (no reembolsable, por transferencia) "
+            "que confirma su cita. Úsala justo después de agendar una cita "
+            "(book_appointment) o cuando el cliente pregunte cómo o dónde "
+            "pagar el anticipo. Devuelve también la imagen con los datos de "
+            "pago para enviársela. No inventes números de cuenta: usa "
+            "exactamente lo que entrega esta tool."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "get_location_info",
+        "description": (
+            "Devolver la ubicación del salón (dirección, horario de "
+            "atención, teléfono e Instagram) y la imagen con el mapa/"
+            "dirección para enviársela al cliente. Úsala cuando el cliente "
+            "pregunte dónde están, cómo llegar, la dirección, el horario o "
+            "los datos de contacto del salón. No inventes la dirección ni "
+            "el horario: usa exactamente lo que entrega esta tool."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
         },
     },
 ]
@@ -2630,7 +2683,8 @@ def _attach_display_text(
                 )
         elif kind in (
             "services", "availability", "booking",
-            "my_appointments", "cancellation",
+            "my_appointments", "cancellation", "payment_info",
+            "location_info",
         ):
             # Appointment / booking formatters. booking + cancellation +
             # availability render even on success=False so the customer
@@ -2639,7 +2693,9 @@ def _attach_display_text(
                 format_availability,
                 format_booking_confirmation,
                 format_cancellation,
+                format_location_info,
                 format_my_appointments,
+                format_payment_info,
                 format_services_list,
             )
             if kind == "services":
@@ -2654,6 +2710,12 @@ def _attach_display_text(
                     result["display_text"] = format_my_appointments(result)
             elif kind == "cancellation":
                 result["display_text"] = format_cancellation(result)
+            elif kind == "payment_info":
+                if result.get("success") is not False:
+                    result["display_text"] = format_payment_info(result)
+            elif kind == "location_info":
+                if result.get("success") is not False:
+                    result["display_text"] = format_location_info(result)
         elif kind == "invoice_created":
             # Billing formatter. Renders even on success=False so the
             # customer sees the friendly error (e.g. "ítem no existe").
@@ -4688,11 +4750,14 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
         if tool_name == "book_appointment":
+            _pid = args.get("partner_id")
             result = book_appointment(
                 *creds,
                 service=args["service"],
-                partner_id=int(args["partner_id"]),
                 start_local=args["start_local"],
+                partner_id=int(_pid) if _pid not in (None, "", 0) else None,
+                customer_name=args.get("customer_name"),
+                customer_phone=args.get("customer_phone"),
             )
             result = _attach_display_text(
                 result, request_channel, kind="booking",
@@ -4730,6 +4795,22 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         )
         result = _attach_display_text(
             result, request_channel, kind="invoice_created",
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "get_payment_info":
+        from mcp_odoo.tools.billing import get_payment_info
+        result = get_payment_info(*creds)
+        result = _attach_display_text(
+            result, request_channel, kind="payment_info",
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    if tool_name == "get_location_info":
+        from mcp_odoo.tools.billing import get_location_info
+        result = get_location_info(*creds)
+        result = _attach_display_text(
+            result, request_channel, kind="location_info",
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 

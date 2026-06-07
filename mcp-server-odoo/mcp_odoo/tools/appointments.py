@@ -40,9 +40,15 @@ from mcp_odoo.tools.generic import (
     odoo_create,
     odoo_read,
     odoo_search,
+    valid_partner_fields,
 )
 
 logger = logging.getLogger("mcp_odoo.appointments")
+
+# Candidate res.partner phone fields. Odoo 19 dropped ``res.partner.mobile``,
+# so we never assume it exists — ``valid_partner_fields`` prunes the list to
+# the columns the live model actually has before we build the search domain.
+_PARTNER_PHONE_FIELDS = ["phone", "mobile"]
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +292,157 @@ def _overlaps(
         if start < b_stop and stop > b_start:
             return True
     return False
+
+
+def _normalize_phone(raw: Any) -> str:
+    """Basic phone normalization for comparison: strip spaces/dashes/parens.
+
+    Keeps a leading ``+`` and digits only. Used to dedupe returning
+    customers — we are NOT trying to be a full E.164 normalizer, just to
+    ignore cosmetic separators ('099 000-0001' == '0990000001').
+    """
+    if not raw:
+        return ""
+    s = str(raw).strip()
+    plus = s.startswith("+")
+    digits = "".join(ch for ch in s if ch.isdigit())
+    return ("+" + digits) if plus else digits
+
+
+def _resolve_or_create_partner(
+    creds: tuple,
+    partner_id: int | None,
+    customer_name: str | None,
+    customer_phone: str | None,
+) -> dict:
+    """Resolve the booking customer to a ``res.partner`` id.
+
+    Resolution order:
+      1. A valid ``partner_id`` → used verbatim (existing customer).
+      2. Otherwise ``customer_phone`` is mandatory. We look up an existing
+         res.partner whose phone matches (OR over the phone fields that
+         EXIST on this Odoo — Odoo 19 dropped ``res.partner.mobile``).
+         Phones are compared after basic normalization to dedupe returning
+         clients. On a match the existing partner is reused.
+      3. No match → create a minimal contact ``{'name', 'phone'}`` — SIN
+         vat, SIN customer_rank, SIN SRI. This mirrors what Odoo's own web
+         booking flow does (a contact, not a fiscal customer).
+
+    Returns ``{"partner_id": int, "created": bool, "name": str,
+    "phone": str}`` on success, or ``{"error_code", "error_detail"}`` on
+    failure (e.g. ``phone_required``).
+    """
+    tenant_id, url, db, user, password = creds
+
+    # 1. Existing partner_id wins.
+    if isinstance(partner_id, int) and partner_id > 0:
+        name = ""
+        try:
+            prows = odoo_read(
+                tenant_id, url, db, user, password,
+                "res.partner", [partner_id], ["name", "phone"],
+            )
+            if prows:
+                name = prows[0].get("name") or ""
+                phone = prows[0].get("phone") or ""
+            else:
+                phone = ""
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "book_appointment: partner read failed for %s: %s",
+                partner_id, exc,
+            )
+            phone = ""
+        return {
+            "partner_id": int(partner_id),
+            "created": False,
+            "name": name,
+            "phone": phone,
+        }
+
+    # 2. No partner_id → phone is mandatory.
+    raw_phone = (customer_phone or "").strip()
+    if not raw_phone:
+        return {
+            "error_code": "phone_required",
+            "error_detail": (
+                "Para agendar necesito tu número de celular (y tu nombre). "
+                "¿Me lo compartes, por favor?"
+            ),
+        }
+    norm_phone = _normalize_phone(raw_phone)
+
+    # Which phone fields actually exist on this Odoo's res.partner?
+    phone_fields = valid_partner_fields(
+        tenant_id, url, db, user, password, list(_PARTNER_PHONE_FIELDS),
+    )
+    if not phone_fields:  # extremely defensive — phone always exists
+        phone_fields = ["phone"]
+
+    # Build an OR domain over the existing phone fields and dedupe by a
+    # normalized comparison (Odoo stores the raw string, so we over-fetch
+    # a few candidates and compare normalized values ourselves).
+    domain: list = []
+    for f in phone_fields:
+        domain.append([f, "=", raw_phone])
+    if len(domain) > 1:
+        domain = ["|"] * (len(domain) - 1) + domain
+
+    existing = None
+    try:
+        rows = odoo_search(
+            tenant_id, url, db, user, password,
+            "res.partner", domain,
+            fields=["id", "name"] + phone_fields, limit=10, order="id",
+        )
+        for r in rows:
+            for f in phone_fields:
+                if _normalize_phone(r.get(f)) == norm_phone and norm_phone:
+                    existing = r
+                    break
+            if existing:
+                break
+        # Fallback: exact-string domain may miss on spacing differences, so
+        # if nothing matched but rows came back, still trust an exact-string
+        # hit (Odoo already filtered to the raw value).
+        if existing is None and rows:
+            existing = rows[0]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "book_appointment: partner phone lookup failed: %s", exc,
+        )
+
+    if existing:
+        return {
+            "partner_id": int(existing["id"]),
+            "created": False,
+            "name": existing.get("name") or (customer_name or ""),
+            "phone": raw_phone,
+        }
+
+    # 3. Create a minimal contact (NO vat, NO customer_rank, NO SRI).
+    # We deliberately do NOT use the create_partner tool — that one is
+    # bound to the SRI / fiscal flow. A booking only needs a contact.
+    create_vals = {
+        "name": (customer_name or "").strip() or "Cliente",
+        "phone": raw_phone,
+    }
+    try:
+        new_id = odoo_create(
+            tenant_id, url, db, user, password,
+            "res.partner", create_vals,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "error_code": "partner_create_failed",
+            "error_detail": f"No pude registrar tu contacto: {exc}",
+        }
+    return {
+        "partner_id": int(new_id),
+        "created": True,
+        "name": create_vals["name"],
+        "phone": raw_phone,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -551,8 +708,10 @@ def book_appointment(
     user: str,
     password: str,
     service: str,
-    partner_id: int,
     start_local: str,
+    partner_id: int | None = None,
+    customer_name: str | None = None,
+    customer_phone: str | None = None,
 ) -> dict:
     """Book an appointment by creating a ``calendar.event``.
 
@@ -560,10 +719,23 @@ def book_appointment(
     ----
     service : str
         Service name (resolved to ``appointment.type``).
-    partner_id : int
-        ``res.partner.id`` of the already-identified customer.
     start_local : str
         Local start time 'YYYY-MM-DD HH:MM' in the salon's tz.
+    partner_id : int, optional
+        ``res.partner.id`` of an already-identified customer. When given
+        it is used verbatim.
+    customer_name : str, optional
+        Customer name used to create a minimal contact when there is no
+        ``partner_id`` (defaults to 'Cliente' if missing).
+    customer_phone : str, optional
+        Customer cellphone. **Mandatory when there is no ``partner_id``** —
+        it is used to look up a returning customer (dedupe) and, failing
+        that, to create a minimal contact (name + phone, SIN cédula).
+
+    The booking is created as **POR CONFIRMAR**: the salon requires a 50%
+    non-refundable deposit before the slot is held. We prefix the
+    calendar.event name with ``[POR CONFIRMAR] `` and return
+    ``pending_deposit: true`` — we do NOT charge anything here.
 
     Re-validates that the slot is still free (no overlap) and falls within
     a working window before creating. Returns an envelope with the booking
@@ -572,10 +744,9 @@ def book_appointment(
     started = time.time()
     creds = (tenant_id, url, db, user, password)
     log_args = {"service": service, "partner_id": partner_id,
-                "start_local": start_local}
-
-    if not isinstance(partner_id, int) or partner_id <= 0:
-        return {"success": False, "error_code": "invalid_partner_id"}
+                "start_local": start_local,
+                "has_name": bool(customer_name),
+                "has_phone": bool(customer_phone)}
 
     atype = _resolve_appointment_type(creds, service)
     if not atype:
@@ -670,18 +841,23 @@ def book_appointment(
             ),
         }
 
-    # ----- Resolve customer + staff partner names ----------------------
-    customer_name = ""
-    try:
-        prows = odoo_read(
-            tenant_id, url, db, user, password,
-            "res.partner", [partner_id], ["name"],
-        )
-        if prows:
-            customer_name = prows[0].get("name") or ""
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("book_appointment: partner read failed: %s", exc)
+    # ----- Resolve (or create) the customer partner -------------------
+    # Done AFTER the slot validations so we never create a throwaway
+    # contact for a slot that turns out to be taken / out of hours.
+    resolved = _resolve_or_create_partner(
+        creds, partner_id, customer_name, customer_phone,
+    )
+    if "error_code" in resolved:
+        _log_call("book_appointment", tenant_id, log_args, None,
+                  resolved["error_code"],
+                  int((time.time() - started) * 1000))
+        return {"success": False, **resolved}
+    resolved_partner_id = int(resolved["partner_id"])
+    partner_created = bool(resolved["created"])
+    resolved_name = resolved.get("name") or ""
+    resolved_phone = resolved.get("phone") or ""
 
+    # ----- Resolve staff partner name ----------------------------------
     staff_partner_id: int | None = None
     try:
         urows = odoo_read(
@@ -695,12 +871,16 @@ def book_appointment(
     except Exception as exc:  # noqa: BLE001
         logger.warning("book_appointment: staff partner read failed: %s", exc)
 
-    attendee_ids = [partner_id]
-    if staff_partner_id and staff_partner_id != partner_id:
+    attendee_ids = [resolved_partner_id]
+    if staff_partner_id and staff_partner_id != resolved_partner_id:
         attendee_ids.append(staff_partner_id)
 
     service_name = atype.get("name") or service
-    event_name = f"{service_name} - {customer_name}".strip(" -")
+    base_name = f"{service_name} - {resolved_name}".strip(" -")
+    # Owner decision: bookings stay POR CONFIRMAR until staff verify the
+    # 50% non-refundable deposit. Prefix the event name so staff see it at
+    # a glance in the calendar.
+    event_name = f"[POR CONFIRMAR] {base_name}"
 
     # Inherit the reminders (email / SMS calendar.alarm) configured on the
     # appointment.type so the customer gets the same notifications the
@@ -737,8 +917,11 @@ def book_appointment(
         "success": True,
         "event_id": int(event_id),
         "service": service_name,
-        "partner_id": partner_id,
-        "customer_name": customer_name,
+        "partner_id": resolved_partner_id,
+        "partner_created": partner_created,
+        "customer_name": resolved_name,
+        "phone": resolved_phone,
+        "pending_deposit": True,
         "start_local": start_dt_local.strftime("%Y-%m-%d %H:%M"),
         "stop_local": stop_dt_local.strftime("%Y-%m-%d %H:%M"),
         "weekday": _PY_WEEKDAY_LABEL_ES.get(start_dt_local.weekday(), ""),

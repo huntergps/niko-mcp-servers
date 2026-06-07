@@ -117,7 +117,13 @@ def format_booking_confirmation(result: dict | None) -> str:
     dur = (result.get("duration_label") or "").strip()
     event_id = result.get("event_id")
 
-    lines: list[str] = ["✅ *¡Tu cita quedó agendada!*"]
+    pending_deposit = bool(result.get("pending_deposit"))
+
+    head = (
+        "📝 *¡Tu cita quedó reservada (por confirmar)!*"
+        if pending_deposit else "✅ *¡Tu cita quedó agendada!*"
+    )
+    lines: list[str] = [head]
     detail_bits: list[str] = []
     if service:
         detail_bits.append(f"Servicio: *{service}*")
@@ -130,7 +136,84 @@ def format_booking_confirmation(result: dict | None) -> str:
         lines.append("\n".join(detail_bits))
     if event_id is not None:
         lines.append(f"_Referencia de tu cita: #{event_id}._")
-    lines.append("_Te enviaremos un recordatorio antes de tu cita._")
+    if pending_deposit:
+        lines.append(
+            "Tu cita queda *por confirmar* hasta que verifiquemos el "
+            "anticipo del *50% (no reembolsable)* por transferencia. "
+            "Te enviaré los datos de pago; cuando transfieras, envíanos "
+            "el comprobante para confirmarla."
+        )
+    else:
+        lines.append("_Te enviaremos un recordatorio antes de tu cita._")
+    return "\n\n".join(lines)
+
+
+def format_payment_info(result: dict | None) -> str:
+    """Render ``get_payment_info`` envelope for chat channels.
+
+    Chat-safe (no pipes/tables): bank details + 50% non-refundable
+    deposit reminder + send-proof instruction.
+    """
+    if not isinstance(result, dict) or not result.get("success"):
+        return "💳 No pude cargar los datos de pago en este momento."
+
+    bank = (result.get("bank") or "").strip()
+    account_type = (result.get("account_type") or "").strip()
+    account_number = (result.get("account_number") or "").strip()
+    holder = (result.get("holder") or "").strip()
+    holder_id = (result.get("holder_id") or "").strip()
+
+    lines: list[str] = ["💳 *Datos para tu anticipo*"]
+    bank_bits: list[str] = []
+    if bank:
+        bank_bits.append(f"Banco: *{bank}*")
+    if account_type:
+        bank_bits.append(f"Tipo de cuenta: {account_type}")
+    if account_number:
+        bank_bits.append(f"N° de cuenta: *{account_number}*")
+    if holder:
+        bank_bits.append(f"Titular: {holder}")
+    if holder_id:
+        bank_bits.append(f"Cédula: {holder_id}")
+    if bank_bits:
+        lines.append("\n".join(bank_bits))
+
+    lines.append(
+        "El anticipo es del *50% (no reembolsable)* por transferencia. "
+        "Cuando hagas el pago, envíanos el *comprobante* para confirmar "
+        "tu cita."
+    )
+    return "\n\n".join(lines)
+
+
+def format_location_info(result: dict | None) -> str:
+    """Render ``get_location_info`` envelope for chat channels.
+
+    Chat-safe (no pipes/tables): address + hours + contact + invitation
+    to visit.
+    """
+    if not isinstance(result, dict) or not result.get("success"):
+        return "📍 No pude cargar nuestra ubicación en este momento."
+
+    address = (result.get("address") or "").strip()
+    hours = (result.get("hours") or "").strip()
+    phone = (result.get("phone") or "").strip()
+    instagram = (result.get("instagram") or "").strip()
+
+    lines: list[str] = ["📍 *Nuestra ubicación — Afrodita Studio*"]
+    info_bits: list[str] = []
+    if address:
+        info_bits.append(f"Dirección: *{address}*")
+    if hours:
+        info_bits.append(f"Horario de atención: {hours}")
+    if phone:
+        info_bits.append(f"Teléfono: {phone}")
+    if instagram:
+        info_bits.append(f"Instagram: {instagram}")
+    if info_bits:
+        lines.append("\n".join(info_bits))
+
+    lines.append("_¡Te esperamos para consentirte! 💅_")
     return "\n\n".join(lines)
 
 
@@ -184,4 +267,6 @@ __all__ = [
     "format_booking_confirmation",
     "format_my_appointments",
     "format_cancellation",
+    "format_payment_info",
+    "format_location_info",
 ]

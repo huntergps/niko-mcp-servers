@@ -121,7 +121,11 @@ class TestRegistration:
         by_name = {t["name"]: t for t in body["result"]["tools"]}
         assert by_name["get_availability"]["inputSchema"]["required"] == ["service"]
         book_req = set(by_name["book_appointment"]["inputSchema"]["required"])
-        assert book_req == {"service", "partner_id", "start_local"}
+        # partner_id is now optional (book con nombre+celular sin cédula).
+        assert book_req == {"service", "start_local"}
+        book_props = by_name["book_appointment"]["inputSchema"]["properties"]
+        assert "customer_name" in book_props
+        assert "customer_phone" in book_props
         cancel_req = set(by_name["cancel_appointment"]["inputSchema"]["required"])
         assert cancel_req == {"event_id", "partner_id"}
         assert by_name["list_my_appointments"]["inputSchema"]["required"] == ["partner_id"]
@@ -597,3 +601,322 @@ class TestFormatters:
         text = format_cancellation({"success": True, "service": "Manicura"})
         assert "cancelé" in text
         assert "Manicura" in text
+
+    def test_booking_pending_deposit(self):
+        from mcp_odoo.formatters.whatsapp_appointments import (
+            format_booking_confirmation,
+        )
+        env = {
+            "success": True, "event_id": 777,
+            "service": "Manicura semipermanente", "weekday": "Viernes",
+            "start_local": "2026-06-12 10:00", "duration_label": "1 h 15 min",
+            "pending_deposit": True,
+        }
+        text = format_booking_confirmation(env)
+        _assert_no_markdown_tables(text)
+        assert "por confirmar" in text.lower()
+        assert "50%" in text
+        assert "no reembolsable" in text.lower()
+        assert "comprobante" in text.lower()
+
+    def test_payment_info(self):
+        from mcp_odoo.formatters.whatsapp_appointments import format_payment_info
+        env = {
+            "success": True,
+            "bank": "Banco Guayaquil",
+            "account_type": "Cuenta de Ahorros",
+            "account_number": "18958304",
+            "holder": "Liceth Alava Mendoza",
+            "holder_id": "2300218159",
+            "deposit_percent": 50,
+            "refundable": False,
+            "method": "transferencia",
+            "pdf_filename": "afrodita_datos_pago.png",
+        }
+        text = format_payment_info(env)
+        _assert_no_markdown_tables(text)
+        assert "Banco Guayaquil" in text
+        assert "18958304" in text
+        assert "Liceth Alava Mendoza" in text
+        assert "2300218159" in text
+        assert "50%" in text
+        assert "no reembolsable" in text.lower()
+        assert "comprobante" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# book_appointment — contact resolution (sin cédula)
+# ---------------------------------------------------------------------------
+
+class TestBookAppointmentContact:
+    def _patch_now(self, fixed_now):
+        from mcp_odoo.tools import appointments as ap
+
+        class _FakeDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now if tz else fixed_now.replace(tzinfo=None)
+        return patch.object(ap, "datetime", _FakeDateTime)
+
+    def _search_factory(self, partner_rows):
+        """Return a fake odoo_search; res.partner returns ``partner_rows``."""
+        def _fake_search(*a, **k):
+            model = a[5]
+            if model == "appointment.type":
+                return [TYPE_22]
+            if model == "appointment.slot":
+                return SLOTS_22
+            if model == "calendar.event":
+                return []
+            if model == "res.partner":
+                return list(partner_rows)
+            return []
+        return _fake_search
+
+    def test_phone_required_when_no_partner(self):
+        from mcp_odoo.tools import appointments as ap
+        fixed_now = datetime(2026, 6, 10, 6, 0, tzinfo=TZ)
+        with patch.object(ap, "odoo_search",
+                          side_effect=self._search_factory([])), \
+             self._patch_now(fixed_now):
+            r = ap.book_appointment(
+                *CREDS, service="Manicura",
+                start_local="2026-06-10 11:00",
+                customer_name="QA Prueba",
+            )
+        assert r["success"] is False
+        assert r["error_code"] == "phone_required"
+
+    def test_creates_minimal_contact(self):
+        """No partner_id + phone with no match → create contact sin vat."""
+        from mcp_odoo.tools import appointments as ap
+        fixed_now = datetime(2026, 6, 10, 6, 0, tzinfo=TZ)
+        captured = {}
+
+        def _fake_read(*a, **k):
+            model = a[5]
+            if model == "res.users":
+                return [{"id": 6, "partner_id": [13, "Liceth"]}]
+            return []
+
+        def _fake_create(*a, **k):
+            model = a[5]
+            vals = a[6]
+            if model == "res.partner":
+                captured["partner_vals"] = vals
+                return 1001
+            if model == "calendar.event":
+                captured["event_vals"] = vals
+                return 555
+            return 0
+
+        with patch.object(ap, "odoo_search",
+                          side_effect=self._search_factory([])), \
+             patch.object(ap, "odoo_read", side_effect=_fake_read), \
+             patch.object(ap, "odoo_create", side_effect=_fake_create), \
+             patch.object(ap, "valid_partner_fields",
+                          side_effect=lambda *a, **k: ["phone"]), \
+             self._patch_now(fixed_now):
+            r = ap.book_appointment(
+                *CREDS, service="Manicura",
+                start_local="2026-06-10 11:00",
+                customer_name="QA Prueba", customer_phone="0990000001",
+            )
+        assert r["success"] is True
+        assert r["partner_id"] == 1001
+        assert r["partner_created"] is True
+        assert r["pending_deposit"] is True
+        # Minimal contact: name + phone only, NO vat / NO customer_rank.
+        pv = captured["partner_vals"]
+        assert pv["name"] == "QA Prueba"
+        assert pv["phone"] == "0990000001"
+        assert "vat" not in pv
+        assert "customer_rank" not in pv
+        # Event name prefixed [POR CONFIRMAR].
+        assert captured["event_vals"]["name"].startswith("[POR CONFIRMAR] ")
+
+    def test_reuses_existing_partner_by_phone(self):
+        """A returning customer (phone match) is reused, never duplicated."""
+        from mcp_odoo.tools import appointments as ap
+        fixed_now = datetime(2026, 6, 10, 6, 0, tzinfo=TZ)
+        created_models: list[str] = []
+
+        def _fake_read(*a, **k):
+            if a[5] == "res.users":
+                return [{"id": 6, "partner_id": [13, "Liceth"]}]
+            return []
+
+        def _fake_create(*a, **k):
+            created_models.append(a[5])
+            return 555  # calendar.event
+
+        # Existing partner whose phone matches after normalization.
+        partner_rows = [{"id": 2002, "name": "QA Prueba",
+                         "phone": "099 000-0001"}]
+
+        with patch.object(ap, "odoo_search",
+                          side_effect=self._search_factory(partner_rows)), \
+             patch.object(ap, "odoo_read", side_effect=_fake_read), \
+             patch.object(ap, "odoo_create", side_effect=_fake_create), \
+             patch.object(ap, "valid_partner_fields",
+                          side_effect=lambda *a, **k: ["phone"]), \
+             self._patch_now(fixed_now):
+            r = ap.book_appointment(
+                *CREDS, service="Manicura",
+                start_local="2026-06-10 11:00",
+                customer_name="QA Prueba", customer_phone="0990000001",
+            )
+        assert r["success"] is True
+        assert r["partner_id"] == 2002
+        assert r["partner_created"] is False
+        # res.partner must NOT have been created — only the calendar.event.
+        assert "res.partner" not in created_models
+
+    def test_mobile_field_pruned_odoo19(self):
+        """Odoo 19 lacks res.partner.mobile → it must not enter the domain."""
+        from mcp_odoo.tools import appointments as ap
+        fixed_now = datetime(2026, 6, 10, 6, 0, tzinfo=TZ)
+        captured = {}
+
+        def _fake_search(*a, **k):
+            model = a[5]
+            if model == "appointment.type":
+                return [TYPE_22]
+            if model == "appointment.slot":
+                return SLOTS_22
+            if model == "calendar.event":
+                return []
+            if model == "res.partner":
+                captured["domain"] = a[6]
+                return []
+            return []
+
+        def _fake_read(*a, **k):
+            if a[5] == "res.users":
+                return [{"id": 6, "partner_id": [13, "Liceth"]}]
+            return []
+
+        with patch.object(ap, "odoo_search", side_effect=_fake_search), \
+             patch.object(ap, "odoo_read", side_effect=_fake_read), \
+             patch.object(ap, "odoo_create", side_effect=lambda *a, **k: 1001), \
+             patch.object(ap, "valid_partner_fields",
+                          side_effect=lambda *a, **k: ["phone"]), \
+             self._patch_now(fixed_now):
+            ap.book_appointment(
+                *CREDS, service="Manicura",
+                start_local="2026-06-10 11:00",
+                customer_name="QA", customer_phone="0990000001",
+            )
+        # Domain only references 'phone', never 'mobile'.
+        flat = str(captured["domain"])
+        assert "phone" in flat
+        assert "mobile" not in flat
+
+    def test_existing_partner_id_used_verbatim(self):
+        """A valid partner_id is used as-is; no contact lookup/creation."""
+        from mcp_odoo.tools import appointments as ap
+        fixed_now = datetime(2026, 6, 10, 6, 0, tzinfo=TZ)
+        created_models: list[str] = []
+
+        def _fake_search(*a, **k):
+            model = a[5]
+            if model == "appointment.type":
+                return [TYPE_22]
+            if model == "appointment.slot":
+                return SLOTS_22
+            return []
+
+        def _fake_read(*a, **k):
+            model = a[5]
+            if model == "res.partner":
+                return [{"id": 99, "name": "Doña Cliente", "phone": "0987"}]
+            if model == "res.users":
+                return [{"id": 6, "partner_id": [13, "Liceth"]}]
+            return []
+
+        def _fake_create(*a, **k):
+            created_models.append(a[5])
+            return 555
+
+        with patch.object(ap, "odoo_search", side_effect=_fake_search), \
+             patch.object(ap, "odoo_read", side_effect=_fake_read), \
+             patch.object(ap, "odoo_create", side_effect=_fake_create), \
+             self._patch_now(fixed_now):
+            r = ap.book_appointment(
+                *CREDS, service="Manicura", partner_id=99,
+                start_local="2026-06-10 11:00",
+            )
+        assert r["success"] is True
+        assert r["partner_id"] == 99
+        assert r["partner_created"] is False
+        assert "res.partner" not in created_models
+
+
+# ---------------------------------------------------------------------------
+# get_payment_info
+# ---------------------------------------------------------------------------
+
+class TestGetPaymentInfo:
+    def test_returns_pdf_filename_and_bank_data(self):
+        from mcp_odoo.tools.billing import get_payment_info
+        r = get_payment_info(*CREDS)
+        assert r["success"] is True
+        assert r["pdf_filename"] == "afrodita_datos_pago.png"
+        assert r["bank"] == "Banco Guayaquil"
+        assert r["account_number"] == "18958304"
+        assert r["holder"] == "Liceth Alava Mendoza"
+        assert r["holder_id"] == "2300218159"
+        assert r["deposit_percent"] == 50
+        assert r["refundable"] is False
+        assert "18958304" in r["payment_text"]
+        assert "comprobante" in r["payment_text"].lower()
+
+    def test_registered_in_tools_list(self, client):
+        body = _rpc(client, "tools/list")
+        names = [t["name"] for t in body["result"]["tools"]]
+        assert "get_payment_info" in names
+
+
+# ---------------------------------------------------------------------------
+# get_location_info
+# ---------------------------------------------------------------------------
+
+class TestGetLocationInfo:
+    def test_returns_pdf_filename_and_location_data(self):
+        from mcp_odoo.tools.billing import get_location_info
+        r = get_location_info(*CREDS)
+        assert r["success"] is True
+        assert r["pdf_filename"] == "afrodita_direccion.png"
+        assert r["address"] == "Miraflores, junto a Danubios Boutique"
+        assert r["hours"] == "9:00 am a 6:00 pm"
+        assert r["phone"] == "0988294278"
+        assert r["instagram"] == "@afroditastudio.stx"
+        # Location text carries the owner-provided data verbatim.
+        assert "Miraflores, junto a Danubios Boutique" in r["location_text"]
+        assert "9:00 am a 6:00 pm" in r["location_text"]
+        assert "0988294278" in r["location_text"]
+        assert "@afroditastudio.stx" in r["location_text"]
+
+    def test_registered_in_tools_list(self, client):
+        body = _rpc(client, "tools/list")
+        names = [t["name"] for t in body["result"]["tools"]]
+        assert "get_location_info" in names
+
+    def test_formatter_chat_safe(self):
+        from mcp_odoo.formatters.whatsapp_appointments import (
+            format_location_info,
+        )
+        env = {
+            "success": True,
+            "address": "Miraflores, junto a Danubios Boutique",
+            "hours": "9:00 am a 6:00 pm",
+            "phone": "0988294278",
+            "instagram": "@afroditastudio.stx",
+            "pdf_filename": "afrodita_direccion.png",
+        }
+        text = format_location_info(env)
+        _assert_no_markdown_tables(text)
+        assert "Miraflores, junto a Danubios Boutique" in text
+        assert "9:00 am a 6:00 pm" in text
+        assert "0988294278" in text
+        assert "@afroditastudio.stx" in text

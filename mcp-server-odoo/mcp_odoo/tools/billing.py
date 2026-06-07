@@ -396,4 +396,132 @@ def create_invoice(
     return result
 
 
-__all__ = ["create_invoice"]
+# ---------------------------------------------------------------------------
+# Payment info (salon deposit) — Afrodita bank details for the 50% deposit
+# ---------------------------------------------------------------------------
+
+# Owner-confirmed bank details for the deposit (NEVER invented — these were
+# provided by the salon). The caller hosts the matching image on the server
+# and niko maps this tool name → /files/ for the PNG delivery.
+_PAYMENT_PDF_FILENAME = "afrodita_datos_pago.png"
+_PAYMENT_BANK = "Banco Guayaquil"
+_PAYMENT_ACCOUNT_TYPE = "Cuenta de Ahorros"
+_PAYMENT_ACCOUNT_NUMBER = "18958304"
+_PAYMENT_HOLDER = "Liceth Alava Mendoza"
+_PAYMENT_HOLDER_ID = "2300218159"
+
+
+def get_payment_info(
+    tenant_id: str,
+    url: str,
+    db: str,
+    user: str,
+    password: str,
+) -> dict:
+    """Return the salon's bank details so the customer can pay the deposit.
+
+    The 50% deposit is *non-refundable* and must be paid by bank transfer;
+    the customer then sends the proof of payment so the staff can confirm
+    the appointment.
+
+    The bank details are owner-provided constants (never invented). The
+    ``pdf_filename`` points at the payment-info image; niko's orchestrator
+    maps this tool name → the ``/files/`` folder and delivers that PNG,
+    mirroring the ``get_invoice_pdf`` pattern (this tool does NOT read or
+    write Odoo — the creds are accepted only for dispatch uniformity).
+
+    Returns
+    -------
+    dict
+        Envelope with ``success, bank, account_type, account_number,
+        holder, holder_id, deposit_percent, refundable, method,
+        pdf_filename`` plus a chat-safe ``payment_text``.
+    """
+    started = time.time()
+    payment_text = (
+        "Para confirmar tu cita necesitas enviar el anticipo del 50% "
+        "(no reembolsable) por transferencia a:\n"
+        f"Banco: {_PAYMENT_BANK}\n"
+        f"Tipo de cuenta: {_PAYMENT_ACCOUNT_TYPE}\n"
+        f"N° de cuenta: {_PAYMENT_ACCOUNT_NUMBER}\n"
+        f"Titular: {_PAYMENT_HOLDER}\n"
+        f"Cédula: {_PAYMENT_HOLDER_ID}\n"
+        "Cuando hagas la transferencia, envíanos el comprobante para "
+        "confirmar tu cita."
+    )
+    result = {
+        "success": True,
+        "bank": _PAYMENT_BANK,
+        "account_type": _PAYMENT_ACCOUNT_TYPE,
+        "account_number": _PAYMENT_ACCOUNT_NUMBER,
+        "holder": _PAYMENT_HOLDER,
+        "holder_id": _PAYMENT_HOLDER_ID,
+        "deposit_percent": 50,
+        "refundable": False,
+        "method": "transferencia",
+        "pdf_filename": _PAYMENT_PDF_FILENAME,
+        "payment_text": payment_text,
+    }
+    _log_call("get_payment_info", tenant_id, {}, {"ok": True}, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Location info (salon address) — Afrodita address / hours / contact
+# ---------------------------------------------------------------------------
+
+# Owner-confirmed location details (NEVER invented). The caller hosts the
+# matching image on the server and niko maps this tool name → /files/location
+# for the PNG delivery.
+_LOCATION_PDF_FILENAME = "afrodita_direccion.png"
+_LOCATION_ADDRESS = "Miraflores, junto a Danubios Boutique"
+_LOCATION_HOURS = "9:00 am a 6:00 pm"
+_LOCATION_PHONE = "0988294278"
+_LOCATION_INSTAGRAM = "@afroditastudio.stx"
+
+
+def get_location_info(
+    tenant_id: str,
+    url: str,
+    db: str,
+    user: str,
+    password: str,
+) -> dict:
+    """Return the salon's address / hours / contact so the customer can visit.
+
+    The location details are owner-provided constants (never invented). The
+    ``pdf_filename`` points at the address image; niko's orchestrator maps
+    this tool name → the ``/files/location`` folder and delivers that PNG,
+    mirroring the ``get_payment_info`` pattern (this tool does NOT read or
+    write Odoo — the creds are accepted only for dispatch uniformity).
+
+    Returns
+    -------
+    dict
+        Envelope with ``success, address, hours, phone, instagram,
+        pdf_filename`` plus a chat-safe ``location_text``.
+    """
+    started = time.time()
+    location_text = (
+        "¡Te esperamos en Afrodita Studio!\n"
+        f"Dirección: {_LOCATION_ADDRESS}\n"
+        f"Horario de atención: {_LOCATION_HOURS}\n"
+        f"Teléfono: {_LOCATION_PHONE}\n"
+        f"Instagram: {_LOCATION_INSTAGRAM}"
+    )
+    result = {
+        "success": True,
+        "address": _LOCATION_ADDRESS,
+        "hours": _LOCATION_HOURS,
+        "phone": _LOCATION_PHONE,
+        "instagram": _LOCATION_INSTAGRAM,
+        "pdf_filename": _LOCATION_PDF_FILENAME,
+        "location_text": location_text,
+    }
+    _log_call("get_location_info", tenant_id, {}, {"ok": True}, None,
+              int((time.time() - started) * 1000))
+    return result
+
+
+__all__ = ["create_invoice", "get_payment_info", "get_location_info"]
