@@ -2409,6 +2409,144 @@ MCP_TOOLS = [
             "required": [],
         },
     },
+    {
+        "name": "register_deposit_proof",
+        "description": (
+            "Registrar el COMPROBANTE del anticipo de una cita: adjunta la "
+            "imagen del comprobante a la cita (calendar.event), crea un pago "
+            "(account.payment) en BORRADOR a nombre del cliente por el monto "
+            "del anticipo (entrante, diario bancario) y adjunta también el "
+            "comprobante al pago. El pago queda en borrador hasta que el "
+            "personal verifique y confirme la cita (confirm_appointment). "
+            "Úsala cuando el cliente envíe la FOTO del comprobante de la "
+            "transferencia del 50%. Necesitas el event_id de la cita, el "
+            "partner_id del cliente, la imagen en base64, el nombre del "
+            "archivo y el monto pagado."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "event_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID de la cita (calendar.event.id) a la que "
+                        "corresponde el anticipo."
+                    ),
+                },
+                "partner_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID del cliente en Odoo (res.partner.id) que pagó "
+                        "el anticipo."
+                    ),
+                },
+                "image_base64": {
+                    "type": "string",
+                    "description": (
+                        "Imagen del comprobante codificada en base64 (sin "
+                        "el prefijo data:)."
+                    ),
+                },
+                "filename": {
+                    "type": "string",
+                    "description": (
+                        "Nombre del archivo del comprobante (ej.: "
+                        "'comprobante.jpg')."
+                    ),
+                },
+                "amount": {
+                    "type": "number",
+                    "description": "Monto del anticipo pagado.",
+                },
+                "mimetype": {
+                    "type": "string",
+                    "description": (
+                        "(Opcional) Tipo MIME de la imagen (default "
+                        "'image/jpeg')."
+                    ),
+                },
+            },
+            "required": [
+                "event_id", "partner_id", "image_base64", "filename",
+                "amount",
+            ],
+        },
+    },
+    {
+        "name": "confirm_appointment",
+        "description": (
+            "Confirmar una cita PENDIENTE una vez verificado el anticipo. "
+            "Quita el prefijo '[POR CONFIRMAR] ' del nombre de la cita y "
+            "contabiliza (postea) el pago del anticipo en borrador asociado. "
+            "Úsala cuando el personal valide el comprobante del cliente. "
+            "Necesitas el event_id de la cita."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "event_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID de la cita (calendar.event.id) a confirmar."
+                    ),
+                },
+            },
+            "required": ["event_id"],
+        },
+    },
+    {
+        "name": "release_appointment",
+        "description": (
+            "Liberar (cancelar) una cita pendiente por expiración o rechazo "
+            "del anticipo. Borra la cita (calendar.event) y, si hay un pago "
+            "de anticipo en borrador asociado, lo cancela/borra. Úsala "
+            "cuando venza el plazo para pagar el anticipo o cuando el "
+            "personal rechace un comprobante. Necesitas el event_id."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "event_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID de la cita (calendar.event.id) a liberar."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "(Opcional) Motivo de la liberación (ej.: "
+                        "'anticipo no pagado a tiempo')."
+                    ),
+                },
+            },
+            "required": ["event_id"],
+        },
+    },
+    {
+        "name": "list_pending_deposit_appointments",
+        "description": (
+            "Listar las citas marcadas '[POR CONFIRMAR]' creadas hace más "
+            "de N minutos (sin anticipo verificado). Sirve para el proceso "
+            "de expiración: avisar al cliente y liberar el horario. Devuelve "
+            "cada cita con event_id, nombre, inicio, fecha de creación y los "
+            "partner_ids del cliente."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "older_than_minutes": {
+                    "type": "integer",
+                    "description": (
+                        "Edad mínima en minutos desde que se creó la cita "
+                        "(default 120)."
+                    ),
+                    "default": 120,
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -2723,6 +2861,30 @@ def _attach_display_text(
                 format_invoice_created,
             )
             result["display_text"] = format_invoice_created(result)
+        elif kind in (
+            "deposit_received", "appointment_confirmed",
+            "appointment_released", "pending_deposit_list",
+        ):
+            # Deposit / proof-of-payment formatters. deposit_received +
+            # appointment_confirmed + appointment_released render even on
+            # success=False so the customer sees the friendly error verbatim.
+            from mcp_odoo.formatters.whatsapp_deposits import (
+                format_appointment_confirmed,
+                format_appointment_released,
+                format_deposit_received,
+                format_pending_deposit_list,
+            )
+            if kind == "deposit_received":
+                result["display_text"] = format_deposit_received(result)
+            elif kind == "appointment_confirmed":
+                result["display_text"] = format_appointment_confirmed(result)
+            elif kind == "appointment_released":
+                result["display_text"] = format_appointment_released(result)
+            elif kind == "pending_deposit_list":
+                if result.get("success") is not False:
+                    result["display_text"] = format_pending_deposit_list(
+                        result
+                    )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "display_text formatter failed kind=%s channel=%s: %s",
@@ -4813,6 +4975,64 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             result, request_channel, kind="location_info",
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    # ----- Deposit / proof-of-payment tools (salon — Odoo 19) ------------
+    if tool_name in (
+        "register_deposit_proof",
+        "confirm_appointment",
+        "release_appointment",
+        "list_pending_deposit_appointments",
+    ):
+        from mcp_odoo.tools.deposits import (
+            confirm_appointment,
+            list_pending_deposit_appointments,
+            register_deposit_proof,
+            release_appointment,
+        )
+        if tool_name == "register_deposit_proof":
+            result = register_deposit_proof(
+                *creds,
+                event_id=int(args["event_id"]),
+                partner_id=int(args["partner_id"]),
+                image_base64=args["image_base64"],
+                filename=args.get("filename") or "comprobante.jpg",
+                amount=float(args["amount"]),
+                mimetype=args.get("mimetype"),
+            )
+            result = _attach_display_text(
+                result, request_channel, kind="deposit_received",
+            )
+            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+        if tool_name == "confirm_appointment":
+            result = confirm_appointment(
+                *creds, event_id=int(args["event_id"]),
+            )
+            result = _attach_display_text(
+                result, request_channel, kind="appointment_confirmed",
+            )
+            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+        if tool_name == "release_appointment":
+            result = release_appointment(
+                *creds,
+                event_id=int(args["event_id"]),
+                reason=args.get("reason"),
+            )
+            result = _attach_display_text(
+                result, request_channel, kind="appointment_released",
+            )
+            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+        if tool_name == "list_pending_deposit_appointments":
+            result = list_pending_deposit_appointments(
+                *creds,
+                older_than_minutes=int(args.get("older_than_minutes", 120)),
+            )
+            result = _attach_display_text(
+                result, request_channel, kind="pending_deposit_list",
+            )
+            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     raise ValueError(f"Unknown tool: {tool_name}")
 

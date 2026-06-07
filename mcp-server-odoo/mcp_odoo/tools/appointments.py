@@ -1118,7 +1118,7 @@ def cancel_appointment(
         try:
             odoo_call_method(
                 tenant_id, url, db, user, password,
-                "calendar.event", "write", [[event_id], {"active": False}],
+                "calendar.event", "write", [event_id], args=[{"active": False}],
             )
             method_used = "deactivate"
         except Exception as exc:  # noqa: BLE001
