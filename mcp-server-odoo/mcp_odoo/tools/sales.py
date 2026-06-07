@@ -1942,24 +1942,41 @@ def odoo_search_partner(
     phone: str | None = None,
 ) -> list[dict]:
     """Search for a partner (customer/supplier) by VAT, name, or phone."""
+    from mcp_odoo.tools.generic import valid_partner_fields
+
+    # res.partner.mobile was removed in Odoo 17+ (merged into phone). Only
+    # query/filter by it when the field actually exists on this instance.
+    has_mobile = "mobile" in valid_partner_fields(
+        tenant_id, url, db, user, password, ["mobile"],
+    )
+
     domain = []
     if vat:
         domain.append(["vat", "=", vat])
     if name:
         domain.append(["name", "ilike", name])
     if phone:
-        domain.append("|")
-        domain.append(["phone", "=", phone])
-        domain.append(["mobile", "=", phone])
+        if has_mobile:
+            # OR(phone, mobile)
+            domain.append("|")
+            domain.append(["phone", "=", phone])
+            domain.append(["mobile", "=", phone])
+        else:
+            domain.append(["phone", "=", phone])
 
     if not domain:
         return []
 
+    desired_fields = ["name", "vat", "email", "phone", "mobile",
+                      "street", "city", "country_id", "customer", "supplier"]
+    fields = valid_partner_fields(
+        tenant_id, url, db, user, password, desired_fields,
+    )
+
     return odoo_search(
         tenant_id, url, db, user, password,
         "res.partner", domain,
-        fields=["name", "vat", "email", "phone", "mobile",
-                "street", "city", "country_id", "customer", "supplier"],
+        fields=fields,
         limit=10,
     )
 

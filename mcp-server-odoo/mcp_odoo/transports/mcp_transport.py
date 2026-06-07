@@ -3217,6 +3217,9 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         req_fields = args.get("fields") or default_fields
         if not isinstance(req_fields, list) or not req_fields:
             req_fields = default_fields
+        # Drop fields absent on this Odoo version (e.g. mobile in Odoo 17+).
+        from mcp_odoo.tools.generic import valid_partner_fields
+        req_fields = valid_partner_fields(*creds, req_fields)
         try:
             rows = odoo_read(*creds, "res.partner", [partner_id], req_fields)
         except Exception as exc:  # noqa: BLE001
@@ -4937,6 +4940,12 @@ async def _create_partner(creds: tuple, args: dict) -> str:
         if args.get(field):
             vals[field] = args[field]
 
+    # Drop fields absent on this Odoo version before writing (e.g. mobile in
+    # Odoo 17+ would raise ValueError: Invalid field 'mobile').
+    from mcp_odoo.tools.generic import valid_partner_fields
+    _valid = set(valid_partner_fields(*creds, list(vals.keys())))
+    vals = {k: v for k, v in vals.items() if k in _valid}
+
     try:
         partner_id = odoo_create(*creds, "res.partner", vals)
         partner = odoo_read(*creds, "res.partner", [partner_id],
@@ -4994,7 +5003,7 @@ async def _update_partner(creds: tuple, args: dict) -> str:
     Two-phase: without confirmed=true, returns preview only.
     With confirmed=true, executes the change.
     """
-    from mcp_odoo.tools.generic import odoo_write, odoo_read
+    from mcp_odoo.tools.generic import odoo_write, odoo_read, valid_partner_fields
     from mcp_odoo.config import settings
     import httpx
 
@@ -5008,11 +5017,20 @@ async def _update_partner(creds: tuple, args: dict) -> str:
     if not vals:
         return json.dumps({"success": False, "message": "No hay campos para actualizar."})
 
+    # Drop fields absent on this Odoo version (e.g. mobile in Odoo 17+) so
+    # neither the read nor the write raises Invalid field.
+    _valid_vals = set(valid_partner_fields(*creds, list(vals.keys())))
+    vals = {k: v for k, v in vals.items() if k in _valid_vals}
+    if not vals:
+        return json.dumps({"success": False, "message": "No hay campos para actualizar."})
+
     # Phase 1: Preview — read current data and show what would change
     if not confirmed:
         try:
-            current = odoo_read(*creds, "res.partner", [partner_id],
-                               ["name", "vat", "email", "phone", "mobile", "street", "city"])[0]
+            _preview_fields = valid_partner_fields(
+                *creds, ["name", "vat", "email", "phone", "mobile", "street", "city"],
+            )
+            current = odoo_read(*creds, "res.partner", [partner_id], _preview_fields)[0]
             changes = []
             for field, new_val in vals.items():
                 old_val = current.get(field, "") or ""
@@ -5044,9 +5062,10 @@ async def _update_partner(creds: tuple, args: dict) -> str:
 
     try:
         odoo_write(*creds, "res.partner", [partner_id], vals)
-        partner = odoo_read(*creds, "res.partner", [partner_id],
-                           ["id", "name", "vat", "email", "phone", "mobile",
-                            "street", "city"])[0]
+        _post_fields = valid_partner_fields(
+            *creds, ["id", "name", "vat", "email", "phone", "mobile", "street", "city"],
+        )
+        partner = odoo_read(*creds, "res.partner", [partner_id], _post_fields)[0]
 
         # Sync updated data to partner_embeddings (RAG)
         try:
@@ -5164,7 +5183,7 @@ async def _update_partner(creds: tuple, args: dict) -> str:
 
 async def _identify_customer(creds: tuple, cedula_ruc: str) -> str:
     """Identify a customer by cedula/RUC with validation and balance lookup."""
-    from mcp_odoo.tools.generic import odoo_search as _search
+    from mcp_odoo.tools.generic import odoo_search as _search, valid_partner_fields
     from mcp_odoo.tools.sales import odoo_check_balance
 
     clean = cedula_ruc.strip().replace("-", "").replace(" ", "")
@@ -5172,13 +5191,19 @@ async def _identify_customer(creds: tuple, cedula_ruc: str) -> str:
     if not valid:
         return json.dumps({"found": False, "error": msg}, ensure_ascii=False)
 
+    # Drop fields absent on this Odoo version (e.g. mobile in Odoo 17+).
+    _partner_fields = valid_partner_fields(
+        *creds,
+        ["name", "vat", "email", "phone", "mobile", "street", "city",
+         "credit_limit", "customer_rank", "supplier_rank", "property_payment_term_id"],
+    )
+
     # Search by VAT in Odoo
     partners = _search(
         *creds,
         "res.partner",
         [["vat", "=", clean]],
-        fields=["name", "vat", "email", "phone", "mobile", "street", "city",
-                "credit_limit", "customer_rank", "supplier_rank", "property_payment_term_id"],
+        fields=_partner_fields,
         limit=1,
     )
 
@@ -5189,8 +5214,7 @@ async def _identify_customer(creds: tuple, cedula_ruc: str) -> str:
                 *creds,
                 "res.partner",
                 [["vat", "=", clean + "001"]],
-                fields=["name", "vat", "email", "phone", "mobile", "street", "city",
-                        "credit_limit", "customer_rank", "supplier_rank", "property_payment_term_id"],
+                fields=_partner_fields,
                 limit=1,
             )
 
