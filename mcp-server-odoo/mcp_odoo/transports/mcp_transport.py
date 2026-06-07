@@ -2283,6 +2283,79 @@ MCP_TOOLS = [
             "required": ["event_id", "partner_id"],
         },
     },
+    {
+        "name": "create_invoice",
+        "description": (
+            "Crear una FACTURA en BORRADOR para un cliente YA identificado "
+            "(salón Afrodita, facturación electrónica Ecuador). Crea el "
+            "documento en estado borrador con los servicios/productos que "
+            "indique el cliente y deja un aviso para que el staff la revise "
+            "y la autorice en el SRI. NO la emite ni la autoriza por su "
+            "cuenta. Cada ítem se resuelve por nombre contra el catálogo; "
+            "si un ítem no existe, devuelve un error claro y NO inventes "
+            "productos. Úsala cuando el cliente pida que le factures un "
+            "servicio o compra. NECESITAS el partner_id del cliente "
+            "identificado y la lista de ítems."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID del cliente en Odoo (res.partner.id). El "
+                        "cliente debe estar identificado primero."
+                    ),
+                },
+                "lines": {
+                    "type": "array",
+                    "description": (
+                        "Lista de ítems a facturar. Cada uno es un objeto "
+                        "con 'item' (nombre del servicio/producto), "
+                        "'quantity' (cantidad, default 1) y opcionalmente "
+                        "'price_unit' (precio unitario; si no lo pasas, "
+                        "Odoo usa el precio de lista del producto)."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "item": {
+                                "type": "string",
+                                "description": (
+                                    "Nombre del servicio o producto a "
+                                    "facturar (ej.: 'Manicura "
+                                    "semipermanente'). Se resuelve de forma "
+                                    "aproximada contra el catálogo."
+                                ),
+                            },
+                            "quantity": {
+                                "type": "number",
+                                "description": "Cantidad (default 1).",
+                                "default": 1,
+                            },
+                            "price_unit": {
+                                "type": "number",
+                                "description": (
+                                    "(Opcional) Precio unitario. Si se "
+                                    "omite, Odoo toma el precio de lista del "
+                                    "producto."
+                                ),
+                            },
+                        },
+                        "required": ["item"],
+                    },
+                },
+                "note": {
+                    "type": "string",
+                    "description": (
+                        "(Opcional) Nota libre que se agrega al aviso para "
+                        "el staff sobre la factura."
+                    ),
+                },
+            },
+            "required": ["partner_id", "lines"],
+        },
+    },
 ]
 
 
@@ -2581,6 +2654,13 @@ def _attach_display_text(
                     result["display_text"] = format_my_appointments(result)
             elif kind == "cancellation":
                 result["display_text"] = format_cancellation(result)
+        elif kind == "invoice_created":
+            # Billing formatter. Renders even on success=False so the
+            # customer sees the friendly error (e.g. "ítem no existe").
+            from mcp_odoo.formatters.whatsapp_billing import (
+                format_invoice_created,
+            )
+            result["display_text"] = format_invoice_created(result)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "display_text formatter failed kind=%s channel=%s: %s",
@@ -4635,6 +4715,20 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
                 result, request_channel, kind="cancellation",
             )
             return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    # ----- Billing tools (salon — Odoo 19 account.move + l10n_ec_edi) ----
+    if tool_name == "create_invoice":
+        from mcp_odoo.tools.billing import create_invoice
+        result = create_invoice(
+            *creds,
+            partner_id=int(args["partner_id"]),
+            lines=args.get("lines") or [],
+            note=args.get("note"),
+        )
+        result = _attach_display_text(
+            result, request_channel, kind="invoice_created",
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     raise ValueError(f"Unknown tool: {tool_name}")
 
