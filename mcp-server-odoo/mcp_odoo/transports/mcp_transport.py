@@ -2120,6 +2120,169 @@ MCP_TOOLS = [
             "required": [],
         },
     },
+    # -----------------------------------------------------------------------
+    # Appointment / booking tools (salon — Odoo 19 ``appointment`` module).
+    # -----------------------------------------------------------------------
+    {
+        "name": "list_services",
+        "description": (
+            "Listar los servicios que ofrece el salón (appointment.type) "
+            "con su nombre, duración y precio en USD. Úsala cuando el "
+            "cliente pregunte '¿qué servicios tienen?', '¿cuánto cuesta "
+            "una manicura?', '¿qué hacen?', 'precios', o cuando necesites "
+            "resolver el nombre exacto de un servicio antes de consultar "
+            "disponibilidad o agendar. Acepta un filtro opcional por "
+            "nombre."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "(Opcional) Filtro por nombre del servicio "
+                        "(ilike, sin distinguir mayúsculas). Ej.: "
+                        "'manicura', 'pedicura', 'acrílicas'."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_availability",
+        "description": (
+            "Calcular los HORARIOS LIBRES para un servicio del salón en un "
+            "rango de fechas. Lee el horario laboral del servicio, "
+            "respeta la antelación mínima, descarta los horarios que ya "
+            "tienen una cita y devuelve los espacios libres agrupados por "
+            "día en hora local. Úsala SIEMPRE antes de agendar, cuando el "
+            "cliente pregunte '¿cuándo tienen espacio?', '¿qué horarios "
+            "hay el viernes?', '¿está libre mañana a las 3?'. El nombre "
+            "del servicio se resuelve de forma aproximada; si no estás "
+            "seguro del nombre exacto, usa primero list_services."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "description": (
+                        "Nombre del servicio a consultar (ej.: 'Manicura "
+                        "semipermanente'). Se resuelve de forma aproximada."
+                    ),
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": (
+                        "(Opcional) Fecha inicial 'YYYY-MM-DD' (hora local "
+                        "del salón). Por defecto hoy."
+                    ),
+                },
+                "days_ahead": {
+                    "type": "integer",
+                    "description": (
+                        "(Opcional) Cuántos días hacia adelante escanear "
+                        "desde date_from (default 7, máx 30)."
+                    ),
+                    "default": 7,
+                },
+            },
+            "required": ["service"],
+        },
+    },
+    {
+        "name": "book_appointment",
+        "description": (
+            "Agendar una cita en el calendario del salón para un cliente "
+            "YA identificado. Crea el evento directo en el calendario (sin "
+            "confirmación humana) y le copia los recordatorios "
+            "(email/SMS) configurados para ese servicio. Re-valida que el "
+            "horario siga libre y dentro del horario de atención antes de "
+            "crear; si está ocupado o fuera de horario, devuelve un error "
+            "claro y debes usar get_availability para ofrecer otra hora. "
+            "Úsala cuando el cliente confirme un horario específico (ej.: "
+            "'agéndame el viernes a las 10'). NECESITAS el partner_id del "
+            "cliente identificado y la hora local exacta."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "description": "Nombre del servicio a agendar.",
+                },
+                "partner_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID del cliente en Odoo (res.partner.id). El "
+                        "cliente debe estar identificado primero."
+                    ),
+                },
+                "start_local": {
+                    "type": "string",
+                    "description": (
+                        "Fecha y hora de inicio en hora local del salón, "
+                        "formato 'YYYY-MM-DD HH:MM' (ej.: "
+                        "'2026-06-12 10:00')."
+                    ),
+                },
+            },
+            "required": ["service", "partner_id", "start_local"],
+        },
+    },
+    {
+        "name": "list_my_appointments",
+        "description": (
+            "Listar las citas FUTURAS de un cliente (calendar.event con "
+            "start >= ahora), ordenadas por fecha. Devuelve cada cita con "
+            "servicio, fecha/hora local y un número de referencia "
+            "(event_id) que sirve para cancelar. Úsala cuando el cliente "
+            "pregunte '¿qué citas tengo?', '¿cuándo es mi próxima cita?', "
+            "o antes de cancelar para que el cliente elija cuál."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "partner_id": {
+                    "type": "integer",
+                    "description": "ID del cliente en Odoo (res.partner.id).",
+                },
+            },
+            "required": ["partner_id"],
+        },
+    },
+    {
+        "name": "cancel_appointment",
+        "description": (
+            "Cancelar una cita del cliente. Verifica que la cita esté a "
+            "nombre de ese cliente (partner_id entre los asistentes) antes "
+            "de cancelar; si no le pertenece, la rechaza. Úsala cuando el "
+            "cliente pida cancelar una cita y te dé el número de "
+            "referencia (event_id). Si no lo conoces, usa primero "
+            "list_my_appointments."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "event_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID de la cita a cancelar (calendar.event.id / "
+                        "número de referencia mostrado al cliente)."
+                    ),
+                },
+                "partner_id": {
+                    "type": "integer",
+                    "description": (
+                        "ID del cliente en Odoo (res.partner.id), para "
+                        "autorizar la cancelación."
+                    ),
+                },
+            },
+            "required": ["event_id", "partner_id"],
+        },
+    },
 ]
 
 
@@ -2392,6 +2555,32 @@ def _attach_display_text(
                     recent_movements=result.get("recent_movements") or [],
                     period=result.get("period") or {},
                 )
+        elif kind in (
+            "services", "availability", "booking",
+            "my_appointments", "cancellation",
+        ):
+            # Appointment / booking formatters. booking + cancellation +
+            # availability render even on success=False so the customer
+            # sees the friendly error (e.g. "horario ocupado") verbatim.
+            from mcp_odoo.formatters.whatsapp_appointments import (
+                format_availability,
+                format_booking_confirmation,
+                format_cancellation,
+                format_my_appointments,
+                format_services_list,
+            )
+            if kind == "services":
+                if result.get("success") is not False:
+                    result["display_text"] = format_services_list(result)
+            elif kind == "availability":
+                result["display_text"] = format_availability(result)
+            elif kind == "booking":
+                result["display_text"] = format_booking_confirmation(result)
+            elif kind == "my_appointments":
+                if result.get("success") is not False:
+                    result["display_text"] = format_my_appointments(result)
+            elif kind == "cancellation":
+                result["display_text"] = format_cancellation(result)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "display_text formatter failed kind=%s channel=%s: %s",
@@ -4380,6 +4569,72 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
             limit=args.get("limit", 10),
         )
         return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+    # ----- Appointment / booking tools (salon — Odoo 19 appointment) -----
+    if tool_name in (
+        "list_services",
+        "get_availability",
+        "book_appointment",
+        "list_my_appointments",
+        "cancel_appointment",
+    ):
+        from mcp_odoo.tools.appointments import (
+            book_appointment,
+            cancel_appointment,
+            get_availability,
+            list_my_appointments,
+            list_services,
+        )
+        if tool_name == "list_services":
+            result = list_services(*creds, query=args.get("query"))
+            result = _attach_display_text(
+                result, request_channel, kind="services",
+            )
+            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+        if tool_name == "get_availability":
+            result = get_availability(
+                *creds,
+                service=args["service"],
+                date_from=args.get("date_from"),
+                days_ahead=args.get("days_ahead", 7),
+            )
+            result = _attach_display_text(
+                result, request_channel, kind="availability",
+            )
+            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+        if tool_name == "book_appointment":
+            result = book_appointment(
+                *creds,
+                service=args["service"],
+                partner_id=int(args["partner_id"]),
+                start_local=args["start_local"],
+            )
+            result = _attach_display_text(
+                result, request_channel, kind="booking",
+            )
+            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+        if tool_name == "list_my_appointments":
+            result = list_my_appointments(
+                *creds, partner_id=int(args["partner_id"]),
+            )
+            result = _attach_display_text(
+                result, request_channel, kind="my_appointments",
+            )
+            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+
+        if tool_name == "cancel_appointment":
+            result = cancel_appointment(
+                *creds,
+                event_id=int(args["event_id"]),
+                partner_id=int(args["partner_id"]),
+            )
+            result = _attach_display_text(
+                result, request_channel, kind="cancellation",
+            )
+            return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
     raise ValueError(f"Unknown tool: {tool_name}")
 
