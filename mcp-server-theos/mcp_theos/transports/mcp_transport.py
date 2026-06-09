@@ -1445,7 +1445,13 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "cola de documentos electrónicos', 'cómo está la cola de "
             "firma', 'qué hay en la cola', 'cuántos documentos están "
             "autorizados/enviados/pendientes/en error'. Devuelve "
-            "breakdown completo, no solo errores."
+            "breakdown completo, no solo errores. Cada ejemplo trae "
+            "'monto' YA formateado (ej. '$12.36') — MUESTRA ese, NUNCA el "
+            "'valor' crudo (el punto es decimal, no separador de miles: "
+            "12.357 = $12.36, NO $12,357). Para decidir si un documento en "
+            "error se puede destrabar, usa list_signature_queue_errors "
+            "(trae 'classification.safe_to_reset' por documento); resetea "
+            "solo los safe_to_reset=true con reset_signature_queue_record."
         ),
         "inputSchema": {
             "type": "object",

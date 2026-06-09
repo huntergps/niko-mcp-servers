@@ -389,7 +389,8 @@ async def signature_queue_status(
                         f"{(x.get('sri_punto_emision') or '').strip()}-"
                         f"{(x.get('sri_secuencial') or '').strip()}"
                     ).strip("-"),
-                    "valor": float(x.get("valor") or 0),
+                    "valor": round(float(x.get("valor") or 0), 2),
+                    "monto": f"${round(float(x.get('valor') or 0), 2):,.2f}",
                     "detalle": (x.get("name") or "").strip()[:80],
                     "fecha_doc": str(x.get("fecha_doc") or "")[:10],
                     "obser": (x.get("obser_doc_sri") or "").strip()[:200] or None,
@@ -452,7 +453,8 @@ async def list_signature_queue_errors(
                 f"{(r.get('sri_punto_emision') or '').strip()}-"
                 f"{(r.get('sri_secuencial') or '').strip()}"
             ).strip("-"),
-            "valor": float(r.get("valor") or 0),
+            "valor": round(float(r.get("valor") or 0), 2),
+            "monto": f"${round(float(r.get('valor') or 0), 2):,.2f}",
             "detalle": (r.get("name") or "").strip()[:80],
             "fecha_doc": str(r.get("fecha_doc") or "")[:10],
             "vent_fact_vent": int(r.get("vent_fact_vent") or 0) or None,
