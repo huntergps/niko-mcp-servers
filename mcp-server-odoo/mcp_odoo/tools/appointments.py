@@ -898,6 +898,27 @@ def book_appointment(
     reminder_ids = [int(x) for x in (atype.get("reminder_ids") or [])
                     if isinstance(x, int)]
 
+    # Deposit = 50% of the service price (appointment.type.product_id.
+    # list_price). The salon holds the slot only after a 50% non-refundable
+    # deposit, so the channel needs the amount to request it from the
+    # customer and to register the proof later. Read the price the same way
+    # list_services does; default to 0 when no product/price is configured.
+    deposit_amount = 0.0
+    prod = _flatten_m2o(atype.get("product_id"))
+    if prod:
+        try:
+            prods = odoo_read(
+                tenant_id, url, db, user, password,
+                "product.product", [int(prod["id"])], ["list_price"],
+            )
+            if prods:
+                list_price = float(prods[0].get("list_price") or 0)
+                deposit_amount = round(list_price * 0.5, 2)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "book_appointment: deposit price lookup failed: %s", exc,
+            )
+
     values: dict[str, Any] = {
         "name": event_name,
         "start": start_utc.strftime("%Y-%m-%d %H:%M:%S"),
@@ -931,6 +952,7 @@ def book_appointment(
         "customer_name": resolved_name,
         "phone": resolved_phone,
         "pending_deposit": True,
+        "deposit_amount": deposit_amount,
         "start_local": start_dt_local.strftime("%Y-%m-%d %H:%M"),
         "stop_local": stop_dt_local.strftime("%Y-%m-%d %H:%M"),
         "weekday": _PY_WEEKDAY_LABEL_ES.get(start_dt_local.weekday(), ""),

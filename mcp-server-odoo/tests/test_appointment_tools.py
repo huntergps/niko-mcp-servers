@@ -393,6 +393,76 @@ class TestBookAppointment:
         assert r["success"] is False
         assert r["error_code"] == "invalid_start_local"
 
+    def test_deposit_amount_is_half_list_price(self):
+        """deposit_amount = 50% of the service product's list_price."""
+        from mcp_odoo.tools import appointments as ap
+        fixed_now = datetime(2026, 6, 10, 6, 0, tzinfo=TZ)
+
+        def _fake_search(*a, **k):
+            model = a[5]
+            if model == "appointment.type":
+                return [TYPE_22]
+            if model == "appointment.slot":
+                return SLOTS_22
+            return []
+
+        def _fake_read(*a, **k):
+            model = a[5]
+            if model == "res.partner":
+                return [{"id": 99, "name": "Doña Cliente"}]
+            if model == "res.users":
+                return [{"id": 6, "partner_id": [13, "Liceth"]}]
+            if model == "product.product":
+                # list_price 40.0 → deposit 20.0
+                return [{"id": 23, "list_price": 40.0}]
+            return []
+
+        with patch.object(ap, "odoo_search", side_effect=_fake_search), \
+             patch.object(ap, "odoo_read", side_effect=_fake_read), \
+             patch.object(ap, "odoo_create", side_effect=lambda *a, **k: 777), \
+             self._patch_now(fixed_now):
+            r = ap.book_appointment(
+                *CREDS, service="Manicura", partner_id=99,
+                start_local="2026-06-10 11:00",
+            )
+        assert r["success"] is True
+        assert r["pending_deposit"] is True
+        assert r["deposit_amount"] == 20.0
+
+    def test_deposit_amount_zero_when_no_price(self):
+        """deposit_amount defaults to 0 when the product has no price."""
+        from mcp_odoo.tools import appointments as ap
+        fixed_now = datetime(2026, 6, 10, 6, 0, tzinfo=TZ)
+
+        def _fake_search(*a, **k):
+            model = a[5]
+            if model == "appointment.type":
+                return [TYPE_22]
+            if model == "appointment.slot":
+                return SLOTS_22
+            return []
+
+        def _fake_read(*a, **k):
+            model = a[5]
+            if model == "res.partner":
+                return [{"id": 99, "name": "Doña Cliente"}]
+            if model == "res.users":
+                return [{"id": 6, "partner_id": [13, "Liceth"]}]
+            if model == "product.product":
+                return [{"id": 23, "list_price": 0.0}]
+            return []
+
+        with patch.object(ap, "odoo_search", side_effect=_fake_search), \
+             patch.object(ap, "odoo_read", side_effect=_fake_read), \
+             patch.object(ap, "odoo_create", side_effect=lambda *a, **k: 778), \
+             self._patch_now(fixed_now):
+            r = ap.book_appointment(
+                *CREDS, service="Manicura", partner_id=99,
+                start_local="2026-06-10 11:00",
+            )
+        assert r["success"] is True
+        assert r["deposit_amount"] == 0.0
+
 
 # ---------------------------------------------------------------------------
 # list_my_appointments
