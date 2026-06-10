@@ -654,7 +654,11 @@ def get_availability(
                                   tzinfo=tz)
 
             candidate = window_start
-            while candidate + dur_delta <= window_end:
+            # The salon accepts a booking whose START is within working
+            # hours, even if the service runs past closing (owner rule:
+            # "se aceptan citas hasta las 6pm"). So the latest START is
+            # window_end (inclusive), NOT window_end - duration.
+            while candidate <= window_end:
                 cand_stop = candidate + dur_delta
                 # Respect minimum lead time.
                 if candidate < earliest_local:
@@ -810,9 +814,14 @@ def book_appointment(
     odoo_wd = str(start_dt_local.weekday() + 1)
     day_windows = windows.get(odoo_wd) or []
     start_hour_f = start_dt_local.hour + start_dt_local.minute / 60.0
-    stop_hour_f = start_hour_f + duration
+    # Owner rule: bookings are accepted when the START is within working
+    # hours (the service may run past closing). Normally up to window_end
+    # (6pm); if the customer insists, up to 1h later (7pm). So validate the
+    # START only, with a 1-hour grace on the closing bound. get_availability
+    # only OFFERS up to window_end; this grace covers an explicit late time.
+    _LATE_GRACE_H = 1.0
     inside = any(
-        start_hour_f >= w_start and stop_hour_f <= w_end
+        w_start <= start_hour_f <= w_end + _LATE_GRACE_H
         for w_start, w_end in day_windows
     )
     if not inside:

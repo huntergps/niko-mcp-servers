@@ -319,10 +319,11 @@ class TestBookAppointment:
 
         with patch.object(ap, "odoo_search", side_effect=_fake_search), \
              self._patch_now(fixed_now):
-            # 19:00 is past the 18:00 close.
+            # Owner rule: bookings accepted up to 1h past close (19:00).
+            # 19:30 is beyond that grace -> rejected as outside hours.
             r = ap.book_appointment(
                 *CREDS, service="Manicura", partner_id=99,
-                start_local="2026-06-10 19:00",
+                start_local="2026-06-10 19:30",
             )
         assert r["success"] is False
         assert r["error_code"] == "outside_hours"
