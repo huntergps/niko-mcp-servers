@@ -757,6 +757,8 @@ def _write_informe(
     fechas: list[str],
     table: dict[tuple[str, str], dict[str, float]],
     company_name: str = "MEGA PRIMAVERA GALAPAGOS SA",
+    periodo_from: str | None = None,
+    periodo_to: str | None = None,
 ) -> int:
     """Write the INFORME dashboard sheet using the corporate palette.
 
@@ -870,11 +872,18 @@ def _write_informe(
     # ------------------------------------------------------------------
     # Row 4: period caption
     # ------------------------------------------------------------------
-    if fechas:
-        if len(fechas) == 1:
-            periodo = f"Período: {_fmt_date_es(fechas[0])}"
-        else:
-            periodo = f"Período: {_fmt_date_es(fechas[0])} a {_fmt_date_es(fechas[-1])}"
+    # El "Período" refleja el RANGO SOLICITADO (date_from/date_to), no el
+    # min/max de las fechas presentes en las filas. Razon (reporte 2026-06-10):
+    # un informe del dia 09/06 incluyo 10 lineas de documentos ATRASADOS con
+    # fecha 05/06 (registrados el 09) y el titulo salia "05/06 a 09/06" aunque
+    # el usuario pidio SOLO el 09/06. Las filas atrasadas se siguen mostrando
+    # en su seccion por fecha (es informacion real); solo el titulo cambia.
+    p_from = (periodo_from or "")[:10] or (fechas[0] if fechas else "")
+    p_to = (periodo_to or "")[:10] or (fechas[-1] if fechas else "")
+    if p_from and p_from == p_to:
+        periodo = f"Período: {_fmt_date_es(p_from)}"
+    elif p_from and p_to:
+        periodo = f"Período: {_fmt_date_es(p_from)} a {_fmt_date_es(p_to)}"
     else:
         periodo = "Período: —"
     ws.row_dimensions[4].height = 18
@@ -2805,7 +2814,8 @@ async def generate(
     bodegas, fechas, table = _pivot(rows, bodega_names, familia_names)
     company_name = getattr(client.cfg, "commercial_name", None) or "MEPRIGA"
     last_row = _write_informe(informe_ws, bodegas, fechas, table,
-                              company_name=company_name)
+                              company_name=company_name,
+                              periodo_from=date_from, periodo_to=date_to)
 
     # Sheet creation order = visible tab order. The user wants:
     #   1) INFORME
