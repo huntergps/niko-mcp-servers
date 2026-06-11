@@ -2155,12 +2155,16 @@ MCP_TOOLS = [
             "Calcular los HORARIOS LIBRES para un servicio del salón en un "
             "rango de fechas. Lee el horario laboral del servicio, "
             "respeta la antelación mínima, descarta los horarios que ya "
-            "tienen una cita y devuelve los espacios libres agrupados por "
-            "día en hora local. Úsala SIEMPRE antes de agendar, cuando el "
-            "cliente pregunte '¿cuándo tienen espacio?', '¿qué horarios "
-            "hay el viernes?', '¿está libre mañana a las 3?'. El nombre "
-            "del servicio se resuelve de forma aproximada; si no estás "
-            "seguro del nombre exacto, usa primero list_services."
+            "tienen una cita y devuelve por día RANGOS EXHAUSTIVOS de "
+            "horas de inicio libres (free_ranges, hora local): cualquier "
+            "hora dentro de un rango (pasos de 30 min, extremos incluidos) "
+            "se puede agendar; una hora fuera de todo rango está ocupada "
+            "o fuera del horario de atención. Úsala SIEMPRE antes de "
+            "agendar, cuando el cliente pregunte '¿cuándo tienen "
+            "espacio?', '¿qué horarios hay el viernes?', '¿está libre "
+            "mañana a las 3?'. El nombre del servicio se resuelve de "
+            "forma aproximada; si no estás seguro del nombre exacto, usa "
+            "primero list_services."
         ),
         "inputSchema": {
             "type": "object",

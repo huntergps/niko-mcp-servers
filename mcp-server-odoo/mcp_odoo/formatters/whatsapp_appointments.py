@@ -80,8 +80,6 @@ def format_availability(result: dict | None) -> str:
     if dur:
         lines.append(f"_Duración: {dur}_")
 
-    any_sampled = False
-    windows_seen: list[str] = []
     for day in days:
         weekday = (day.get("weekday") or "").strip()
         date_iso = (day.get("date") or "").strip()
@@ -92,27 +90,29 @@ def format_availability(result: dict | None) -> str:
         except Exception:  # noqa: BLE001
             pass
         header = f"*{weekday} {date_disp}*".strip()
-        slots = day.get("slots") or []
-        labels = [str(s.get("label") or "").strip() for s in slots if s.get("label")]
-        if labels:
-            line = f"{header}: " + " · ".join(labels)
-            # The slots are an even SAMPLE of the day (see get_availability)
-            # — say so, or the customer reads the list as exhaustive.
-            total_free = day.get("total_free")
-            if isinstance(total_free, int) and total_free > len(labels):
-                line += " _(y más)_"
-                any_sampled = True
-                window = (day.get("window") or "").strip()
-                if window and window not in windows_seen:
-                    windows_seen.append(window)
-            lines.append(line)
 
-    if any_sampled and windows_seen:
-        lines.append(
-            f"_Nuestro horario de atención es {', '.join(windows_seen)}; "
-            "si prefieres otra hora dentro de ese horario, dímela y la "
-            "verifico._"
-        )
+        # free_ranges is exhaustive (see get_availability): contiguous
+        # ranges of free start times. Render "libre de 09:00 a 18:00",
+        # "09:00 a 11:30 y 15:00 a 18:00", or "solo a las 15:30".
+        ranges = day.get("free_ranges") or []
+        labels = [str(r.get("label") or "").strip() for r in ranges
+                  if r.get("label")]
+        if labels:
+            if len(labels) == 1 and " a " in labels[0]:
+                lines.append(f"{header}: libre de {labels[0]}")
+            elif len(labels) == 1:
+                lines.append(f"{header}: solo a las {labels[0]}")
+            else:
+                lines.append(f"{header}: " + " y ".join(labels))
+            continue
+
+        # Backward compat: older envelopes carried discrete slots[].
+        slots = day.get("slots") or []
+        slot_labels = [str(s.get("label") or "").strip() for s in slots
+                       if s.get("label")]
+        if slot_labels:
+            lines.append(f"{header}: " + " · ".join(slot_labels))
+
     lines.append(
         "_Dime la hora que prefieres (ej.: «el viernes a las 10:00») y la "
         "agendo._"

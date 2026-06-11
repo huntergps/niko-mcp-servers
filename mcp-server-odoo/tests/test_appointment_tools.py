@@ -214,12 +214,9 @@ class TestGetAvailability:
             )
         assert r["success"] is True
         day = r["days"][0]
-        first_labels = [s["label"] for s in day["slots"]]
-        # 09:00, 09:30, 10:00 must NOT appear (before 11:00 earliest).
-        assert "09:00" not in first_labels
-        assert "09:30" not in first_labels
-        # 11:00 is the first valid candidate (10:00 + 1h lead).
-        assert first_labels[0] == "11:00"
+        # 11:00 is the first valid candidate (10:00 + 1h lead) — earlier
+        # starts must not appear in any free range.
+        assert day["free_ranges"][0]["start_local"].endswith("11:00")
 
     def test_busy_event_discards_overlapping_slot(self):
         from mcp_odoo.tools import appointments as ap
@@ -253,20 +250,17 @@ class TestGetAvailability:
                 *CREDS, service="Manicura", date_from="2026-06-10",
                 days_ahead=1,
             )
-        labels = [s["label"] for s in r["days"][0]["slots"]]
-        # 09:00 candidate (09:00-10:15) overlaps the busy block → excluded.
-        assert "09:00" not in labels
-        # 09:30 (09:30-10:45) still overlaps → excluded.
-        assert "09:30" not in labels
-        # The duration is 1.25h, so a slot at 10:30 (10:30-11:45) is clear.
-        assert "10:30" in labels
+        ranges = r["days"][0]["free_ranges"]
+        # 09:00 (09:00-10:15) and 09:30 (09:30-10:45) overlap the busy
+        # block → the first free range starts at 10:30 (10:30-11:45 clear).
+        assert ranges[0]["start_local"].endswith("10:30")
 
 
-class TestAvailabilitySampling:
-    """The surfaced slots must SPAN the whole day, never just the morning.
+class TestAvailabilityRanges:
+    """Availability must surface EXHAUSTIVE free ranges spanning the day.
 
-    Regression for the Afrodita bug (2026-06): on a fully-free day the old
-    code surfaced the first 6 chronological candidates (09:00-11:30) and the
+    Regression for the Afrodita bug (2026-06): the old code surfaced the
+    first 6 chronological slots (09:00-11:30) on a fully-free day and the
     agent told the customer 'solo hay horarios en la mañana'.
     """
 
@@ -297,41 +291,41 @@ class TestAvailabilitySampling:
                 days_ahead=1,
             )
 
-    def test_free_day_sample_spans_morning_to_closing(self):
+    def test_free_day_is_one_full_range(self):
         r = self._run(busy_events=[])
         assert r["success"] is True
         day = r["days"][0]
-        labels = [s["label"] for s in day["slots"]]
-        # 09:00..18:00 every 30 min = 19 free candidates, 6 surfaced.
-        assert len(labels) == 6
-        assert labels[0] == "09:00"
-        assert labels[-1] == "18:00"  # latest START = window_end (owner rule)
-        assert any(lbl >= "12:00" for lbl in labels), labels  # afternoon shown
-        assert day["total_free"] == 19
+        assert day["free_ranges"] == [{
+            "start_local": "2026-06-12 09:00",
+            "end_local": "2026-06-12 18:00",  # latest START = window_end
+            "label": "09:00 a 18:00",
+        }]
+        assert day["total_free"] == 19  # 09:00..18:00 every 30 min
         assert day["window"] == "09:00 - 18:00"
-        # Explicit not-exhaustive signal for the LLM.
-        assert "muestra" in r.get("note", "")
+        # Semantics note for the LLM is always present.
+        assert "free_ranges" in r.get("note", "")
 
-    def test_no_note_when_all_slots_fit(self):
-        # Busy 09:00-16:45 local → only a handful of late candidates left.
-        busy_start = datetime(2026, 6, 12, 9, 0, tzinfo=TZ).astimezone(
+    def test_midday_busy_block_splits_into_two_ranges(self):
+        # Busy 12:00-13:00 local. Duration 1.25h → candidates whose span
+        # touches 12:00-13:00 drop: 11:00, 11:30, 12:00, 12:30 (13:00 ends
+        # 14:15, clear). Ranges: 09:00-10:30 and 13:00-18:00.
+        busy_start = datetime(2026, 6, 12, 12, 0, tzinfo=TZ).astimezone(
             ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M:%S")
-        busy_stop = datetime(2026, 6, 12, 16, 45, tzinfo=TZ).astimezone(
+        busy_stop = datetime(2026, 6, 12, 13, 0, tzinfo=TZ).astimezone(
             ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M:%S")
         r = self._run(busy_events=[{"start": busy_start, "stop": busy_stop}])
-        day = r["days"][0]
-        assert day["total_free"] == len(day["slots"]) <= 6
-        assert "note" not in r
+        labels = [rg["label"] for rg in r["days"][0]["free_ranges"]]
+        assert labels == ["09:00 a 10:30", "13:00 a 18:00"]
 
-    def test_sample_evenly_helper(self):
-        from mcp_odoo.tools.appointments import _sample_evenly
-        items = list(range(19))
-        out = _sample_evenly(items, 6)
-        assert len(out) == 6
-        assert out[0] == 0 and out[-1] == 18  # first + last always kept
-        assert out == sorted(out)
-        # Already-fitting lists come back untouched.
-        assert _sample_evenly([1, 2, 3], 6) == [1, 2, 3]
+    def test_single_free_candidate_has_point_label(self):
+        from mcp_odoo.tools.appointments import _group_free_ranges
+        c = datetime(2026, 6, 12, 15, 30, tzinfo=TZ)
+        out = _group_free_ranges([c], timedelta(minutes=30))
+        assert out == [{
+            "start_local": "2026-06-12 15:30",
+            "end_local": "2026-06-12 15:30",
+            "label": "15:30",
+        }]
 
 
 # ---------------------------------------------------------------------------
@@ -695,36 +689,54 @@ class TestFormatters:
         assert "Viernes" in text
         assert "10:00" in text
 
-    def test_availability_sampled_day_says_more_exist(self):
+    def test_availability_free_day_renders_full_range(self):
         from mcp_odoo.formatters.whatsapp_appointments import format_availability
         env = {
             "success": True, "service": "Acrílicas básicas",
             "duration_label": "3 h",
             "days": [{
                 "date": "2026-06-12", "weekday": "Viernes",
-                "slots": [{"label": "09:00"}, {"label": "12:00"},
-                          {"label": "18:00"}],
+                "free_ranges": [{"start_local": "2026-06-12 09:00",
+                                 "end_local": "2026-06-12 18:00",
+                                 "label": "09:00 a 18:00"}],
                 "total_free": 19, "window": "09:00 - 18:00",
             }],
         }
         text = format_availability(env)
         _assert_no_markdown_tables(text)
-        assert "(y más)" in text
-        assert "09:00 - 18:00" in text  # working window surfaced
+        assert "libre de 09:00 a 18:00" in text
 
-    def test_availability_full_day_has_no_more_marker(self):
+    def test_availability_split_day_joins_ranges(self):
         from mcp_odoo.formatters.whatsapp_appointments import format_availability
         env = {
             "success": True, "service": "Acrílicas básicas",
             "duration_label": "3 h",
             "days": [{
-                "date": "2026-06-12", "weekday": "Viernes",
-                "slots": [{"label": "16:00"}, {"label": "17:00"}],
-                "total_free": 2, "window": "09:00 - 18:00",
+                "date": "2026-06-13", "weekday": "Sábado",
+                "free_ranges": [
+                    {"label": "09:00 a 11:30"},
+                    {"label": "15:00 a 18:00"},
+                ],
+                "total_free": 13, "window": "09:00 - 18:00",
             }],
         }
         text = format_availability(env)
-        assert "(y más)" not in text
+        assert "09:00 a 11:30 y 15:00 a 18:00" in text
+        assert "libre de" not in text
+
+    def test_availability_single_point_range(self):
+        from mcp_odoo.formatters.whatsapp_appointments import format_availability
+        env = {
+            "success": True, "service": "Acrílicas básicas",
+            "duration_label": "3 h",
+            "days": [{
+                "date": "2026-06-14", "weekday": "Domingo",
+                "free_ranges": [{"label": "15:30"}],
+                "total_free": 1, "window": "09:00 - 18:00",
+            }],
+        }
+        text = format_availability(env)
+        assert "solo a las 15:30" in text
 
     def test_availability_error_surfaces_detail(self):
         from mcp_odoo.formatters.whatsapp_appointments import format_availability
