@@ -58,7 +58,12 @@ _PARTNER_PHONE_FIELDS = ["phone", "mobile"]
 DEFAULT_TZ = "Pacific/Galapagos"
 _SLOT_STEP_MINUTES = 30  # granularity of candidate start times
 _MAX_DAYS_WITH_AVAIL = 3  # cap on days surfaced to the customer
-_MAX_SLOTS_PER_DAY = 6  # cap on free slots per day surfaced
+# Cap on free slots per day SURFACED to the customer. The day is scanned in
+# full and the surfaced slots are sampled EVENLY across all free candidates
+# (first and last always included) — never "the first 6 mornings". See
+# get_availability: truncating chronologically made the agent tell customers
+# "solo hay horarios en la mañana" on fully-free days.
+_MAX_SLOTS_PER_DAY = 6
 
 # Odoo appointment.slot.weekday ('1'=Mon .. '7'=Sun) → Spanish label.
 _WEEKDAY_LABEL_ES = {
@@ -281,6 +286,23 @@ def _read_busy_intervals(
         if st and sp and sp > st:
             busy.append((st, sp))
     return busy
+
+
+def _sample_evenly(items: list, limit: int) -> list:
+    """Pick up to ``limit`` items spread evenly across ``items``.
+
+    Always includes the first and last element so the surfaced sample
+    spans the whole range (e.g. 09:00 AND 17:30 on a free day) instead of
+    clustering at the start. Preserves order; returns ``items`` untouched
+    when it already fits.
+    """
+    n = len(items)
+    if n <= limit or limit <= 0:
+        return list(items)
+    if limit == 1:
+        return [items[0]]
+    idxs = sorted({round(i * (n - 1) / (limit - 1)) for i in range(limit)})
+    return [items[i] for i in idxs]
 
 
 def _overlaps(
@@ -562,8 +584,13 @@ def get_availability(
     -------
     dict
         Envelope with ``success, service, duration_label, timezone,
-        days[]``. Each day: ``date, weekday, slots[]`` where each slot is
-        ``{start_local, label}``. Limited to ~3 days / ~6 slots per day.
+        days[]``. Each day: ``date, weekday, slots[], total_free, window``
+        where each slot is ``{start_local, label}``. ``slots`` holds up to
+        ~6 entries sampled EVENLY across all free candidates of the day
+        (first and last included); ``total_free`` is the real count and
+        ``window`` the day's working hours. A top-level ``note`` is added
+        whenever any day was sampled, so the agent never treats the list
+        as exhaustive. Limited to ~3 days.
     """
     started = time.time()
     creds = (tenant_id, url, db, user, password)
@@ -644,6 +671,10 @@ def get_availability(
         if not day_windows:
             continue
 
+        # Scan the WHOLE day first (every window, every 30-min step) and
+        # only then sample what we surface. Capping mid-scan surfaced only
+        # the first morning slots, and the agent wrongly told customers
+        # "solo hay horarios en la mañana" on days that were free all day.
         free_slots: list[dict] = []
         for start_h, end_h in sorted(day_windows):
             sh, smm = _float_hour_to_hm(start_h)
@@ -674,17 +705,21 @@ def get_availability(
                     "start_local": candidate.strftime("%Y-%m-%d %H:%M"),
                     "label": candidate.strftime("%H:%M"),
                 })
-                if len(free_slots) >= _MAX_SLOTS_PER_DAY:
-                    break
                 candidate += step
-            if len(free_slots) >= _MAX_SLOTS_PER_DAY:
-                break
 
         if free_slots:
+            shown = _sample_evenly(free_slots, _MAX_SLOTS_PER_DAY)
+            wd_start_h, wd_start_m = _float_hour_to_hm(
+                min(w[0] for w in day_windows))
+            wd_end_h, wd_end_m = _float_hour_to_hm(
+                max(w[1] for w in day_windows))
             days_out.append({
                 "date": day.isoformat(),
                 "weekday": _PY_WEEKDAY_LABEL_ES.get(day.weekday(), ""),
-                "slots": free_slots,
+                "slots": shown,
+                "total_free": len(free_slots),
+                "window": (f"{wd_start_h:02d}:{wd_start_m:02d}"
+                           f" - {wd_end_h:02d}:{wd_end_m:02d}"),
             })
         if len(days_out) >= _MAX_DAYS_WITH_AVAIL:
             break
@@ -699,6 +734,17 @@ def get_availability(
         "days": days_out,
         "display_type": "list_data",
     }
+    # Explicit signal for the LLM: the surfaced slots are a SAMPLE, not the
+    # exhaustive list. Without this the agent answers "no hay más horarios"
+    # for any time absent from the sample.
+    if any(d["total_free"] > len(d["slots"]) for d in days_out):
+        result["note"] = (
+            "Los horarios mostrados son una muestra distribuida del día; "
+            "hay más horarios libres (ver total_free y window por día). "
+            "Si el cliente pide una hora específica dentro del horario de "
+            "atención, agéndala directamente con book_appointment — esa "
+            "herramienta valida disponibilidad real."
+        )
     _log_call("get_availability", tenant_id, log_args,
               {"days_with_avail": len(days_out)}, None,
               int((time.time() - started) * 1000))
