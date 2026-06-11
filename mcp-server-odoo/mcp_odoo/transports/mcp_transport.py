@@ -2162,7 +2162,11 @@ MCP_TOOLS = [
             "o fuera del horario de atención. Úsala SIEMPRE antes de "
             "agendar, cuando el cliente pregunte '¿cuándo tienen "
             "espacio?', '¿qué horarios hay el viernes?', '¿está libre "
-            "mañana a las 3?'. El nombre del servicio se resuelve de "
+            "mañana a las 3?'. Los resultados valen SOLO para el turno "
+            "actual: la agenda cambia minuto a minuto, así que NUNCA "
+            "afirmes que no hay disponibilidad basándote en respuestas "
+            "de turnos anteriores — vuelve a llamar esta herramienta. "
+            "El nombre del servicio se resuelve de "
             "forma aproximada; si no estás seguro del nombre exacto, usa "
             "primero list_services."
         ),
