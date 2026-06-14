@@ -1747,8 +1747,10 @@ MCP_TOOLS = [
         "name": "lookup_sri",
         "description": (
             "Consultar datos de una persona o empresa en el SRI (Servicio de Rentas Internas) "
-            "por cedula (10 digitos) o RUC (13 digitos). Devuelve nombre completo, estado "
-            "tributario, actividad economica, direccion de establecimientos. "
+            "por cedula (10 digitos) o RUC (13 digitos). Devuelve nombre/razon social, estado "
+            "tributario, regimen, actividad economica, representantes legales (empresas), "
+            "banderas (contribuyente fantasma, transacciones inexistentes), fechas y "
+            "direccion de todos los establecimientos. "
             "Usa esto cuando identify_customer no encuentre al cliente en Odoo — "
             "el SRI puede tener sus datos para crear el perfil."
         ),
@@ -5080,6 +5082,7 @@ async def _lookup_sri(cedula_ruc: str) -> str:
                 if isinstance(data, dict) and data.get("nombreCompleto"):
                     result["nombre"] = data["nombreCompleto"]
                     result["tipo_persona"] = data.get("tipoPersona", "")
+                    result["codigo_persona"] = data.get("codigoPersona", "")
         except Exception:
             pass
 
@@ -5098,9 +5101,28 @@ async def _lookup_sri(cedula_ruc: str) -> str:
                     result["estado"] = contrib.get("estadoContribuyenteRuc", "")
                     result["tipo_contribuyente"] = contrib.get("tipoContribuyente", "")
                     result["regimen"] = contrib.get("regimen", "")
+                    result["categoria"] = contrib.get("categoria") or ""
                     result["obligado_contabilidad"] = contrib.get("obligadoLlevarContabilidad", "")
                     result["agente_retencion"] = contrib.get("agenteRetencion", "")
                     result["contribuyente_especial"] = contrib.get("contribuyenteEspecial", "")
+                    # Fraud / status flags the SRI exposes — useful to flag a
+                    # risky counterparty before creating the partner.
+                    result["contribuyente_fantasma"] = contrib.get("contribuyenteFantasma", "")
+                    result["transacciones_inexistente"] = contrib.get("transaccionesInexistente", "")
+                    result["motivo_cancelacion_suspension"] = (
+                        contrib.get("motivoCancelacionSuspension") or ""
+                    )
+                    # Legal representatives (companies / tipo_persona=JUR).
+                    reps_raw = contrib.get("representantesLegales") or []
+                    if isinstance(reps_raw, list):
+                        result["representantes_legales"] = [
+                            {
+                                "identificacion": r.get("identificacion", ""),
+                                "nombre": r.get("nombre", ""),
+                            }
+                            for r in reps_raw
+                            if isinstance(r, dict)
+                        ]
                     # All activities from all records
                     actividades = []
                     for c in data:
@@ -5109,9 +5131,12 @@ async def _lookup_sri(cedula_ruc: str) -> str:
                             actividades.append(act)
                     result["actividades"] = actividades
                     result["actividad_principal"] = actividades[0] if actividades else ""
-                    # Dates
+                    # Dates — keep the full lifecycle, not just the start.
                     fechas = contrib.get("informacionFechasContribuyente") or {}
                     result["fecha_inicio"] = fechas.get("fechaInicioActividades", "")
+                    result["fecha_cese"] = fechas.get("fechaCese", "")
+                    result["fecha_reinicio"] = fechas.get("fechaReinicioActividades", "")
+                    result["fecha_actualizacion"] = fechas.get("fechaActualizacion", "")
         except Exception:
             pass
 
