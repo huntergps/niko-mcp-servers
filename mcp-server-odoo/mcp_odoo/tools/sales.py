@@ -1314,9 +1314,25 @@ def odoo_list_quotations(
     total, subtotal, date_order, lines_count, report_url{html,pdf}}]}
     """
     started = time.time()
+    # The LLM (and MCP arg passing) routinely sends numeric args as STRINGS
+    # ("62"), and Odoo's domain needs a real int — ["partner_id","=","62"]
+    # matches nothing. Verified in prod 2026-06-17: a B2C customer asking
+    # for "mis proformas" got partner_id="62" (str) → the isinstance check
+    # below returned invalid_partner_id → the bot answered "no puedo
+    # ayudarte" despite 20 real quotations existing. Coerce to int up front
+    # so both the validation and the Odoo domain are correct regardless of
+    # how the caller typed it. ``limit`` gets the same treatment.
+    try:
+        partner_id = int(partner_id)
+    except (ValueError, TypeError):
+        return {"success": False, "error_code": "invalid_partner_id"}
+    try:
+        limit = int(limit)
+    except (ValueError, TypeError):
+        limit = 10
     log_args = {"partner_id": partner_id, "limit": limit, "states": states}
 
-    if not isinstance(partner_id, int) or partner_id <= 0:
+    if partner_id <= 0:
         return {"success": False, "error_code": "invalid_partner_id"}
 
     states = states or ["draft", "sent", "sale", "done"]
