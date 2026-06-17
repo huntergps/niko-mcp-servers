@@ -6873,6 +6873,126 @@ async def _rag_search(
                 for pid, data in live.items()}
         await _apply_pricelist_to_live(tenant_id, _effective_partner_id, live)
 
+    # ── In-stock-by-category merge (Bug: "ninguno con stock") ─────────
+    # The semantic pool above is capped at ``candidate_k`` (~100) by
+    # cosine similarity. Real catalogs have THOUSANDS of items per
+    # category, so the few SKUs that actually have stock can rank far
+    # beyond the pool (verified: for "laptop" the 3 in-stock notebooks
+    # ranked at positions ~247/299/480 in a 1252-product category). The
+    # downstream "in-stock first" re-rank then never sees them and the
+    # bot wrongly reports "ninguno con stock".
+    #
+    # Fix: we DO NOT filter out-of-stock items (the customer may want a
+    # proforma for something agotado). Instead we GUARANTEE that the
+    # in-stock items of the categories already present in the semantic
+    # pool get into the pool, and let the existing re-rank float them up.
+    #
+    # This block is fully defensive: any failure (no Odoo, RPC error,
+    # missing categories) logs and falls through to the current behaviour
+    # without raising. It must run BEFORE the re-rank and BEFORE the
+    # query cache write so pagination uses the complete list.
+    try:
+        from mcp_odoo.tools.generic import odoo_search as _cat_search
+
+        tc_for_cat = await _get_tenant_config_by_id(tenant_id)
+        if tc_for_cat and tc_for_cat.get("url"):
+            # ids already in the pool (so we never re-fetch / dupe them)
+            existing_ids: set[int] = {
+                oid for oid in (
+                    (r.get("odoo_id") or (r.get("metadata") or {}).get("odoo_id"))
+                    for r in results
+                )
+                if isinstance(oid, int)
+            }
+
+            # ``_fetch_products_live`` only keeps the category NAME
+            # (``_live["category"]`` = ``categ_id[1]``), not the numeric
+            # id. We need the ids to query by ``categ_id in [...]``, so do
+            # a single light read of ``categ_id`` for the pooled ids.
+            cat_ids: set[int] = set()
+            if existing_ids:
+                cat_rows = _cat_search(
+                    tc_for_cat["tenant_id"], tc_for_cat["url"],
+                    tc_for_cat["db"], tc_for_cat["user"],
+                    tc_for_cat["password"],
+                    "product.template",
+                    [["id", "in", list(existing_ids)]],
+                    fields=["id", "categ_id"],
+                    limit=len(existing_ids),
+                )
+                for cr in (cat_rows or []):
+                    categ = cr.get("categ_id")
+                    # Odoo returns categ_id as [id, "name"]
+                    if isinstance(categ, list) and categ and isinstance(categ[0], int):
+                        cat_ids.add(categ[0])
+
+            if cat_ids:
+                # Bring ONLY the in-stock items of those categories that
+                # aren't already pooled. Capped so we never drag thousands
+                # of rows into the page (most categories have <80 in-stock
+                # SKUs; if more, the most relevant ones are already in the
+                # semantic pool anyway).
+                _MERGE_LIMIT = 80
+                instock_rows = _cat_search(
+                    tc_for_cat["tenant_id"], tc_for_cat["url"],
+                    tc_for_cat["db"], tc_for_cat["user"],
+                    tc_for_cat["password"],
+                    "product.template",
+                    [
+                        ["categ_id", "in", list(cat_ids)],
+                        ["qty_available", ">", 0],
+                        ["active", "=", True],
+                        ["id", "not in", list(existing_ids)],
+                    ],
+                    fields=["id"],
+                    limit=_MERGE_LIMIT,
+                )
+                new_ids: list[int] = [
+                    row["id"] for row in (instock_rows or [])
+                    if isinstance(row.get("id"), int)
+                    and row["id"] not in existing_ids
+                ]
+
+                if new_ids:
+                    # Read live data + apply the SAME pricelist as the
+                    # rest of the pool so prices stay consistent.
+                    new_live = await _fetch_products_live(tenant_id, new_ids)
+                    if _effective_partner_id and new_live:
+                        new_live = {
+                            pid: dict(data) if isinstance(data, dict) else data
+                            for pid, data in new_live.items()
+                        }
+                        await _apply_pricelist_to_live(
+                            tenant_id, _effective_partner_id, new_live,
+                        )
+                    # Fold the new live data into the shared ``live`` map
+                    # so the re-rank below picks it up uniformly.
+                    for pid, data in new_live.items():
+                        if pid not in live:
+                            live[pid] = data
+                    # Append synthetic candidate rows. The re-rank reads
+                    # ``odoo_id`` + ``live[odoo_id]["qty"]`` only, so a
+                    # minimal row is enough; it will be classified
+                    # in_stock and floated to the front.
+                    added = 0
+                    for pid in new_ids:
+                        if pid in existing_ids:
+                            continue
+                        results.append({"odoo_id": pid})
+                        existing_ids.add(pid)
+                        added += 1
+                    print(
+                        f"[RAG] in-stock-by-category merge: added {added} "
+                        f"in-stock items from {len(cat_ids)} categories "
+                        f"(pool now {len(results)})",
+                        flush=True,
+                    )
+    except Exception as _merge_exc:
+        print(
+            f"[RAG] in-stock-by-category merge failed (non-fatal): {_merge_exc}",
+            flush=True,
+        )
+
     # ── Re-rank: in-stock first, out-of-stock second ─────────────────
     # The RAG returned candidate_k products by semantic relevance.
     # Within that pool, we prefer products with stock > 0 because no
