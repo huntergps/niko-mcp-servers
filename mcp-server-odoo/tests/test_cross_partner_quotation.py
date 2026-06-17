@@ -153,12 +153,17 @@ class TestCrossPartnerQuotationBlock:
 
 class TestCrossPartnerListQuotations:
     """list_quotations / get_latest_quotation / get_active_quotation
-    accept ``partner_id`` directly — the LLM passing the wrong id must
-    be short-circuited.
+    accept ``partner_id`` directly. The LLM passing the WRONG id (or none)
+    is no longer rejected — the C1b partner-scope override (2026-06-17)
+    rewrites ``partner_id`` to the pinned ``expected_partner_id`` so the
+    tool always runs against the identified customer's own data.
     """
 
     @pytest.mark.asyncio
-    async def test_list_quotations_blocked_when_arg_partner_differs(self):
+    async def test_list_quotations_overrides_wrong_arg_partner(self):
+        """LLM passes the customer's CÉDULA (wrong partner_id) → override
+        rewrites it to the pinned partner and the tool RUNS with id 42.
+        """
         from mcp_odoo.transports import mcp_transport as t
 
         with patch.object(
@@ -166,20 +171,47 @@ class TestCrossPartnerListQuotations:
         ), patch(
             "mcp_odoo.tools.sales.odoo_list_quotations"
         ) as mock_list:
+            mock_list.return_value = {"success": True, "orders": []}
+
             req = _make_request(expected_partner="42")
+            # 1500501968 = the customer's cédula the LLM fumbled in as id.
             result_json = await t._execute_tool(
-                req, "list_quotations", {"partner_id": 99},
+                req, "list_quotations", {"partner_id": "1500501968"},
             )
 
         data = json.loads(result_json)
-        assert data["success"] is False
-        assert data["error_code"] == "cross_partner_quotation"
-        assert data["expected_partner_id"] == 42
-        # Real tool MUST NOT have been invoked.
-        mock_list.assert_not_called()
+        assert data["success"] is True
+        # Tool actually executed, and with the authoritative partner_id.
+        mock_list.assert_called_once()
+        # odoo_list_quotations(*creds, partner_id, limit, states) — the
+        # partner_id is the first positional after the 5 creds.
+        called_partner = mock_list.call_args.args[5]
+        assert called_partner == 42
 
     @pytest.mark.asyncio
-    async def test_get_latest_quotation_blocked_when_arg_partner_differs(self):
+    async def test_list_quotations_overrides_absent_arg_partner(self):
+        """LLM omits partner_id entirely → override injects the pinned id."""
+        from mcp_odoo.transports import mcp_transport as t
+
+        with patch.object(
+            t, "_get_tenant_config", new=AsyncMock(return_value=_TENANT_CFG)
+        ), patch(
+            "mcp_odoo.tools.sales.odoo_list_quotations"
+        ) as mock_list:
+            mock_list.return_value = {"success": True, "orders": []}
+
+            req = _make_request(expected_partner="62")
+            result_json = await t._execute_tool(
+                req, "list_quotations", {},
+            )
+
+        data = json.loads(result_json)
+        assert data["success"] is True
+        mock_list.assert_called_once()
+        assert mock_list.call_args.args[5] == 62
+
+    @pytest.mark.asyncio
+    async def test_get_latest_quotation_overrides_wrong_arg_partner(self):
         from mcp_odoo.transports import mcp_transport as t
 
         with patch.object(
@@ -187,15 +219,66 @@ class TestCrossPartnerListQuotations:
         ), patch(
             "mcp_odoo.tools.sales.get_latest_quotation"
         ) as mock_latest:
-            req = _make_request(expected_partner="42")
+            mock_latest.return_value = {"success": True, "order_id": None}
+
+            req = _make_request(expected_partner="62")
             result_json = await t._execute_tool(
-                req, "get_latest_quotation", {"partner_id": 99},
+                req, "get_latest_quotation", {"partner_id": "1500501968"},
             )
 
         data = json.loads(result_json)
-        assert data["success"] is False
-        assert data["error_code"] == "cross_partner_quotation"
-        mock_latest.assert_not_called()
+        assert data["success"] is True
+        mock_latest.assert_called_once()
+        # get_latest_quotation(*creds, partner_id=..., states=...) — kwarg.
+        assert mock_latest.call_args.kwargs["partner_id"] == 62
+
+    @pytest.mark.asyncio
+    async def test_get_latest_quotation_overrides_absent_arg_partner(self):
+        from mcp_odoo.transports import mcp_transport as t
+
+        with patch.object(
+            t, "_get_tenant_config", new=AsyncMock(return_value=_TENANT_CFG)
+        ), patch(
+            "mcp_odoo.tools.sales.get_latest_quotation"
+        ) as mock_latest:
+            mock_latest.return_value = {"success": True, "order_id": None}
+
+            req = _make_request(expected_partner="62")
+            result_json = await t._execute_tool(
+                req, "get_latest_quotation", {},
+            )
+
+        data = json.loads(result_json)
+        assert data["success"] is True
+        mock_latest.assert_called_once()
+        assert mock_latest.call_args.kwargs["partner_id"] == 62
+
+    @pytest.mark.asyncio
+    async def test_partner_scope_not_overridden_when_header_absent(self):
+        """B2B sellers / unidentified B2C: no header → no override.
+
+        The LLM-supplied partner_id is passed through untouched, so a
+        seller can still list any customer's quotations.
+        """
+        from mcp_odoo.transports import mcp_transport as t
+
+        with patch.object(
+            t, "_get_tenant_config", new=AsyncMock(return_value=_TENANT_CFG)
+        ), patch(
+            "mcp_odoo.tools.sales.odoo_list_quotations"
+        ) as mock_list:
+            mock_list.return_value = {"success": True, "orders": []}
+
+            req = _make_request(expected_partner=None)
+            result_json = await t._execute_tool(
+                req, "list_quotations", {"partner_id": 99},
+            )
+
+        data = json.loads(result_json)
+        assert data["success"] is True
+        mock_list.assert_called_once()
+        # Untouched — seller's chosen partner is honoured.
+        assert mock_list.call_args.args[5] == 99
 
     @pytest.mark.asyncio
     async def test_list_quotations_passes_when_same_partner(self):

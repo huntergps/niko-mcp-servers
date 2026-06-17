@@ -3101,6 +3101,59 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
         int(_epid_str) if _epid_str.isdigit() else None
     )
 
+    # C1b — Route customer-scoped CONSULTA tools to the identified partner
+    # (2026-06-17). Production incident: a B2C-identified customer
+    # (partner_id=62) asked "mis proformas"; the LLM (Llama-3.3-70B) called
+    # ``get_latest_quotation`` / ``list_quotations`` with the customer's
+    # CÉDULA ("1500501968") as partner_id — a non-existent partner id — and
+    # got an empty result. Rather than REJECT the wrong/absent id (which
+    # surfaces a confusing "esa cotización es de otro cliente" to a customer
+    # asking for HIS OWN data), we OVERRIDE the ``partner_id`` argument with
+    # the authoritative ``expected_partner_id`` the orchestrator pinned for
+    # this B2C session. Code routes to the right customer; the LLM's fumbled
+    # id becomes irrelevant.
+    #
+    # SCOPE (deliberate): this override covers ONLY the quotation list/
+    # resolve tools, which is exactly what the incident concerns ("mis
+    # proformas"). The OTP-gated financial tools (get_customer_invoices /
+    # get_customer_payments / get_customer_statement / check_balance /
+    # get_customer_credit_status) are intentionally EXCLUDED: they have
+    # their own stricter cross-partner REJECT (``cross_partner_invoice``)
+    # guarding sensitive financial data behind an OTP-verified identity.
+    # Silently rewriting their partner_id would WEAKEN that security model
+    # (e.g. it would mask an LLM/header mismatch instead of refusing), so
+    # those tools keep rejecting on mismatch.
+    #
+    # The by-id guard set (`order_id`/`line_id`) below is NOT touched
+    # either — those operate on a specific document, not a customer scope,
+    # and the cross-partner reject there is correct.
+    #
+    # Defensive: only override when ``expected_partner_id`` is present and
+    # numeric (it is, parsed via isdigit above). When the header is ABSENT
+    # (B2B sellers, unidentified B2C) ``expected_partner_id`` is None → no
+    # override → current behavior preserved.
+    _PARTNER_SCOPED_QUERY_TOOLS = {
+        "list_quotations": "partner_id",
+        "get_latest_quotation": "partner_id",
+        "get_active_quotation": "partner_id",
+    }
+    if expected_partner_id and tool_name in _PARTNER_SCOPED_QUERY_TOOLS:
+        _scope_arg = _PARTNER_SCOPED_QUERY_TOOLS[tool_name]
+        _prev = args.get(_scope_arg)
+        args[_scope_arg] = expected_partner_id
+        # Compare normalized ints so "62" vs 62 isn't logged as a change.
+        try:
+            _prev_int = int(_prev) if _prev not in (None, "") else None
+        except (TypeError, ValueError):
+            _prev_int = None
+        if _prev_int != expected_partner_id:
+            logger.info(
+                "C1b partner-scope override: tool=%s tenant=%s arg=%s "
+                "llm_supplied=%r -> expected_partner_id=%s",
+                tool_name, tc["tenant_id"], _scope_arg, _prev,
+                expected_partner_id,
+            )
+
     # Tools whose result envelope must belong to ``expected_partner_id``.
     # We resolve the underlying sale.order.partner_id via a single
     # odoo_read and short-circuit with a ``cross_partner_quotation``
@@ -3217,6 +3270,13 @@ async def _execute_tool(request: Request, tool_name: str, args: dict) -> str:
     # get_latest_quotation / list_quotations / get_active_quotation take
     # ``partner_id`` directly — if the LLM passed someone else's id,
     # reject up front so we don't expose the other customer's list.
+    #
+    # NOTE (2026-06-17): the C1b partner-scope override above already
+    # rewrites ``partner_id`` to ``expected_partner_id`` for these three
+    # tools, so this block is now a NO-OP whenever the header is present
+    # (arg always == expected after the override). It is kept as
+    # defence-in-depth — if the override set is ever trimmed this guard
+    # still prevents a cross-partner list from leaking.
     if (
         expected_partner_id
         and tool_name in {
