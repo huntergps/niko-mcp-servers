@@ -6887,10 +6887,26 @@ async def _rag_search(
     # in-stock items of the categories already present in the semantic
     # pool get into the pool, and let the existing re-rank float them up.
     #
+    # INTENT-AWARE (v2, prod 2026-06-17): the merge must pull in-stock
+    # ONLY from the categories relevant to the query, not from every
+    # category in the pool. Real bug: query "laptop" pooled items from 5
+    # categories incl. "REPUESTOS" which has hundreds of small in-stock
+    # parts. The flat ``limit 80`` filled up with REPUESTOS parts and
+    # never reached the 3 in-stock laptops in cat 19. Then the downstream
+    # intent filter (kind=laptop) dropped all those parts → "ninguno con
+    # stock" again. So we filter ``cat_ids`` by the intent rule's
+    # ``category_hints`` (substring match on the category NAME) before the
+    # in-stock query.
+    #
+    # ``intent_rule`` is computed ONCE here and reused by the kind filter
+    # further down (avoids classifying the query twice).
+    #
     # This block is fully defensive: any failure (no Odoo, RPC error,
     # missing categories) logs and falls through to the current behaviour
     # without raising. It must run BEFORE the re-rank and BEFORE the
     # query cache write so pagination uses the complete list.
+    intent_rule = _classify_product_intent(query)
+    intent_kind = intent_rule.get("kind") if intent_rule else None
     try:
         from mcp_odoo.tools.generic import odoo_search as _cat_search
 
@@ -6908,8 +6924,9 @@ async def _rag_search(
             # ``_fetch_products_live`` only keeps the category NAME
             # (``_live["category"]`` = ``categ_id[1]``), not the numeric
             # id. We need the ids to query by ``categ_id in [...]``, so do
-            # a single light read of ``categ_id`` for the pooled ids.
-            cat_ids: set[int] = set()
+            # a single light read of ``categ_id`` for the pooled ids. We
+            # keep BOTH id and name so we can filter by intent hints.
+            cat_names: dict[int, str] = {}
             if existing_ids:
                 cat_rows = _cat_search(
                     tc_for_cat["tenant_id"], tc_for_cat["url"],
@@ -6924,7 +6941,44 @@ async def _rag_search(
                     categ = cr.get("categ_id")
                     # Odoo returns categ_id as [id, "name"]
                     if isinstance(categ, list) and categ and isinstance(categ[0], int):
-                        cat_ids.add(categ[0])
+                        cat_names[categ[0]] = (
+                            categ[1] if len(categ) > 1 and isinstance(categ[1], str)
+                            else ""
+                        )
+
+            cat_ids: set[int] = set(cat_names.keys())
+
+            # Intent-aware narrowing: keep only categories whose NAME
+            # matches one of the intent rule's category_hints. This
+            # prevents an unrelated, stock-heavy category (REPUESTOS)
+            # from crowding out the relevant one (Laptops) under the
+            # in-stock query's limit. If hints exist but match nothing,
+            # fall back to ALL pool categories so the merge never silently
+            # no-ops on a vocab mismatch.
+            if intent_rule and cat_ids:
+                hints = [
+                    h.lower() for h in intent_rule.get("category_hints", []) if h
+                ]
+                if hints:
+                    hinted = {
+                        cid for cid, cname in cat_names.items()
+                        if any(h in (cname or "").lower() for h in hints)
+                    }
+                    if hinted:
+                        print(
+                            f"[RAG] merge intent={intent_kind}: narrowed "
+                            f"{len(cat_ids)}→{len(hinted)} categories via "
+                            f"category_hints",
+                            flush=True,
+                        )
+                        cat_ids = hinted
+                    else:
+                        print(
+                            f"[RAG] merge intent={intent_kind}: no category "
+                            f"name matched hints {hints}; keeping all "
+                            f"{len(cat_ids)} pool categories",
+                            flush=True,
+                        )
 
             if cat_ids:
                 # Bring ONLY the in-stock items of those categories that
@@ -7026,8 +7080,8 @@ async def _rag_search(
     # out "TECLADO PARA LAPTOP HP"). When the filter would leave zero
     # rows we keep the unfiltered list so the customer still gets
     # options (better than "no encontré").
-    intent_rule = _classify_product_intent(query)
-    intent_kind = intent_rule.get("kind") if intent_rule else None
+    # ``intent_rule`` / ``intent_kind`` were already computed above the
+    # in-stock-by-category merge — reuse them (no second classification).
     if intent_rule:
         filtered, dropped = _apply_kind_filter(ranked, intent_rule)
         if filtered:

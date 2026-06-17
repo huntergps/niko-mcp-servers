@@ -214,6 +214,194 @@ class TestInStockCategoryMerge:
         assert codes  # sanity
 
     @pytest.mark.asyncio
+    async def test_merge_narrows_to_intent_relevant_category(self):
+        """Prod bug (2026-06-17): the pool spans an intent-relevant
+        category (Laptops) and an unrelated stock-heavy one (REPUESTOS).
+        Without intent narrowing the flat ``limit 80`` filled with
+        REPUESTOS parts and the in-stock laptop never made it in, then
+        the kind filter dropped the parts → "ninguno con stock".
+
+        With the fix, the merge must:
+          1. query in-stock ONLY for the Laptops category id,
+          2. so the in-stock laptop is merged + ranked first,
+          3. and the (irrelevant) REPUESTOS category is never queried."""
+        from mcp_odoo.transports import mcp_transport as t
+
+        mock_tc = {
+            "tenant_id": "tenant-uuid",
+            "url": "http://fake:8069",
+            "db": "fake", "user": "u", "password": "p",
+        }
+
+        # Pool: 1 agotado laptop (cat 19 Laptops) + 1 in-stock repuesto
+        # (cat 76 REPUESTOS). Both are in the semantic pool for "laptop".
+        LAPTOP_CAT = 19
+        REPUESTOS_CAT = 76
+        pool_ids = [100, 200]
+        # The in-stock laptop that ranks beyond the pool (the one the
+        # customer actually wants).
+        instock_laptop = 17883
+        # An in-stock repuesto Odoo WOULD return if we queried REPUESTOS.
+        instock_repuesto = 50000
+
+        live_map = {
+            100: _live(100, "LAPTOP HP agotada", qty=0, category="PC / Laptops"),
+            200: _live(200, "MEMORIA RAM", qty=15, category="PC / REPUESTOS"),
+            17883: _live(
+                17883, "LAPTOP LENOVO IDEAPAD", qty=4, category="PC / Laptops",
+            ),
+            50000: _live(
+                50000, "DISIPADOR DE CALOR", qty=99, category="PC / REPUESTOS",
+            ),
+        }
+
+        async def _fake_live(tenant_id, ids):
+            return {pid: live_map[pid] for pid in ids if pid in live_map}
+
+        instock_domains: list = []
+
+        def _fake_search(*args, **kwargs):
+            domain = args[6]
+            is_instock_query = any(
+                isinstance(c, list) and c and c[0] == "qty_available"
+                for c in domain
+            )
+            if is_instock_query:
+                instock_domains.append(domain)
+                # Mimic Odoo honoring categ_id filter: only return rows
+                # whose category is in the queried cat list.
+                cat_clause = next(
+                    (c for c in domain if isinstance(c, list) and c and c[0] == "categ_id"),
+                    None,
+                )
+                queried = set(cat_clause[2]) if cat_clause else set()
+                out = []
+                if LAPTOP_CAT in queried:
+                    out.append({"id": instock_laptop})
+                if REPUESTOS_CAT in queried:
+                    out.append({"id": instock_repuesto})
+                return out
+            # categ_id read: pool item 100 in Laptops, 200 in REPUESTOS.
+            return [
+                {"id": 100, "categ_id": [LAPTOP_CAT, "PC / Laptops"]},
+                {"id": 200, "categ_id": [REPUESTOS_CAT, "PC / REPUESTOS"]},
+            ]
+
+        fake_client = _semantic_client_factory(pool_ids)
+
+        with (
+            patch.object(
+                t, "_get_tenant_config_by_id",
+                AsyncMock(return_value=mock_tc),
+            ),
+            patch.object(t, "_get_tenant_slug", AsyncMock(return_value="tecnosmart")),
+            patch.object(t, "_fetch_products_live", AsyncMock(side_effect=_fake_live)),
+            patch.object(t, "_apply_pricelist_to_live", AsyncMock(return_value=None)),
+            patch("mcp_odoo.tools.generic.odoo_search", side_effect=_fake_search),
+            patch("httpx.AsyncClient", fake_client),
+        ):
+            result = await t._rag_search(
+                query="laptop", top_k=10, offset=0, tenant_id="tenant-uuid",
+            )
+
+        env = _decode(result)
+        template_ids = [r["template_id"] for r in env["rows"]]
+
+        # 1. The in-stock query targeted ONLY the Laptops category.
+        assert instock_domains, "in-stock query never ran"
+        cat_clause = next(
+            (c for c in instock_domains[0]
+             if isinstance(c, list) and c and c[0] == "categ_id"),
+            None,
+        )
+        assert cat_clause is not None
+        assert set(cat_clause[2]) == {LAPTOP_CAT}, (
+            f"merge queried {cat_clause[2]} — should be only Laptops "
+            f"({LAPTOP_CAT}), not REPUESTOS ({REPUESTOS_CAT})"
+        )
+
+        # 2. The in-stock laptop was merged in and ranks first.
+        assert instock_laptop in template_ids, (
+            f"in-stock laptop missing from {template_ids}"
+        )
+        assert template_ids[0] == instock_laptop, (
+            f"expected in-stock laptop first, got {template_ids}"
+        )
+
+        # 3. The REPUESTOS in-stock item was NEVER merged (and the kind
+        #    filter would have dropped it anyway).
+        assert instock_repuesto not in template_ids
+        # The agotado laptop survives; the pool repuesto (200) is dropped
+        # by the kind filter, which is fine — point is the laptop has stock.
+        assert 100 in template_ids
+
+    @pytest.mark.asyncio
+    async def test_merge_falls_back_to_all_cats_when_hints_miss(self):
+        """If the intent hints match NO pool category name (vocab
+        mismatch), the merge must NOT silently no-op: it falls back to
+        querying all pool categories."""
+        from mcp_odoo.transports import mcp_transport as t
+
+        mock_tc = {
+            "tenant_id": "tenant-uuid",
+            "url": "http://fake:8069",
+            "db": "fake", "user": "u", "password": "p",
+        }
+        pool_ids = [100]
+        instock_id = 777
+        # Pool category name does NOT contain "laptop"/"notebook"/etc.,
+        # so the laptop hints won't match → fallback to all cats.
+        live_map = {
+            100: _live(100, "EQUIPO agotado", qty=0, category="Genérico 1234"),
+            777: _live(777, "EQUIPO con stock", qty=2, category="Genérico 1234"),
+        }
+
+        async def _fake_live(tenant_id, ids):
+            return {pid: live_map[pid] for pid in ids if pid in live_map}
+
+        queried_cats: list = []
+
+        def _fake_search(*args, **kwargs):
+            domain = args[6]
+            is_instock_query = any(
+                isinstance(c, list) and c and c[0] == "qty_available"
+                for c in domain
+            )
+            if is_instock_query:
+                cat_clause = next(
+                    (c for c in domain if isinstance(c, list) and c and c[0] == "categ_id"),
+                    None,
+                )
+                if cat_clause:
+                    queried_cats.append(set(cat_clause[2]))
+                return [{"id": instock_id}]
+            return [{"id": 100, "categ_id": [55, "Genérico 1234"]}]
+
+        fake_client = _semantic_client_factory(pool_ids)
+
+        with (
+            patch.object(
+                t, "_get_tenant_config_by_id",
+                AsyncMock(return_value=mock_tc),
+            ),
+            patch.object(t, "_get_tenant_slug", AsyncMock(return_value="tecnosmart")),
+            patch.object(t, "_fetch_products_live", AsyncMock(side_effect=_fake_live)),
+            patch.object(t, "_apply_pricelist_to_live", AsyncMock(return_value=None)),
+            patch("mcp_odoo.tools.generic.odoo_search", side_effect=_fake_search),
+            patch("httpx.AsyncClient", fake_client),
+        ):
+            result = await t._rag_search(
+                query="laptop", top_k=10, offset=0, tenant_id="tenant-uuid",
+            )
+
+        env = _decode(result)
+        template_ids = [r["template_id"] for r in env["rows"]]
+        # Fallback queried the (only) pool category despite the hint miss.
+        assert queried_cats and queried_cats[0] == {55}
+        # And the in-stock item was merged.
+        assert instock_id in template_ids
+
+    @pytest.mark.asyncio
     async def test_no_dupe_when_instock_already_pooled(self):
         """If the in-stock-by-category query returns an id that's already
         in the semantic pool, it must NOT be duplicated."""
