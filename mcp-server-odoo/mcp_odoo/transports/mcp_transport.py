@@ -2694,6 +2694,17 @@ async def _handle_mcp_request(request: Request, body: dict) -> dict | None:
                 "isError": True,
             })
 
+        # Defensive type coercion of LLM-supplied args to the schema types
+        # (2026-06-17). Llama-3.3-70B / the MCP arg path often pass ints,
+        # arrays and booleans as STRINGS (e.g. partner_id="62",
+        # states='["draft","sent"]'); the Odoo domains built from those
+        # then match nothing. Normalise at the boundary BEFORE validation
+        # (so coerced ints/arrays pass the type check below) and before
+        # _execute_tool's C1b partner-scope override (which still wins for
+        # partner-scoped tools). Purely defensive: never raises, leaves
+        # non-convertible / out-of-schema args untouched.
+        args = _coerce_args_by_schema(tool_name, args)
+
         # Pre-execution arg validation against the tool's inputSchema.
         # Without this, malformed LLM args (e.g. fields placed at the
         # top level instead of inside a required nested array) reach the
@@ -5896,6 +5907,135 @@ async def _resolve_order_id_alias(request: Request, tool_name: str, args: dict) 
         f"order_id tiene tipo {type(raw).__name__}, esperaba un entero "
         f"positivo."
     )
+
+
+def _coerce_args_by_schema(tool_name: str, args: dict) -> dict:
+    """Defensively coerce LLM-supplied args to the types declared in the
+    tool's ``inputSchema`` (MCP_TOOLS), in place.
+
+    Root-cause fix (2026-06-17, verified in prod). Llama-3.3-70B (and the
+    MCP arg-passing path) frequently emit numeric / array / boolean
+    arguments as STRINGS, while the tool functions expect the schema
+    types. Real incidents:
+
+      * ``list_quotations(partner_id="62", limit="10")`` — the int-typed
+        fields arrived as strings; the Odoo domain ``["partner_id","=","62"]``
+        matched nothing → empty / ``invalid_partner_id``.
+      * ``get_latest_quotation(partner_id="1500501968",
+        states='["draft","sent"]')`` — ``states`` arrived as a JSON STRING
+        instead of a list → the domain ``["state","in","[\\"draft\\",...]"]``
+        was malformed → no quotations surfaced even though 20 existed.
+
+    Instead of patching each tool one at a time (whack-a-mole; see the
+    point fix in ``odoo_list_quotations`` commit 7047786 which stays as
+    redundant defence), we normalise at the transport boundary against the
+    SAME schema dict used to list / validate tools.
+
+    Rules (each per-arg coercion is wrapped in its own try/except — on ANY
+    failure the original value is kept; we NEVER raise and NEVER touch args
+    that are absent from the schema):
+
+      * ``integer`` : numeric str -> int
+      * ``number``  : str -> float
+      * ``boolean`` : "true"/"false"/"1"/"0"/"yes"/"no" (any case) -> bool
+      * ``array``   : JSON str that parses to a list -> list; else, if it
+                      contains commas, a simple comma split -> list
+      * ``object``  : JSON str that parses to a dict -> dict
+      * ``string``  : left untouched
+
+    ORDERING NOTE: this MUST run before the C1b partner-scope override in
+    ``_execute_tool`` (which overwrites ``partner_id`` with the
+    orchestrator's pinned ``expected_partner_id``). It does — this is
+    invoked in the ``tools/call`` handler prior to ``_execute_tool``. The
+    override therefore always wins for partner-scoped tools regardless of
+    what (now-coerced) value the LLM supplied.
+
+    Returns the same ``args`` dict (mutated in place) for convenience.
+    """
+    if not isinstance(args, dict):
+        return args
+
+    spec = next((t for t in MCP_TOOLS if t.get("name") == tool_name), None)
+    if not spec:
+        return args  # unknown tool — leave args untouched
+    properties = ((spec.get("inputSchema") or {}).get("properties")) or {}
+    if not properties:
+        return args
+
+    casted: dict[str, object] = {}
+
+    for arg_name, value in list(args.items()):
+        prop = properties.get(arg_name)
+        if not isinstance(prop, dict):
+            continue  # arg not in schema — don't touch
+        expected_type = prop.get("type")
+        if not expected_type:
+            continue
+
+        try:
+            if expected_type == "integer":
+                if isinstance(value, bool):
+                    continue  # bool is an int subclass — leave as-is
+                if isinstance(value, str) and value.strip():
+                    new_val = int(value.strip())
+                    if new_val != value:
+                        args[arg_name] = new_val
+                        casted[arg_name] = new_val
+
+            elif expected_type == "number":
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, str) and value.strip():
+                    new_val = float(value.strip())
+                    args[arg_name] = new_val
+                    casted[arg_name] = new_val
+
+            elif expected_type == "boolean":
+                if isinstance(value, str):
+                    low = value.strip().lower()
+                    if low in ("true", "1", "yes"):
+                        args[arg_name] = True
+                        casted[arg_name] = True
+                    elif low in ("false", "0", "no"):
+                        args[arg_name] = False
+                        casted[arg_name] = False
+                    # anything else: leave original
+
+            elif expected_type == "array":
+                if isinstance(value, str):
+                    s = value.strip()
+                    parsed = None
+                    try:
+                        maybe = json.loads(s)
+                        if isinstance(maybe, list):
+                            parsed = maybe
+                    except (ValueError, TypeError):
+                        parsed = None
+                    if parsed is None and "," in s:
+                        # best-effort fallback for "a,b,c" style inputs
+                        parsed = [p.strip() for p in s.split(",") if p.strip()]
+                    if parsed is not None:
+                        args[arg_name] = parsed
+                        casted[arg_name] = parsed
+
+            elif expected_type == "object":
+                if isinstance(value, str) and value.strip():
+                    try:
+                        maybe = json.loads(value.strip())
+                        if isinstance(maybe, dict):
+                            args[arg_name] = maybe
+                            casted[arg_name] = maybe
+                    except (ValueError, TypeError):
+                        pass
+            # "string" and unknown types: leave untouched
+        except Exception:
+            # Per-arg defensive: keep the original value on any failure.
+            continue
+
+    if casted:
+        logger.info("[coerce] tool=%s casted=%r", tool_name, casted)
+
+    return args
 
 
 def _validate_args_against_schema(tool_name: str, args: dict) -> dict | None:
