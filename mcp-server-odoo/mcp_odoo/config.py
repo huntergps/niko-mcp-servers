@@ -16,6 +16,20 @@ class Settings(BaseSettings):
     embedding_model: str = "bge-m3"
     default_tenant_id: str = ""
 
+    # RAG REST endpoint (env ``RAG_REST_URL``). The RAG embeddings store
+    # (``product_embeddings`` / ``partner_embeddings`` tables + the
+    # ``search_tenant_products`` / ``search_tenant_partners`` RPCs) is being
+    # split off Supabase onto its own Postgres/PostgREST stack. Only those
+    # RAG calls read this URL; everything else (OTP, tenants, knowledge_facts,
+    # contact_profiles, PDFs, …) keeps using ``supabase_url``.
+    #
+    # Empty by default so that, when ``RAG_REST_URL`` is unset, the RAG calls
+    # fall back to ``supabase_url`` via the ``rag_rest_url`` property below —
+    # i.e. deploying this code alone is a NO-OP; the real cutover is setting
+    # ``RAG_REST_URL`` in the container env. The service key / JWT secret is
+    # shared by both stacks, so it is NOT duplicated here.
+    rag_rest_url: str = ""
+
     # Single-tenant fallback (when no JWT)
     odoo_url: str = ""
     odoo_db: str = ""
@@ -37,6 +51,13 @@ class Settings(BaseSettings):
     niko_public_url: str = "https://niko.galapagos.tech"
 
     model_config = {"env_prefix": "", "case_sensitive": False}
+
+    def model_post_init(self, __context: object) -> None:
+        # Default ``rag_rest_url`` to ``supabase_url`` when ``RAG_REST_URL`` is
+        # not set, so RAG calls keep hitting the same Supabase endpoint as
+        # before the split (NO-OP until the operator sets ``RAG_REST_URL``).
+        if not self.rag_rest_url:
+            self.rag_rest_url = self.supabase_url
 
 
 settings = Settings()

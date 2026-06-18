@@ -5361,7 +5361,9 @@ async def _create_partner(creds: tuple, args: dict) -> str:
             from mcp_odoo.config import settings as _cfg
             tenant_id = creds[0]
             tenant_slug = await _get_tenant_slug(tenant_id)
-            supa_url = _cfg.supabase_url or "http://supabase-kong:8000"
+            # partner_embeddings lives in the RAG stack → rag_rest_url
+            # (defaults to supabase_url when RAG_REST_URL is unset).
+            supa_url = _cfg.rag_rest_url or "http://supabase-kong:8000"
             supa_key = _cfg.supabase_service_key or _cfg.supabase_jwt_secret
 
             p_name = partner.get("name", "")
@@ -5476,6 +5478,9 @@ async def _update_partner(creds: tuple, args: dict) -> str:
         try:
             tenant_id = creds[0]
             tenant_slug = await _get_tenant_slug(tenant_id)
+            # This block touches BOTH stacks: partner_embeddings (RAG → rag_url)
+            # and contact_profiles (NOT RAG → supabase_url). Keep them split.
+            rag_url = settings.rag_rest_url or "http://supabase-kong:8000"
             supabase_url = settings.supabase_url or "http://supabase-kong:8000"
             supabase_key = settings.supabase_service_key or settings.supabase_jwt_secret
 
@@ -5499,7 +5504,7 @@ async def _update_partner(creds: tuple, args: dict) -> str:
 
             async with httpx.AsyncClient(timeout=10) as client:
                 await client.patch(
-                    f"{supabase_url}/rest/v1/partner_embeddings?odoo_id=eq.{partner_id}",
+                    f"{rag_url}/rest/v1/partner_embeddings?odoo_id=eq.{partner_id}",
                     headers=_postgrest_headers(supabase_key,
                                                schema=f"tenant_{tenant_slug}",
                                                prefer="return=minimal"),
@@ -6904,7 +6909,10 @@ async def _rag_search(
     import httpx
 
     ollama_url = settings.ollama_url or "https://llama.galapagos.tech"
-    supabase_url = settings.supabase_url or "https://supabase.galapagos.tech"
+    # RAG store URL: ``search_tenant_products`` RPC + ``product_embeddings``
+    # ILIKE fallback live in the RAG stack (split off Supabase). Defaults to
+    # supabase_url when ``RAG_REST_URL`` is unset (see config.rag_rest_url).
+    rag_url = settings.rag_rest_url or "https://supabase.galapagos.tech"
     supabase_key = settings.supabase_service_key or settings.supabase_jwt_secret
     tenant_id = tenant_id or settings.default_tenant_id or "6b898738-41f9-48ce-a3e4-ad8a9ad9af77"
     embedding_model = settings.embedding_model or "bge-m3"
@@ -6931,7 +6939,7 @@ async def _rag_search(
             # RRF hybrid search: semantic + keyword fused via search_tenant_products
             try:
                 resp = await client.post(
-                    f"{supabase_url}/rest/v1/rpc/search_tenant_products",
+                    f"{rag_url}/rest/v1/rpc/search_tenant_products",
                     headers={
                         "apikey": supabase_key,
                         "Authorization": f"Bearer {supabase_key}",
@@ -6982,7 +6990,7 @@ async def _rag_search(
 
             search_terms = query.replace(" ", "%")
             resp = await client.get(
-                f"{supabase_url}/rest/v1/product_embeddings",
+                f"{rag_url}/rest/v1/product_embeddings",
                 params={
                     "or": f"(name.ilike.%{search_terms}%,content.ilike.%{search_terms}%)",
                     "select": "odoo_id,name,code,content,metadata",
@@ -7660,7 +7668,9 @@ async def _rag_search_partners(query: str, top_k: int = 5, tenant_id: str = "") 
     import httpx
 
     ollama_url = settings.ollama_url or "https://llama.galapagos.tech"
-    supabase_url = settings.supabase_url or "https://supabase.galapagos.tech"
+    # RAG store URL: ``search_tenant_partners`` RPC lives in the RAG stack.
+    # Defaults to supabase_url when ``RAG_REST_URL`` is unset.
+    rag_url = settings.rag_rest_url or "https://supabase.galapagos.tech"
     supabase_key = settings.supabase_service_key or settings.supabase_jwt_secret
     tenant_id = tenant_id or settings.default_tenant_id or "6b898738-41f9-48ce-a3e4-ad8a9ad9af77"
     embedding_model = settings.embedding_model or "bge-m3"
@@ -7683,7 +7693,7 @@ async def _rag_search_partners(query: str, top_k: int = 5, tenant_id: str = "") 
 
         # Hybrid search: semantic + keyword via tenant-specific wrapper
         resp = await client.post(
-            f"{supabase_url}/rest/v1/rpc/search_tenant_partners",
+            f"{rag_url}/rest/v1/rpc/search_tenant_partners",
             headers={
                 "apikey": supabase_key,
                 "Authorization": f"Bearer {supabase_key}",
