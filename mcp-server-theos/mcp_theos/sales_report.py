@@ -1643,32 +1643,24 @@ async def _fetch_day_lines_via_proceso(
     return {"success": True, "rows": rows, "total_count": total_count}
 
 
-async def _get_day_lines(
-    client: VelneoClient,
-    *,
-    day: str,
-    sucursal: str,
-    retries: int = 2,
+# Caché en memoria + single-flight para el DÍA EN CURSO. Los 3 tools de
+# "ventas de hoy" (sales_quick_summary + dashboard + evolution) llaman cada uno a
+# summarize_sales → _get_day_lines(hoy). Sin esto, cada uno re-corre el proceso
+# pesado (~90s) y encadenados se pasan del timeout (ese fue el "backend caído").
+# Con esto, el PRIMERO hace el fetch y los demás (concurrentes o dentro del TTL)
+# reusan EL MISMO resultado → texto + 2 imágenes cuesta ~1 fetch, no 3.
+_LIVE_DAY_TTL = 75.0  # s — hoy es mutable: TTL corto para no servir datos viejos
+_LIVE_DAY_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
+_LIVE_DAY_INFLIGHT: dict[tuple[str, str, str], Any] = {}
+
+
+async def _do_fetch_day_lines(
+    client: VelneoClient, *, day: str, sucursal: str, retries: int,
+    is_past: bool,
 ) -> dict[str, Any]:
-    """Return the day's filtered movement rows — from cache if past day,
-    paginating Velneo otherwise. Cache misses for past days populate
-    the cache so the next call is free.
-
-    Retries the live fetch on transient transport errors (Velneo sometimes
-    drops the connection mid-pagination on heavy days). Each retry waits
-    a couple of seconds — the upstream usually recovers within one.
-    """
+    """Fetch del proceso con reintentos transitorios + escritura a caché de disco
+    si es un día pasado. Sin caché en memoria (eso lo maneja _get_day_lines)."""
     import asyncio
-    today = _today_ecu_iso()
-    is_past = day < today
-
-    if is_past:
-        path = _cache_path(client.cfg.tenant_id, sucursal, day)
-        cached = _read_jsonl(path)
-        if cached:
-            return {"success": True, "rows": cached,
-                    "total_count": len(cached), "from_cache": True}
-
     attempt = 0
     last_result: dict[str, Any] = {}
     while attempt <= retries:
@@ -1677,7 +1669,6 @@ async def _get_day_lines(
         )
         if last_result.get("success"):
             break
-        # Only retry on transient transport errors.
         if last_result.get("error_code") != "transport":
             break
         attempt += 1
@@ -1693,6 +1684,63 @@ async def _get_day_lines(
                            sucursal, day, e)
     last_result["from_cache"] = False
     return last_result
+
+
+async def _get_day_lines(
+    client: VelneoClient,
+    *,
+    day: str,
+    sucursal: str,
+    retries: int = 2,
+) -> dict[str, Any]:
+    """Filas de movimiento del día.
+
+    - Día PASADO: del caché de disco (o fetch+caché en miss).
+    - Día EN CURSO (hoy): single-flight + TTL en memoria, para que los 3 tools de
+      "ventas de hoy" compartan UN solo fetch del proceso (sino 3×~90s → timeout).
+    """
+    import asyncio, time
+    today = _today_ecu_iso()
+    is_past = day < today
+
+    if is_past:
+        path = _cache_path(client.cfg.tenant_id, sucursal, day)
+        cached = _read_jsonl(path)
+        if cached:
+            return {"success": True, "rows": cached,
+                    "total_count": len(cached), "from_cache": True}
+        return await _do_fetch_day_lines(
+            client, day=day, sucursal=sucursal, retries=retries, is_past=True)
+
+    # --- DÍA EN CURSO: compartir el fetch entre los 3 tools ---
+    key = (client.cfg.tenant_id, sucursal, day)
+    now = time.monotonic()
+    hit = _LIVE_DAY_CACHE.get(key)
+    if hit and (now - hit[0]) < _LIVE_DAY_TTL:
+        return {**hit[1], "from_cache": True}
+
+    inflight = _LIVE_DAY_INFLIGHT.get(key)
+    if inflight is not None and not inflight.done():
+        # otro tool ya está trayendo "hoy": espera ESE mismo fetch (no re-corras)
+        return {**(await asyncio.shield(inflight))}
+
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    _LIVE_DAY_INFLIGHT[key] = fut
+    try:
+        result = await _do_fetch_day_lines(
+            client, day=day, sucursal=sucursal, retries=retries, is_past=False)
+        if result.get("success"):
+            _LIVE_DAY_CACHE[key] = (time.monotonic(), result)
+        if not fut.done():
+            fut.set_result(result)
+        return result
+    except Exception as e:
+        if not fut.done():
+            fut.set_exception(e)
+        raise
+    finally:
+        _LIVE_DAY_INFLIGHT.pop(key, None)
 
 
 async def _iter_days(date_from: str, date_to: str) -> list[str]:
