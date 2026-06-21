@@ -123,23 +123,97 @@ def extract_rows(body: dict[str, Any], *table_keys: str) -> list[dict[str, Any]]
     return [_upper_keys(r) for r in rows]
 
 
+# --------------------------------------------------------------------------
+# Cliente httpx COMPARTIDO (keep-alive) — el cuello de botella del API HTTPS de
+# Velneo no es el server ni el TLS en sí, sino abrir una conexión NUEVA por cada
+# tool: ``async with VelneoClient(cfg)`` creaba un AsyncClient y lo cerraba al
+# salir, pagando handshake TLS de cero cada vez (~0.75s vs ~0.2s reusando). Aquí
+# mantenemos UN AsyncClient vivo por (event-loop, tenant) y lo reusamos entre
+# llamadas; las conexiones quedan en el pool keep-alive (keepalive_expiry alto,
+# no los 5s del default). VelneoClient pasa a ser un wrapper que TOMA PRESTADO
+# ese cliente y NO lo cierra al salir (solo se cierra al apagar el MCP).
+# --------------------------------------------------------------------------
+try:  # http2 es opcional: solo si el paquete h2 está instalado (httpx[http2]).
+    import h2  # noqa: F401
+    _HTTP2_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _HTTP2_AVAILABLE = False
+
+# Clave: (id(loop), base_url, api_key) — un cliente por event-loop evita el error
+# "attached to a different loop" cuando un script (warm_cache/backfill) crea su
+# propio loop. En multi-tenant la api_key distingue cada tenant => un pool por
+# tenant. Acceso sync dentro de un único loop => sin carrera.
+_SHARED_CLIENTS: dict[tuple[int, str, str], "httpx.AsyncClient"] = {}
+
+
+def _build_async_client(cfg: TenantVelneoConfig) -> httpx.AsyncClient:
+    timeout = httpx.Timeout(
+        connect=settings.velneo_connect_timeout,
+        read=settings.velneo_http_timeout,
+        write=settings.velneo_http_timeout,
+        pool=settings.velneo_http_timeout,
+    )
+    transport = httpx.AsyncHTTPTransport(
+        retries=settings.velneo_connect_retries,
+        limits=httpx.Limits(
+            max_keepalive_connections=settings.velneo_max_keepalive,
+            max_connections=settings.velneo_max_connections,
+            keepalive_expiry=settings.velneo_keepalive_expiry,
+        ),
+        http2=_HTTP2_AVAILABLE,
+    )
+    return httpx.AsyncClient(
+        base_url=cfg.base_url,
+        headers=_headers(cfg),
+        timeout=timeout,
+        transport=transport,
+    )
+
+
+def _shared_client_for(cfg: TenantVelneoConfig) -> httpx.AsyncClient:
+    import asyncio
+    try:
+        loop_id = id(asyncio.get_running_loop())
+    except RuntimeError:  # sin loop corriendo (no debería pasar en uso normal)
+        loop_id = 0
+    key = (loop_id, cfg.base_url, cfg.api_key)
+    cli = _SHARED_CLIENTS.get(key)
+    if cli is None or cli.is_closed:
+        cli = _build_async_client(cfg)
+        _SHARED_CLIENTS[key] = cli
+    return cli
+
+
+async def close_shared_clients() -> None:
+    """Cierra todos los AsyncClient compartidos (al apagar el MCP)."""
+    for cli in list(_SHARED_CLIENTS.values()):
+        try:
+            await cli.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+    _SHARED_CLIENTS.clear()
+
+
 class VelneoClient:
     def __init__(self, cfg: TenantVelneoConfig):
         self.cfg = cfg
-        self._client = httpx.AsyncClient(
-            base_url=cfg.base_url,
-            headers=_headers(cfg),
-            timeout=settings.velneo_http_timeout,
-        )
+        # Toma prestado el cliente compartido (keep-alive). Sincrónico: todos los
+        # usos construyen VelneoClient dentro de un loop corriendo.
+        self._client = _shared_client_for(cfg)
 
     async def __aenter__(self) -> "VelneoClient":
+        if self._client.is_closed:
+            self._client = _shared_client_for(self.cfg)
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
-        await self._client.aclose()
+        # NO cerrar: el cliente es compartido y se reusa entre llamadas.
+        return None
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        # No-op por diseño: el compartido solo se cierra al apagar el MCP vía
+        # close_shared_clients().
+        return None
 
     async def get(  # noqa: C901 — single hot path
         self,

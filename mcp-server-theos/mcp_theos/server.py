@@ -28,6 +28,8 @@ setup_structured_logging()
 async def lifespan(app: FastAPI):
     yield
     clear_cache()
+    from mcp_theos.velneo_http import close_shared_clients
+    await close_shared_clients()
 
 
 app = FastAPI(

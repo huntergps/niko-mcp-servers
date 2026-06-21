@@ -34,6 +34,17 @@ class Settings(BaseSettings):
     velneo_http_timeout: float = 20.0
     velneo_default_page_size: int = 200
     velneo_max_pages: int = 50
+    # Velneo (mepriga.galapagos.tech) a veces deja colgado el handshake TLS
+    # (ConnectTimeout intermitente). connect timeout corto (falla rápido) + el
+    # transporte reintenta la CONEXIÓN; el read sigue largo para procesos lentos.
+    velneo_connect_timeout: float = 10.0
+    velneo_connect_retries: int = 3
+    # Pool keep-alive del cliente httpx COMPARTIDO. keepalive_expiry alto (vs los
+    # 5s del default) para que la conexión sobreviva entre tools y se reuse el
+    # handshake TLS (lo caro en Velneo). Ver VelneoClient en velneo_http.py.
+    velneo_max_keepalive: int = 20
+    velneo_max_connections: int = 50
+    velneo_keepalive_expiry: float = 30.0
 
     # On-disk image cache (mirror of the visor app's strategy — see
     # /Users/elmers/Documents/develop/2026/visor/lib/services/
