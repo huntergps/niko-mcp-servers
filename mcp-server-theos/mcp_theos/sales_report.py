@@ -1576,7 +1576,7 @@ async def _fetch_day_lines_via_proceso(
     *,
     day: str,
     sucursal: str,
-    page_size: int = 500,
+    page_size: int = 1000,
 ) -> dict[str, Any]:
     """Paginate the VENT_FACT_MOV_BUSQ_3P proceso for a SINGLE day.
 
@@ -1625,9 +1625,17 @@ async def _fetch_day_lines_via_proceso(
             uk = _upper_keys(r)
             kept = {k: v for k, v in uk.items() if k in _KEEP_KEYS}
             rows.append(kept)
-        if len(page_rows) < page_size:
-            break
+        # Cortar por total_count (fuente de verdad). IMPORTANTE: Velneo CAPA el
+        # page[size] de los procesos a 1000 (probado: pedir 10000 devuelve 1000),
+        # así que NUNCA usar 'len(page_rows) < page_size' como fin de paginación
+        # —cortaría leyendo de menos cuando el día tiene >1000 movimientos y daría
+        # totales errados—. El proceso reconstruye la cesta completa por página,
+        # por eso conviene el page_size máximo (1000) para minimizar # de builds.
         if total_count and len(rows) >= total_count:
+            break
+        if not page_rows:
+            break
+        if not total_count and len(page_rows) < page_size:
             break
         page_num += 1
     return {"success": True, "rows": rows, "total_count": total_count}
